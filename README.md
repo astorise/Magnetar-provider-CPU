@@ -14,35 +14,17 @@ related tensor operators).
 
 ## Status
 
-**Empty template.** This crate is currently a bare `cargo new --lib`
-scaffold. The real, working Reference CPU Provider implementation lives
-today inside `magnetar-runtime` itself (`reference_cpu.rs`), as a
-deliberate, tracked architectural debt -- not the target state. Extracting
-it into this crate is `reach-architecture-freeze-1` task group 14
-("Extract Reference CPU into `providers/cpu`"), which cited two
-prerequisites: task group 13 (does `ProviderExecutionApi` need a new
-contract, or do ordinary additive methods suffice?) and task group 5/task
-3.3 (is `HostTensor` still the concrete type `magnetar-runtime`'s *generic*
-graph-execution code carries, not just Reference CPU's own Kernel bodies?).
-Both are now resolved. Task group 13 resolved without needing a new
-contract. `define-provider-prepared-kernel-execution-contract` was opened
-for a *different* reason (a Provider-agnostic tensor *value* type,
-`TensorValue`) and initially added it additively without migrating
-`magnetar-runtime`'s generic dispatch/transport code off `HostTensor` --
-but per the post-freeze équipe review's explicit decision to migrate the
-generic transport now rather than wait for a real CUDA Provider, that
-Change's task group 5 completed the migration: `execute_qwen_graph_nodes`'s
-per-node transport reads/writes exclusively through `TensorValue` today,
-materializing to `HostTensor` only at four explicit boundaries (weight
-binding, KV-history concatenation, final logits extraction, per-node
-Kernel-input resolution). `HostTensor` still exists and is still what
-Reference CPU's own Kernel bodies compute over -- that is expected and
-correct, not a remaining blocker -- but it is no longer required at the
-generic `ProviderExecutionApi` trait boundary, so extracting Reference CPU
-into this crate would no longer be moving a layering problem across the
-repository boundary. Extraction itself (task group 14's actual code move)
-has not started yet; both of its prerequisites are simply no longer
-outstanding.
+**Real extraction, not a template.** This crate now holds the actual
+`ReferenceCpuExecutor`/`ReferenceCpuProvider` implementation, its numeric
+kernels (matmul, attention, rope, rmsnorm, softmax, silu, gelu, dtype/layout
+conversion), and SIMD-feature-flag plumbing, ported out of
+`magnetar-runtime/src/reference_cpu.rs`. `magnetar-runtime` keeps its own
+copy of that file in-crate, deliberately: it is still what magnetar-runtime's
+~1000-test suite instantiates directly as a generic test double, and it is
+never referenced by this crate or vice versa. The two are independent,
+intentionally near-duplicate implementations, not one moved file -- see
+"Relationship to magnetar-runtime" below for why a literal move was not
+possible yet.
 
 ## Governing contract
 
@@ -51,14 +33,33 @@ in the main Magnetar repository's OpenSpec capability set defines this
 Provider's baseline requirement: Magnetar SHALL define a Reference CPU
 Provider as a correctness-first baseline Provider for inference execution.
 The broader `provider` capability spec governs the full
-`ProviderExecutionApi`/`Provider` contract this crate would implement.
+`ProviderExecutionApi`/`Provider` contract this crate implements.
 
 ## Relationship to magnetar-runtime
 
-Once extracted, this crate depends only on `magnetar-runtime`'s public
-Provider/Device/Kernel/Tensor contracts (`providers/cpu -> magnetar-runtime`,
-never the reverse) and registers itself the same way any Provider does --
-`magnetar-runtime` compiling and testing cleanly without this crate present
-is one of task group 14's own verification requirements. It is pinned into
-the main [Magnetar](https://github.com/astorise/Magnetar) repository as a
-git submodule at `providers/cpu`.
+This crate depends only on `magnetar-runtime`'s public Provider/Device/
+Kernel/Tensor contracts (`providers/cpu -> magnetar-runtime`, never the
+reverse); `magnetar-runtime` compiles and tests cleanly without this crate
+present. It is pinned into the main
+[Magnetar](https://github.com/astorise/Magnetar) repository as a git
+submodule at `providers/cpu`.
+
+One detail keeps this from being a clean, self-contained port: `HostTensor`,
+`ReferenceCpuError`, and `ReferenceCpuErrorCode` are *imported* from
+`magnetar_runtime` here rather than redefined locally, because
+`magnetar-runtime/src/provider.rs`'s `ProviderExecutionApi` trait
+(`write_tensor`/`read_tensor`/`write_tensor_admitted`) is still typed
+directly against `HostTensor` -- an explicitly documented, provisional
+transport ahead of a fully Resource-based rewrite (`magnetar-runtime` task
+group 5 / Correctif 5), not yet complete. `HostTensor::new`/`rows_cols`
+return `ReferenceCpuError`, and `magnetar-runtime`'s own
+`impl From<ReferenceCpuError> for KernelError` cannot be duplicated here
+(Rust's orphan rule forbids `impl ForeignTrait for ForeignType` regardless of
+which side is "local"), so that error type is pulled in too. This is the
+smallest set of types load-bearing enough to force sharing: everything else
+in this crate (`ReferenceCpuFeatureFlags`, the kernel functions,
+`ReferenceCpuExecutor`, `ReferenceCpuProvider`, SIMD detection, conformance
+reporting) is this crate's own, independent of magnetar-runtime's in-crate
+copy. Once magnetar-runtime's Resource-based rewrite removes `HostTensor`
+from the generic trait boundary, this crate can define its own `HostTensor`/
+`ReferenceCpuError` instead of importing magnetar-runtime's.

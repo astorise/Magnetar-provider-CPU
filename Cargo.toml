@@ -6,3 +6,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Path dependency, not a published crate: this crate is only buildable
+# from within a checkout of the parent Magnetar repository, with this
+# submodule checked out at `providers/cpu` (exactly what CI's
+# `submodule-integration` job does via `submodules: recursive`). A
+# standalone clone of this repository alone cannot resolve this
+# dependency. Default features stay on: magnetar-runtime is deliberately
+# fail-closed at compile time unless one of `wasmtime-component-engine`
+# (the default) or `non-strict-fixture-fallback` is enabled, even though
+# this crate itself only uses the Provider/Kernel/Tensor/Memory contracts.
+magnetar-runtime = { path = "../../magnetar-runtime" }

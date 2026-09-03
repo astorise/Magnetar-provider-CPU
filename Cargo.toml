@@ -11,8 +11,11 @@ edition = "2024"
 # submodule checked out at `providers/cpu` (exactly what CI's
 # `submodule-integration` job does via `submodules: recursive`). A
 # standalone clone of this repository alone cannot resolve this
-# dependency. Default features stay on: magnetar-runtime is deliberately
-# fail-closed at compile time unless one of `wasmtime-component-engine`
-# (the default) or `non-strict-fixture-fallback` is enabled, even though
-# this crate itself only uses the Provider/Kernel/Tensor/Memory contracts.
+# dependency. Default features stay on (wasmtime-component-engine) even
+# though this crate itself only uses the Provider/Kernel/Tensor/Memory
+# contracts -- magnetar-runtime compiles fine with any feature combination
+# (task 12.6 removed the compile-time fail-closed trap this comment used to
+# describe: a missing Component engine now fails closed at runtime instead
+# of at compile time), but there is no reason for this crate to opt out of
+# the default strict engine.
 magnetar-runtime = { path = "../../magnetar-runtime" }

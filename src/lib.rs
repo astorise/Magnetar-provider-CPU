@@ -121,7 +121,7 @@ use magnetar_runtime::operator::{
 };
 use magnetar_runtime::provider::{
     PROVIDER_API_VERSION, Provider, ProviderError, ProviderExecutionApi, ProviderMetadata,
-    ProviderRegistry, TensorValue,
+    ProviderRegistry, TensorValue, TensorValueAdmissionError,
 };
 use magnetar_runtime::scheduler::{
     ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionErrorCode,
@@ -1128,17 +1128,30 @@ impl ReferenceCpuExecutor {
     /// ever receives [`TensorValue::Host`]; an [`TensorValue::Opaque`] write
     /// (which would mean "store this, but I have no bytes for it") is not
     /// meaningful for a host-visible-only Provider, so it is a documented
-    /// no-op rather than a panic.
-    pub fn write_tensor_value(&self, id: TensorResourceId, value: TensorValue) {
+    /// no-op rather than a panic. Reference CPU's own storage write is
+    /// genuinely infallible (an in-memory map insert), so this always
+    /// returns `Ok`; the `Result` shape exists for the trait's general
+    /// contract (`generalize-first-native-provider-dispatch`), not because
+    /// this Provider can fail here.
+    pub fn write_tensor_value(
+        &self,
+        id: TensorResourceId,
+        value: TensorValue,
+    ) -> Result<(), ProviderExecutionError> {
         if let TensorValue::Host(tensor) = value {
             self.write_tensor(id, tensor);
         }
+        Ok(())
     }
 
     /// See [`ProviderExecutionApi::write_tensor_value_admitted`]. Same
     /// `Opaque`-is-a-no-op reasoning as [`Self::write_tensor_value`]; an
     /// `Opaque` write admits nothing and succeeds trivially, since there is
-    /// no byte size to account for it.
+    /// no byte size to account for it. The `Host` case delegates to
+    /// [`Self::write_tensor_admitted`], which already has the correct
+    /// admit-then-write shape; wrapped in `TensorValueAdmissionError::Memory`
+    /// since that delegate's own failure is always a Memory Manager
+    /// admission failure for this Provider (its write is infallible).
     pub fn write_tensor_value_admitted(
         &self,
         memory: &mut MemoryManager,
@@ -1146,11 +1159,11 @@ impl ReferenceCpuExecutor {
         value: TensorValue,
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), TensorValueAdmissionError> {
         match value {
-            TensorValue::Host(tensor) => {
-                self.write_tensor_admitted(memory, id, tensor, class, owner)
-            }
+            TensorValue::Host(tensor) => self
+                .write_tensor_admitted(memory, id, tensor, class, owner)
+                .map_err(TensorValueAdmissionError::Memory),
             TensorValue::Opaque => Ok(()),
         }
     }
@@ -2020,7 +2033,11 @@ impl ProviderExecutionApi for ReferenceCpuExecutor {
         ReferenceCpuExecutor::read_tensor_value(self, id)
     }
 
-    fn write_tensor_value(&self, id: TensorResourceId, value: TensorValue) {
+    fn write_tensor_value(
+        &self,
+        id: TensorResourceId,
+        value: TensorValue,
+    ) -> Result<(), ProviderExecutionError> {
         ReferenceCpuExecutor::write_tensor_value(self, id, value)
     }
 
@@ -2031,7 +2048,7 @@ impl ProviderExecutionApi for ReferenceCpuExecutor {
         value: TensorValue,
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), TensorValueAdmissionError> {
         ReferenceCpuExecutor::write_tensor_value_admitted(
             self,
             memory,

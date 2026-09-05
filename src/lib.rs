@@ -1975,20 +1975,34 @@ impl ProviderExecutionApi for ReferenceCpuExecutor {
         self.complete_kernel_invocation(handle)
     }
 
-    fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) {
-        ReferenceCpuExecutor::write_tensor(self, id, tensor)
+    fn write_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: HostTensor,
+    ) -> Result<(), ProviderExecutionError> {
+        // In-memory `Mutex<BTreeMap>` storage: genuinely infallible in
+        // practice, unlike a real device Provider's write, but still
+        // returns the trait's `Result` shape rather than a bare `()`.
+        ReferenceCpuExecutor::write_tensor(self, id, tensor);
+        Ok(())
     }
 
     fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
         ReferenceCpuExecutor::read_tensor(self, id)
     }
 
-    fn release_tensor(&self, id: &TensorResourceId) -> bool {
-        ReferenceCpuExecutor::release_tensor(self, id)
+    fn release_tensor(&self, id: &TensorResourceId) -> Result<bool, ProviderExecutionError> {
+        Ok(ReferenceCpuExecutor::release_tensor(self, id))
     }
 
-    fn release_admitted_tensor(&self, memory: &mut MemoryManager, id: &TensorResourceId) -> bool {
-        ReferenceCpuExecutor::release_admitted_tensor(self, memory, id)
+    fn release_admitted_tensor(
+        &self,
+        memory: &mut MemoryManager,
+        id: &TensorResourceId,
+    ) -> Result<bool, ProviderExecutionError> {
+        Ok(ReferenceCpuExecutor::release_admitted_tensor(
+            self, memory, id,
+        ))
     }
 
     fn write_tensor_admitted(

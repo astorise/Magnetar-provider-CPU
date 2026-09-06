@@ -375,27 +375,48 @@ pub fn rmsnorm(
     HostTensor::new(input.shape.clone(), out)
 }
 
-/// Rotary position embedding, rotating consecutive pairs within the first
-/// `dimension` elements of each row.
+/// Rotary position embedding. Each row divides into `head_count` equal-width
+/// blocks of `head_width = cols / head_count` columns; within each block
+/// independently, the first `dimension` columns (`dimension <= head_width`,
+/// partial RoPE is legal) are rotated in consecutive pairs, using the same
+/// per-pair rotation formula for every block. Columns outside a rotated
+/// range (partial RoPE's tail, if any) are left unchanged, not zeroed.
 ///
-/// The absolute position of row `r` is `position_offset + r`. The offset is an
-/// explicit parameter rather than a default because a decode step passes a
-/// single row whose true position is however many tokens precede it: deriving
-/// position from the row index alone would rotate every generated token as if
-/// it were the first, which is silently wrong rather than an error.
+/// `head_count = 1` reproduces the single-block behavior this function had
+/// before `make-first-native-cuda-hot-path-device-resident` exactly:
+/// `head_width` becomes `cols`, so this is not a separate code path, just
+/// the general case's `head_count = 1` instance.
+///
+/// The absolute position of row `r` is `position_offset + r`, the same for
+/// every block in that row (RoPE's position dimension is per-token, not
+/// per-head). The offset is an explicit parameter rather than a default
+/// because a decode step passes a single row whose true position is
+/// however many tokens precede it: deriving position from the row index
+/// alone would rotate every generated token as if it were the first, which
+/// is silently wrong rather than an error.
 pub fn rope(
     input: &HostTensor,
     base: f32,
     scale: f32,
     dimension: u64,
     position_offset: u64,
+    head_count: u64,
 ) -> Result<HostTensor, ReferenceCpuError> {
     let (rows, cols) = input.rows_cols()?;
-    if dimension == 0 || !dimension.is_multiple_of(2) || dimension > cols {
+    if head_count == 0 || !cols.is_multiple_of(head_count) {
         return Err(ReferenceCpuError::new(
             ReferenceCpuErrorCode::ShapeUnsupported,
             format!(
-                "RoPE dimension {dimension} must be positive, even, and at most the row width {cols}"
+                "RoPE head_count {head_count} must be positive and evenly divide the row width {cols}"
+            ),
+        ));
+    }
+    let head_width = cols / head_count;
+    if dimension == 0 || !dimension.is_multiple_of(2) || dimension > head_width {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "RoPE dimension {dimension} must be positive, even, and at most the head width {head_width}"
             ),
         ));
     }
@@ -413,17 +434,21 @@ pub fn rope(
     }
     let mut out = input.data.clone();
     let half = (dimension / 2) as usize;
+    let head_width = head_width as usize;
     for row in 0..rows as usize {
         let position = ((position_offset as usize + row) as f32) * scale;
         let row_start = row * cols as usize;
-        for pair in 0..half {
-            let frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
-            let angle = position * frequency;
-            let (sin, cos) = angle.sin_cos();
-            let even = input.data[row_start + 2 * pair];
-            let odd = input.data[row_start + 2 * pair + 1];
-            out[row_start + 2 * pair] = even * cos - odd * sin;
-            out[row_start + 2 * pair + 1] = even * sin + odd * cos;
+        for head in 0..head_count as usize {
+            let col_base = row_start + head * head_width;
+            for pair in 0..half {
+                let frequency = base.powf(-2.0 * (pair as f32) / dimension as f32);
+                let angle = position * frequency;
+                let (sin, cos) = angle.sin_cos();
+                let even = input.data[col_base + 2 * pair];
+                let odd = input.data[col_base + 2 * pair + 1];
+                out[col_base + 2 * pair] = even * cos - odd * sin;
+                out[col_base + 2 * pair + 1] = even * sin + odd * cos;
+            }
         }
     }
     HostTensor::new(input.shape.clone(), out)
@@ -1229,6 +1254,7 @@ impl ReferenceCpuExecutor {
             1.0,
             2,
             0,
+            1,
         );
         checks.push(ReferenceCpuConformanceCheck {
             name: "rope-baseline-known-output",
@@ -1794,7 +1820,13 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
-                rope(&input, base, scale, dimension, position_offset).map_err(KernelError::from)?
+                // `make-first-native-cuda-hot-path-device-resident`:
+                // absent means single-block, identical to this Kernel's
+                // behavior before `head_count` existed.
+                let head_count =
+                    Self::attribute_integer(&invocation.attributes, "head_count").unwrap_or(1);
+                rope(&input, base, scale, dimension, position_offset, head_count)
+                    .map_err(KernelError::from)?
             }
             "attention" => {
                 if cfg!(target_arch = "wasm32") {

@@ -1437,8 +1437,27 @@ impl ReferenceCpuExecutor {
         let provider = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
         let mut admitted: Vec<(TensorResourceId, MemoryAllocationId)> =
             Vec::with_capacity(invocation.outputs.len());
+        // Resource ids a caller already admitted before submission
+        // (`MemoryManager::admit_kernel_output`,
+        // `unify-provider-output-admission-and-residency`) -- this
+        // Provider never self-admitted them (`resource_allocations` has no
+        // entry), yet `memory` already has a residency record for them.
+        // Honored as-is: no second, Provider-owned allocation, no
+        // overwriting the caller's own residency/placement/ownership
+        // choice.
+        let mut preadmitted: std::collections::BTreeSet<TensorResourceId> =
+            std::collections::BTreeSet::new();
         for output in &invocation.outputs {
             let resource = &output.resource;
+            let self_admitted_before = self
+                .resource_allocations
+                .lock()
+                .unwrap()
+                .contains_key(&resource.id);
+            if !self_admitted_before && memory.tensor_residency(&resource.id).is_some() {
+                preadmitted.insert(resource.id.clone());
+                continue;
+            }
             let byte_size = match resource.descriptor.byte_size() {
                 Ok(byte_size) => byte_size,
                 Err(error) => {
@@ -1497,6 +1516,14 @@ impl ReferenceCpuExecutor {
             return result;
         }
         for resource in &result.updated_resources {
+            if preadmitted.contains(&resource.id) {
+                // The caller's own residency record is already
+                // authoritative -- do not overwrite it with a
+                // Provider-chosen placement/affinity, and this Provider
+                // does not own its lifecycle (no entry to add to
+                // `resource_allocations`).
+                continue;
+            }
             let Some((_, allocation_id)) = admitted
                 .iter()
                 .find(|(resource_id, _)| *resource_id == resource.id)

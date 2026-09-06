@@ -4,6 +4,10 @@
 name = "magnetar-provider-cpu"
 version = "0.1.0"
 edition = "2024"
+# Never published to crates.io independently -- this crate is only
+# buildable from within a checkout of the parent Magnetar repository (see
+# the path dependency comment below).
+publish = false
 
 [dependencies]
 # Path dependency, not a published crate: this crate is only buildable

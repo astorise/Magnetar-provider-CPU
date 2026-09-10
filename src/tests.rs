@@ -533,3 +533,38 @@ fn rope_rejects_dimension_larger_than_head_width() {
     let result = rope(&input, 10000.0, 1.0, 6, 0, 2);
     assert!(result.is_err(), "dimension must not exceed head_width");
 }
+
+#[test]
+fn add_same_shape_behavior_is_unchanged() {
+    let a = HostTensor::new(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let b = HostTensor::new(vec![2, 3], vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]).unwrap();
+    let result = add(&a, &b).unwrap();
+    assert_eq!(result.shape, vec![2, 3]);
+    assert_eq!(result.data, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]);
+}
+
+/// Real Qwen2/2.5 QKV projection bias: `[rows, cols] + [cols]`, the bias
+/// row broadcast across every row of `a`.
+#[test]
+fn add_broadcasts_a_single_row_bias_across_every_row() {
+    let a = HostTensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let bias = HostTensor::new(vec![2], vec![100.0, 1000.0]).unwrap();
+    let result = add(&a, &bias).unwrap();
+    assert_eq!(result.shape, vec![3, 2]);
+    assert_eq!(
+        result.data,
+        vec![101.0, 1002.0, 103.0, 1004.0, 105.0, 1006.0]
+    );
+
+    // [1, cols] is accepted identically to [cols].
+    let bias_2d = HostTensor::new(vec![1, 2], vec![100.0, 1000.0]).unwrap();
+    let result_2d = add(&a, &bias_2d).unwrap();
+    assert_eq!(result_2d.data, result.data);
+}
+
+#[test]
+fn add_rejects_an_incompatible_broadcast_shape() {
+    let a = HostTensor::new(vec![3, 2], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let wrong = HostTensor::new(vec![3], vec![1.0, 2.0, 3.0]).unwrap();
+    assert!(add(&a, &wrong).is_err());
+}

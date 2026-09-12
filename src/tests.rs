@@ -568,3 +568,25 @@ fn add_rejects_an_incompatible_broadcast_shape() {
     let wrong = HostTensor::new(vec![3], vec![1.0, 2.0, 3.0]).unwrap();
     assert!(add(&a, &wrong).is_err());
 }
+
+/// `implement-device-resident-multi-step-cuda-decode` task 2.3: KV-history
+/// concatenation's exact contract -- `a`'s rows stacked above `b`'s rows,
+/// trailing dimensions preserved.
+#[test]
+fn concat_stacks_a_rows_above_b_rows() {
+    let a = HostTensor::new(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let b = HostTensor::new(vec![1, 3], vec![7.0, 8.0, 9.0]).unwrap();
+    let result = concat(&a, &b).unwrap();
+    assert_eq!(result.shape, vec![3, 3]);
+    assert_eq!(
+        result.data,
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    );
+}
+
+#[test]
+fn concat_rejects_a_trailing_dimension_mismatch() {
+    let a = HostTensor::new(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let b = HostTensor::new(vec![1, 4], vec![7.0, 8.0, 9.0, 10.0]).unwrap();
+    assert!(concat(&a, &b).is_err());
+}

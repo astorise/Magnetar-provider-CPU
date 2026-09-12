@@ -723,6 +723,43 @@ pub fn mul(a: &HostTensor, b: &HostTensor) -> Result<HostTensor, ReferenceCpuErr
     })
 }
 
+/// Row-wise concatenation: `a` and `b` must share the same trailing
+/// (column) dimensions; the result stacks `a`'s rows above `b`'s rows.
+/// KV-history concatenation's exact contract
+/// (`implement-device-resident-multi-step-cuda-decode`): `a` is the
+/// previous steps' historical K/V, `b` is this step's newly computed K/V.
+/// Identical to `magnetar-runtime`'s own in-crate copy of this function.
+pub fn concat(a: &HostTensor, b: &HostTensor) -> Result<HostTensor, ReferenceCpuError> {
+    let Some((&a_rows, a_rest)) = a.shape.split_first() else {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "concat expects a to have at least one dimension",
+        ));
+    };
+    let Some((&b_rows, b_rest)) = b.shape.split_first() else {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            "concat expects b to have at least one dimension",
+        ));
+    };
+    if a_rest != b_rest {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!(
+                "concat expects a and b to share trailing dimensions, got {:?} and {:?}",
+                a.shape, b.shape
+            ),
+        ));
+    }
+    let mut shape = Vec::with_capacity(a.shape.len());
+    shape.push(a_rows + b_rows);
+    shape.extend_from_slice(a_rest);
+    let mut data = Vec::with_capacity(a.data.len() + b.data.len());
+    data.extend_from_slice(&a.data);
+    data.extend_from_slice(&b.data);
+    Ok(HostTensor { shape, data })
+}
+
 pub fn residual_add(
     input: &HostTensor,
     residual: &HostTensor,
@@ -1008,6 +1045,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("gelu", OperatorFamily::Activation),
         baseline_advertisement("activation", OperatorFamily::Activation),
         baseline_advertisement("add", OperatorFamily::Tensor),
+        baseline_advertisement("concat", OperatorFamily::Tensor),
         baseline_advertisement("mul", OperatorFamily::Tensor),
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
@@ -1975,6 +2013,11 @@ impl ReferenceCpuExecutor {
                 let a = self.input_tensor(invocation, 0)?;
                 let b = self.input_tensor(invocation, 1)?;
                 mul(&a, &b).map_err(KernelError::from)?
+            }
+            "concat" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                concat(&a, &b).map_err(KernelError::from)?
             }
             "residual-add" => {
                 let input = self.input_tensor(invocation, 0)?;

@@ -1240,8 +1240,10 @@ impl ReferenceCpuExecutor {
     }
 
     /// See [`ProviderExecutionApi::copy_tensor_admitted`]: a `HostTensor`
-    /// clone under the new id, admitted exactly like
-    /// [`Self::write_tensor_admitted`] already admits any other write.
+    /// clone under the new id, admitted with the same admit-then-store
+    /// shape [`Self::write_tensor_admitted`] uses, but returning the
+    /// allocation id (`write_tensor_admitted`'s own signature predates
+    /// this need and stays unchanged for its existing callers).
     pub fn copy_tensor_admitted(
         &self,
         memory: &mut MemoryManager,
@@ -1249,14 +1251,33 @@ impl ReferenceCpuExecutor {
         to: TensorResourceId,
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
-    ) -> Result<(), TensorValueAdmissionError> {
+    ) -> Result<MemoryAllocationId, TensorValueAdmissionError> {
         let tensor = self.read_tensor(from).ok_or_else(|| {
             TensorValueAdmissionError::Memory(MemoryError::AllocationDenied {
                 reason: format!("copy_tensor_admitted: source resource '{from}' not found"),
             })
         })?;
-        self.write_tensor_admitted(memory, to, tensor, class, owner)
-            .map_err(TensorValueAdmissionError::Memory)
+        let byte_size = tensor.data.len() as u64 * std::mem::size_of::<f32>() as u64;
+        let allocation = memory
+            .allocate(MemoryAllocationRequest::new(
+                class,
+                byte_size,
+                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
+                    REFERENCE_CPU_PROVIDER_NAME,
+                )),
+                owner,
+            ))
+            .map_err(TensorValueAdmissionError::Memory)?;
+        let previous = self
+            .resource_allocations
+            .lock()
+            .unwrap()
+            .insert(to.clone(), allocation.id);
+        if let Some(previous) = previous {
+            let _ = memory.release(previous);
+        }
+        self.storage.lock().unwrap().insert(to, tensor);
+        Ok(allocation.id)
     }
 
     /// See [`ProviderExecutionApi::write_tensor_value`]. Reference CPU only
@@ -2261,7 +2282,7 @@ impl ProviderExecutionApi for ReferenceCpuExecutor {
         to: TensorResourceId,
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
-    ) -> Result<(), TensorValueAdmissionError> {
+    ) -> Result<MemoryAllocationId, TensorValueAdmissionError> {
         ReferenceCpuExecutor::copy_tensor_admitted(self, memory, from, to, class, owner)
     }
 

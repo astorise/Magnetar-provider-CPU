@@ -1230,6 +1230,26 @@ impl ReferenceCpuExecutor {
         self.read_tensor(id).map(TensorValue::Host)
     }
 
+    /// See [`ProviderExecutionApi::copy_tensor_admitted`]: a `HostTensor`
+    /// clone under the new id, admitted exactly like
+    /// [`Self::write_tensor_admitted`] already admits any other write.
+    pub fn copy_tensor_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        from: &TensorResourceId,
+        to: TensorResourceId,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), TensorValueAdmissionError> {
+        let tensor = self.read_tensor(from).ok_or_else(|| {
+            TensorValueAdmissionError::Memory(MemoryError::AllocationDenied {
+                reason: format!("copy_tensor_admitted: source resource '{from}' not found"),
+            })
+        })?;
+        self.write_tensor_admitted(memory, to, tensor, class, owner)
+            .map_err(TensorValueAdmissionError::Memory)
+    }
+
     /// See [`ProviderExecutionApi::write_tensor_value`]. Reference CPU only
     /// ever receives [`TensorValue::Host`]; an [`TensorValue::Opaque`] write
     /// (which would mean "store this, but I have no bytes for it") is not
@@ -2219,6 +2239,17 @@ impl ProviderExecutionApi for ReferenceCpuExecutor {
             class,
             owner,
         )
+    }
+
+    fn copy_tensor_admitted(
+        &self,
+        memory: &mut MemoryManager,
+        from: &TensorResourceId,
+        to: TensorResourceId,
+        class: MemoryAllocationClass,
+        owner: MemoryAllocationOwner,
+    ) -> Result<(), TensorValueAdmissionError> {
+        ReferenceCpuExecutor::copy_tensor_admitted(self, memory, from, to, class, owner)
     }
 
     fn allocate_workspace(

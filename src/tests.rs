@@ -590,3 +590,57 @@ fn concat_rejects_a_trailing_dimension_mismatch() {
     let b = HostTensor::new(vec![1, 4], vec![7.0, 8.0, 9.0, 10.0]).unwrap();
     assert!(concat(&a, &b).is_err());
 }
+
+/// `implement-device-resident-multi-step-cuda-decode` task 4.4:
+/// `copy_tensor_admitted` duplicates a resource's bytes to a fresh
+/// identity, admitted the same way `write_tensor_admitted` already is.
+#[test]
+fn copy_tensor_admitted_duplicates_bytes_to_a_fresh_identity() {
+    let executor = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let source_id = TensorResourceId::new("copy-source");
+    executor
+        .write_tensor_admitted(
+            &mut memory,
+            source_id.clone(),
+            HostTensor::new(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap(),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session("test-session".into()),
+        )
+        .expect("source write succeeds");
+
+    let dest_id = TensorResourceId::new("copy-destination");
+    executor
+        .copy_tensor_admitted(
+            &mut memory,
+            &source_id,
+            dest_id.clone(),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session("test-session".into()),
+        )
+        .expect("copy succeeds");
+
+    assert_eq!(
+        executor
+            .read_tensor(&dest_id)
+            .expect("destination resource is present")
+            .data,
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+}
+
+#[test]
+fn copy_tensor_admitted_rejects_a_missing_source() {
+    let executor = ReferenceCpuExecutor::new();
+    let mut memory = MemoryManager::default();
+    let error = executor
+        .copy_tensor_admitted(
+            &mut memory,
+            &TensorResourceId::new("does-not-exist"),
+            TensorResourceId::new("copy-destination-2"),
+            MemoryAllocationClass::Tensor,
+            MemoryAllocationOwner::Session("test-session".into()),
+        )
+        .expect_err("copying a nonexistent source must fail structurally");
+    assert!(matches!(error, TensorValueAdmissionError::Memory(_)));
+}

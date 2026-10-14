@@ -4,22 +4,15 @@
 name = "magnetar-provider-cpu"
 version = "0.1.0"
 edition = "2024"
-# Never published to crates.io independently -- this crate is only
-# buildable from within a checkout of the parent Magnetar repository (see
-# the path dependency comment below).
-publish = false
+license = "MIT"
+description = "Reference CPU Provider for the Magnetar inference runtime."
+repository = "https://github.com/astorise/Magnetar-provider-CPU"
+readme = "README.md"
+keywords = ["ai", "inference", "magnetar"]
+categories = ["science", "hardware-support"]
+rust-version = "1.98"
 
 [dependencies]
-# Path dependency, not a published crate: this crate is only buildable
-# from within a checkout of the parent Magnetar repository, with this
-# submodule checked out at `providers/cpu` (exactly what CI's
-# `submodule-integration` job does via `submodules: recursive`). A
-# standalone clone of this repository alone cannot resolve this
-# dependency. Default features stay on (wasmtime-component-engine) even
-# though this crate itself only uses the Provider/Kernel/Tensor/Memory
-# contracts -- magnetar-runtime compiles fine with any feature combination
-# (task 12.6 removed the compile-time fail-closed trap this comment used to
-# describe: a missing Component engine now fails closed at runtime instead
-# of at compile time), but there is no reason for this crate to opt out of
-# the default strict engine.
-magnetar-runtime = { path = "../../magnetar-runtime" }
+# `path` resolves inside a checkout of the parent Magnetar repository;
+# `version` is what `cargo publish` records for crates.io consumers.
+magnetar-runtime = { version = "0.1.0", path = "../../magnetar-runtime" }

@@ -644,3 +644,74 @@ fn copy_tensor_admitted_rejects_a_missing_source() {
         .expect_err("copying a nonexistent source must fail structurally");
     assert!(matches!(error, TensorValueAdmissionError::Memory(_)));
 }
+
+/// `fix-rope-rotation-pairing`: Hugging Face's `q * cos + rotate_half(q) *
+/// sin` for one head block, written independently of `rope_with_pairing`.
+fn hugging_face_rotate_half_rope(
+    row: &[f32],
+    base: f32,
+    dimension: usize,
+    position: f32,
+) -> Vec<f32> {
+    let half = dimension / 2;
+    let mut out = row.to_vec();
+    for column in 0..dimension {
+        let pair = column % half;
+        let angle = position * base.powf(-2.0 * pair as f32 / dimension as f32);
+        let rotated = if column < half {
+            -row[column + half]
+        } else {
+            row[column - half]
+        };
+        out[column] = row[column] * angle.cos() + rotated * angle.sin();
+    }
+    out
+}
+
+#[test]
+fn rope_half_split_matches_hugging_face_rotate_half_including_partial_rope() {
+    let mut rng = Rng(0x7a1f);
+    // Two heads of width 6, rotating the first 4 columns of each.
+    let input = rng.tensor(3, 12);
+    let rotated = rope_with_pairing(&input, 10000.0, 1.0, 4, 2, 2, RopePairing::HalfSplit).unwrap();
+    for row in 0..3 {
+        for head in 0..2 {
+            let start = row * 12 + head * 6;
+            assert_eq!(
+                rotated.data[start + 4..start + 6],
+                input.data[start + 4..start + 6],
+                "partial RoPE leaves the tail untouched"
+            );
+            let expected = hugging_face_rotate_half_rope(
+                &input.data[start..start + 4],
+                10000.0,
+                4,
+                (2 + row) as f32,
+            );
+            for (actual, expected) in rotated.data[start..start + 4].iter().zip(&expected) {
+                assert!((actual - expected).abs() < 1e-5, "{actual} vs {expected}");
+            }
+        }
+    }
+}
+
+#[test]
+fn rope_keeps_the_interleaved_default_and_pairings_differ() {
+    let mut rng = Rng(0x7a20);
+    let input = rng.tensor(2, 8);
+    let interleaved =
+        rope_with_pairing(&input, 10000.0, 1.0, 8, 0, 1, RopePairing::Interleaved).unwrap();
+    let half_split =
+        rope_with_pairing(&input, 10000.0, 1.0, 8, 0, 1, RopePairing::HalfSplit).unwrap();
+    assert_eq!(rope(&input, 10000.0, 1.0, 8, 0, 1).unwrap(), interleaved);
+    assert_ne!(interleaved.data[8..], half_split.data[8..]);
+    assert_eq!(
+        RopePairing::from_attribute("half_split"),
+        Some(RopePairing::HalfSplit)
+    );
+    assert_eq!(
+        RopePairing::from_attribute("interleaved"),
+        Some(RopePairing::Interleaved)
+    );
+    assert_eq!(RopePairing::from_attribute("neox"), None);
+}

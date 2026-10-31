@@ -1090,6 +1090,8 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
     vec![
         baseline_advertisement("matmul", OperatorFamily::LinearAlgebra),
         baseline_advertisement("matmul-bias", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("matmul-residual", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("silu-mul", OperatorFamily::Activation),
         embedding,
         baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
         baseline_advertisement("rope", OperatorFamily::PositionEncoding),
@@ -2006,6 +2008,28 @@ impl ReferenceCpuExecutor {
                 let product =
                     matmul(&a, &b, transpose_a, transpose_b).map_err(KernelError::from)?;
                 add(&product, &bias).map_err(KernelError::from)?
+            }
+            // The Runtime's fused `residual + matmul(a, b)`: the matmul, then
+            // the `residual-add` it replaces.
+            "matmul-residual" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                let residual = self.input_tensor(invocation, 2)?;
+                let transpose_a =
+                    Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                let transpose_b =
+                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                Self::require_f32_accumulation(&invocation.attributes)?;
+                let product =
+                    matmul(&a, &b, transpose_a, transpose_b).map_err(KernelError::from)?;
+                residual_add(&residual, &product).map_err(KernelError::from)?
+            }
+            // The Runtime's fused `silu(gate) * up`: `silu`, then the `mul`
+            // it replaces.
+            "silu-mul" => {
+                let gate = self.input_tensor(invocation, 0)?;
+                let up = self.input_tensor(invocation, 1)?;
+                mul(&silu(&gate), &up).map_err(KernelError::from)?
             }
             "embedding" => {
                 let table = self.input_tensor(invocation, 0)?;

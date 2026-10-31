@@ -1089,6 +1089,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
 
     vec![
         baseline_advertisement("matmul", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("matmul-bias", OperatorFamily::LinearAlgebra),
         embedding,
         baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
         baseline_advertisement("rope", OperatorFamily::PositionEncoding),
@@ -1962,6 +1963,21 @@ impl ReferenceCpuExecutor {
         Ok(resource.resource.clone())
     }
 
+    /// `matmul` and `matmul-bias` accumulate in f32 only; any other
+    /// requested `accumulation_dtype` is rejected rather than ignored.
+    fn require_f32_accumulation(
+        attributes: &BTreeMap<String, OperatorAttributeValue>,
+    ) -> Result<(), KernelError> {
+        if let Some(OperatorAttributeValue::DType(dtype)) = attributes.get("accumulation_dtype")
+            && *dtype != ComputeDType::Float32
+        {
+            return Err(KernelError::KernelDTypeUnsupported {
+                dtype: format!("Reference CPU only accumulates in f32; requested {dtype:?}"),
+            });
+        }
+        Ok(())
+    }
+
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
         let mut result = KernelResult::success(invocation.id.clone());
@@ -1973,17 +1989,23 @@ impl ReferenceCpuExecutor {
                     Self::attribute_bool(&invocation.attributes, "transpose_a", false);
                 let transpose_b =
                     Self::attribute_bool(&invocation.attributes, "transpose_b", false);
-                if let Some(OperatorAttributeValue::DType(dtype)) =
-                    invocation.attributes.get("accumulation_dtype")
-                    && *dtype != ComputeDType::Float32
-                {
-                    return Err(KernelError::KernelDTypeUnsupported {
-                        dtype: format!(
-                            "Reference CPU only accumulates in f32; requested {dtype:?}"
-                        ),
-                    });
-                }
+                Self::require_f32_accumulation(&invocation.attributes)?;
                 matmul(&a, &b, transpose_a, transpose_b).map_err(KernelError::from)?
+            }
+            // The Runtime's fused `matmul(a, b) + bias` (`graph_fusion`):
+            // exactly the `matmul` and row-broadcast `add` it replaces.
+            "matmul-bias" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                let bias = self.input_tensor(invocation, 2)?;
+                let transpose_a =
+                    Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                let transpose_b =
+                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                Self::require_f32_accumulation(&invocation.attributes)?;
+                let product =
+                    matmul(&a, &b, transpose_a, transpose_b).map_err(KernelError::from)?;
+                add(&product, &bias).map_err(KernelError::from)?
             }
             "embedding" => {
                 let table = self.input_tensor(invocation, 0)?;

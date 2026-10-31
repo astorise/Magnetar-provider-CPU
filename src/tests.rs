@@ -795,4 +795,14 @@ fn matmul_bias_is_bit_identical_to_matmul_then_add() {
         fused.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
         unfused.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
     );
+    let half_accumulation = invocation.clone().with_attributes(BTreeMap::from([(
+        "accumulation_dtype".to_string(),
+        OperatorAttributeValue::DType(ComputeDType::Float16),
+    )]));
+    let rejected = executor.execute_invocation(advertisement, operator, &half_accumulation);
+    assert_ne!(
+        rejected.status,
+        KernelResultStatus::Succeeded,
+        "like matmul, matmul-bias only accumulates in f32"
+    );
 }

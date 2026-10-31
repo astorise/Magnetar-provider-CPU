@@ -736,3 +736,63 @@ fn kernel_observation_log_keeps_only_the_most_recent_observations() {
         Some(KernelObservationKind::KernelDispatchCompleted)
     );
 }
+
+/// The Runtime's fused `matmul-bias` (`graph_fusion`) must be
+/// bit-identical to the `matmul` + row-broadcast `add` pair it replaces.
+#[test]
+fn matmul_bias_is_bit_identical_to_matmul_then_add() {
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "matmul-bias")
+        .expect("matmul-bias is advertised");
+    let catalog = magnetar_runtime::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    use magnetar_runtime::kernel::{KernelInvocationId, KernelResource};
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let (m, k, n) = (3u64, 37u64, 21u64);
+    let values = |count: u64, seed: u64| -> Vec<f32> {
+        (0..count)
+            .map(|i| (((i * 7919 + seed * 104_729) % 2001) as f32 - 1000.0) * 1.3e-3)
+            .collect()
+    };
+    let a = HostTensor::new(vec![m, k], values(m * k, 1)).unwrap();
+    let b = HostTensor::new(vec![k, n], values(k * n, 2)).unwrap();
+    let bias = HostTensor::new(vec![n], values(n, 3)).unwrap();
+    executor.write_tensor(TensorResourceId::new("a"), a.clone());
+    executor.write_tensor(TensorResourceId::new("b"), b.clone());
+    executor.write_tensor(TensorResourceId::new("bias"), bias.clone());
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("invocation-matmul-bias"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(resource("a", vec![m, k]))
+    .with_input(resource("b", vec![k, n]))
+    .with_input(resource("bias", vec![n]))
+    .with_output(resource("out", vec![m, n]));
+
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    let fused = executor.read_tensor(&TensorResourceId::new("out")).unwrap();
+    let unfused = add(&matmul(&a, &b, false, false).unwrap(), &bias).unwrap();
+    assert_eq!(
+        fused.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        unfused.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+}

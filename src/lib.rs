@@ -1089,6 +1089,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
 
     vec![
         baseline_advertisement("matmul", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("matmul-bias", OperatorFamily::LinearAlgebra),
         embedding,
         baseline_advertisement("rmsnorm", OperatorFamily::Normalization),
         baseline_advertisement("rope", OperatorFamily::PositionEncoding),
@@ -1984,6 +1985,20 @@ impl ReferenceCpuExecutor {
                     });
                 }
                 matmul(&a, &b, transpose_a, transpose_b).map_err(KernelError::from)?
+            }
+            // The Runtime's fused `matmul(a, b) + bias` (`graph_fusion`):
+            // exactly the `matmul` and row-broadcast `add` it replaces.
+            "matmul-bias" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                let bias = self.input_tensor(invocation, 2)?;
+                let transpose_a =
+                    Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                let transpose_b =
+                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                let product =
+                    matmul(&a, &b, transpose_a, transpose_b).map_err(KernelError::from)?;
+                add(&product, &bias).map_err(KernelError::from)?
             }
             "embedding" => {
                 let table = self.input_tensor(invocation, 0)?;

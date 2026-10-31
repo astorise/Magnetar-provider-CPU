@@ -140,6 +140,9 @@ use std::{
 
 /// Stable, package-qualified Reference CPU Provider identity.
 pub const REFERENCE_CPU_PROVIDER_NAME: &str = "magnetar:provider/reference-cpu";
+
+/// How many recent Kernel observations an executor keeps.
+pub const KERNEL_OBSERVATION_LOG_CAPACITY: usize = 4096;
 pub const REFERENCE_CPU_PROVIDER_VERSION: &str = "0.1.0";
 pub const REFERENCE_CPU_PROVIDER_VENDOR: &str = "magnetar";
 pub const REFERENCE_CPU_DEVICE_ID: &str = "reference-cpu:host:0";
@@ -1374,12 +1377,26 @@ impl ReferenceCpuExecutor {
         }
     }
 
+    /// The most recent Kernel observations, oldest first, at most
+    /// `KERNEL_OBSERVATION_LOG_CAPACITY` of them.
     pub fn observations(&self) -> Vec<KernelObservation> {
-        self.observations.lock().unwrap().clone()
+        let observations = self.observations.lock().unwrap();
+        let start = observations
+            .len()
+            .saturating_sub(KERNEL_OBSERVATION_LOG_CAPACITY);
+        observations[start..].to_vec()
     }
 
     fn observe(&self, observation: KernelObservation) {
-        self.observations.lock().unwrap().push(observation);
+        let mut observations = self.observations.lock().unwrap();
+        // Bounded like the Runtime's own observation logs: a resident model
+        // records two observations per dispatched Kernel for as long as it
+        // serves. Dropping the oldest half at twice the capacity keeps the
+        // cost per observation amortized O(1).
+        if observations.len() >= 2 * KERNEL_OBSERVATION_LOG_CAPACITY {
+            observations.drain(..KERNEL_OBSERVATION_LOG_CAPACITY);
+        }
+        observations.push(observation);
     }
 
     /// Runs a small, fixed set of known-input/known-output checks against

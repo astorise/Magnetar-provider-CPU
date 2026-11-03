@@ -537,6 +537,57 @@ pub fn softmax_rows(input: &HostTensor) -> Result<HostTensor, ReferenceCpuError>
     HostTensor::new(input.shape.clone(), out)
 }
 
+/// The `attention` Kernel feature advertised when it honours the `key_count`
+/// attribute (`append-kv-history-in-place`).
+pub const KEY_COUNT_FEATURE: &str = "key-count";
+
+/// The first `count` rows of a rank-2 tensor.
+pub fn leading_rows(tensor: &HostTensor, count: u64) -> Result<HostTensor, ReferenceCpuError> {
+    let (rows, cols) = tensor.rows_cols()?;
+    if count > rows {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("key_count {count} exceeds the {rows} rows of K/V"),
+        ));
+    }
+    HostTensor::new(
+        [count, cols],
+        tensor.data[..(count * cols) as usize].to_vec(),
+    )
+    .map_err(|error| {
+        ReferenceCpuError::new(ReferenceCpuErrorCode::ShapeUnsupported, error.to_string())
+    })
+}
+
+/// Writes `rows` over `store`'s rows `row_offset..row_offset + rows`, in
+/// place (`kv-write`). Rows outside that range are unchanged.
+pub fn kv_write_in_place(
+    store: &mut HostTensor,
+    rows: &HostTensor,
+    row_offset: u64,
+) -> Result<(), ReferenceCpuError> {
+    let (capacity, width) = store.rows_cols()?;
+    let (count, row_width) = rows.rows_cols()?;
+    if row_width != width {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("kv-write rows have width {row_width}, the store {width}"),
+        ));
+    }
+    if row_offset
+        .checked_add(count)
+        .is_none_or(|end| end > capacity)
+    {
+        return Err(ReferenceCpuError::new(
+            ReferenceCpuErrorCode::ShapeUnsupported,
+            format!("kv-write of {count} rows at {row_offset} exceeds the store's {capacity} rows"),
+        ));
+    }
+    let start = (row_offset * width) as usize;
+    store.data[start..start + rows.data.len()].copy_from_slice(&rows.data);
+    Ok(())
+}
+
 /// Simple causal (or unmasked) scaled dot-product attention over `head_count`
 /// query heads of `head_dimension` each. `q` has shape
 /// `[sequence_length, head_count * head_dimension]`; `k`/`v` have shape
@@ -1065,6 +1116,7 @@ fn baseline_advertisement(name: &str, family: OperatorFamily) -> KernelAdvertise
 /// Operators are never assumed available just because Reference CPU exists.
 pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
     let mut attention = baseline_advertisement("attention", OperatorFamily::Attention);
+    attention.id.features.insert(KEY_COUNT_FEATURE.to_string());
     // Attention is the one Kernel that genuinely needs scratch space (the
     // per-query score buffer), so it requests it through the Memory
     // Manager rather than allocating it invisibly to the Runtime. It is
@@ -1102,6 +1154,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("activation", OperatorFamily::Activation),
         baseline_advertisement("add", OperatorFamily::Tensor),
         baseline_advertisement("concat", OperatorFamily::Tensor),
+        baseline_advertisement("kv-write", OperatorFamily::Tensor),
         baseline_advertisement("mul", OperatorFamily::Tensor),
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
@@ -1980,9 +2033,63 @@ impl ReferenceCpuExecutor {
         Ok(())
     }
 
+    /// `kv-write` (`append-kv-history-in-place`): writes the rows into the
+    /// store's own storage in place when the output is the store, as it is
+    /// for a KV history; otherwise into a copy stored under the output.
+    fn run_kv_write(
+        &self,
+        invocation: &KernelInvocation,
+    ) -> Result<TensorResourceDescriptor, KernelError> {
+        let rows = self.input_tensor(invocation, 1)?;
+        let row_offset =
+            Self::attribute_integer(&invocation.attributes, "row_offset").ok_or_else(|| {
+                KernelError::KernelAttributeUnsupported {
+                    attribute: "row_offset".into(),
+                }
+            })?;
+        let store_id = &invocation
+            .inputs
+            .first()
+            .ok_or_else(|| KernelError::KernelExecutionFailed {
+                reason: "missing input at index 0".into(),
+            })?
+            .resource
+            .id;
+        let output =
+            invocation
+                .outputs
+                .first()
+                .ok_or_else(|| KernelError::KernelExecutionFailed {
+                    reason: "missing output at index 0".into(),
+                })?;
+        let mut storage = self.storage.lock().unwrap();
+        let store =
+            storage
+                .get_mut(store_id)
+                .ok_or_else(|| KernelError::KernelExecutionFailed {
+                    reason: format!("no materialized data for input resource {store_id}"),
+                })?;
+        if output.resource.id == *store_id {
+            kv_write_in_place(store, &rows, row_offset).map_err(KernelError::from)?;
+        } else {
+            let mut copy = store.clone();
+            kv_write_in_place(&mut copy, &rows, row_offset).map_err(KernelError::from)?;
+            storage.insert(output.resource.id.clone(), copy);
+        }
+        Ok(output.resource.clone())
+    }
+
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
         let mut result = KernelResult::success(invocation.id.clone());
+        if name == "kv-write" {
+            let descriptor = self.run_kv_write(invocation)?;
+            result
+                .output_readiness
+                .insert(descriptor.id.to_string(), true);
+            result.updated_resources.push(descriptor);
+            return Ok(result);
+        }
         let output = match name {
             "matmul" => {
                 let a = self.input_tensor(invocation, 0)?;
@@ -2176,6 +2283,15 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 }
+                // Only the first `key_count` rows of K and V are the key
+                // sequence (`append-kv-history-in-place`).
+                let (k, v) = match Self::attribute_integer(&invocation.attributes, "key_count") {
+                    None => (k, v),
+                    Some(key_count) => (
+                        leading_rows(&k, key_count).map_err(KernelError::from)?,
+                        leading_rows(&v, key_count).map_err(KernelError::from)?,
+                    ),
+                };
                 attention(
                     &q,
                     &k,

@@ -886,3 +886,52 @@ fn matmul_residual_and_silu_mul_are_bit_identical_to_their_pairs() {
     let unfused = mul(&silu(&gate), &up).unwrap();
     assert_eq!(bits(&fused), bits(&unfused));
 }
+
+/// `append-kv-history-in-place`: `kv-write` writes rows in place and
+/// rejects overruns; attention over the first `key_count` rows of a store
+/// with a NaN tail equals attention over exactly those rows; attention
+/// advertises the `key-count` feature.
+#[test]
+fn kv_write_in_place_and_key_count_attention_ignore_the_store_tail() {
+    let mut store = HostTensor::new([4, 2], vec![0.0; 8]).unwrap();
+    let rows = HostTensor::new([2, 2], vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    kv_write_in_place(&mut store, &rows, 1).unwrap();
+    assert_eq!(store.data, vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0]);
+    assert!(kv_write_in_place(&mut store, &rows, 3).is_err());
+
+    let width = 4u64;
+    let values = |rows: u64, seed: u64| {
+        (0..rows * width)
+            .map(|i| (((i * 37 + seed * 11) % 17) as f32) / 17.0 - 0.5)
+            .collect::<Vec<_>>()
+    };
+    let q = HostTensor::new([2, width], values(2, 1)).unwrap();
+    let k = HostTensor::new([5, width], values(5, 2)).unwrap();
+    let v = HostTensor::new([5, width], values(5, 3)).unwrap();
+    let expected = attention(&q, &k, &v, 2, 2, Some(2), None, true).unwrap();
+    let tail = |tensor: &HostTensor| {
+        let mut data = vec![f32::NAN; (8 * width) as usize];
+        data[..tensor.data.len()].copy_from_slice(&tensor.data);
+        HostTensor::new([8, width], data).unwrap()
+    };
+    let bounded = attention(
+        &q,
+        &leading_rows(&tail(&k), 5).unwrap(),
+        &leading_rows(&tail(&v), 5).unwrap(),
+        2,
+        2,
+        Some(2),
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(bounded.data, expected.data);
+    assert!(
+        reference_cpu_kernel_advertisements()
+            .iter()
+            .any(
+                |advertisement| advertisement.implemented_operator.name() == "attention"
+                    && advertisement.id.features.contains(KEY_COUNT_FEATURE)
+            )
+    );
+}

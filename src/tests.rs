@@ -937,13 +937,13 @@ fn kv_write_in_place_and_key_count_attention_ignore_the_store_tail() {
 }
 
 #[test]
-fn rope_applies_llama3_frequency_scaling_and_advertises_it() {
+fn rope_applies_banded_frequency_scaling_and_advertises_it() {
     let mut rng = Rng(0x11a3);
     let (rows, head_count, head_width) = (2_usize, 2_usize, 16_usize);
     let cols = head_count * head_width;
     let input = rng.tensor(rows as u64, cols as u64);
     let (base, offset) = (500_000.0_f32, 9_000_u64);
-    let scaling = RopeLlama3Scaling {
+    let scaling = RopeBandedFrequencyScaling {
         factor: 8.0,
         low_freq_factor: 1.0,
         high_freq_factor: 4.0,
@@ -979,5 +979,9 @@ fn rope_applies_llama3_frequency_scaling_and_advertises_it() {
         .into_iter()
         .find(|advertisement| advertisement.implemented_operator.name() == "rope")
         .expect("rope is advertised");
-    assert!(rope.id.features.contains(ROPE_LLAMA3_SCALING_FEATURE));
+    assert!(
+        rope.id
+            .features
+            .contains(ROPE_BANDED_FREQUENCY_SCALING_FEATURE)
+    );
 }

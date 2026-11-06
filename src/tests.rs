@@ -935,3 +935,49 @@ fn kv_write_in_place_and_key_count_attention_ignore_the_store_tail() {
             )
     );
 }
+
+#[test]
+fn rope_applies_llama3_frequency_scaling_and_advertises_it() {
+    let mut rng = Rng(0x11a3);
+    let (rows, head_count, head_width) = (2_usize, 2_usize, 16_usize);
+    let cols = head_count * head_width;
+    let input = rng.tensor(rows as u64, cols as u64);
+    let (base, offset) = (500_000.0_f32, 9_000_u64);
+    let scaling = RopeLlama3Scaling {
+        factor: 8.0,
+        low_freq_factor: 1.0,
+        high_freq_factor: 4.0,
+        original_context_length: 64,
+    };
+    let rotated = rope_with_frequency_scaling(
+        &input,
+        base,
+        1.0,
+        head_width as u64,
+        offset,
+        head_count as u64,
+        RopePairing::HalfSplit,
+        Some(&scaling),
+    )
+    .unwrap();
+    let half = head_width / 2;
+    for row in 0..rows {
+        let position = (offset as usize + row) as f32;
+        for head in 0..head_count {
+            let start = row * cols + head * head_width;
+            for pair in 0..half {
+                let frequency =
+                    scaling.scale_frequency(base.powf(-2.0 * pair as f32 / head_width as f32));
+                let (sin, cos) = (position * frequency).sin_cos();
+                let (a, b) = (input.data[start + pair], input.data[start + pair + half]);
+                assert_eq!(rotated.data[start + pair], a * cos - b * sin);
+                assert_eq!(rotated.data[start + pair + half], a * sin + b * cos);
+            }
+        }
+    }
+    let rope = reference_cpu_kernel_advertisements()
+        .into_iter()
+        .find(|advertisement| advertisement.implemented_operator.name() == "rope")
+        .expect("rope is advertised");
+    assert!(rope.id.features.contains(ROPE_LLAMA3_SCALING_FEATURE));
+}

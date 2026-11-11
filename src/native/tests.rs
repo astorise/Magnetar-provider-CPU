@@ -305,3 +305,52 @@ fn packed_matmul_bandwidth() {
         }
     }
 }
+
+/// An f32 embedding table (a k-quant table expanded at load) is gathered
+/// in place, equal to the Reference CPU lookup.
+#[test]
+fn f32_tables_are_gathered_in_place() {
+    let executor = NativeCpuExecutor::with_settings(true, true, 1);
+    let table = activations(10, 64, 71);
+    let id = TensorResourceId::new("table");
+    executor.reference().write_tensor(id.clone(), table.clone());
+    let ids = HostTensor::new([3], vec![2.0, 9.0, 0.0]).unwrap();
+    let ids_id = TensorResourceId::new("ids");
+    executor
+        .reference()
+        .write_tensor(ids_id.clone(), ids.clone());
+    let invocation = invocation_reading("embedding", &[&id, &ids_id]);
+    let actual = NativeState::f32_embedding(executor.reference(), &invocation, &id).unwrap();
+    assert_eq!(actual, embedding_lookup(&table, &ids).unwrap());
+}
+
+/// A `KernelInvocation` of `kernel` reading `inputs`, for direct kernel
+/// calls.
+fn invocation_reading(kernel: &str, inputs: &[&TensorResourceId]) -> KernelInvocation {
+    use magnetar_runtime::kernel::{KernelInvocationId, KernelResource};
+    let advertisement = native_cpu_kernel_advertisements()
+        .into_iter()
+        .find(|advertisement| advertisement.id.name == kernel)
+        .unwrap();
+    let mut invocation = KernelInvocation::new(
+        KernelInvocationId::new("test"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(NATIVE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    for id in inputs {
+        invocation = invocation.with_input(KernelResource::new(
+            TensorResourceDescriptor::new(
+                (*id).clone(),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(vec![1]),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        ));
+    }
+    invocation
+}

@@ -220,6 +220,33 @@ impl NativeState {
         }
     }
 
+    fn f32_embedding(
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+        id: &TensorResourceId,
+    ) -> Result<HostTensor, KernelError> {
+        let ids = executor.input_tensor(invocation, 1)?;
+        let storage = executor.storage.lock().unwrap();
+        let table = storage
+            .get(id)
+            .ok_or_else(|| KernelError::KernelExecutionFailed {
+                reason: format!("no materialized data for input resource {id}"),
+            })?;
+        let (vocab, dim) = table.rows_cols().map_err(KernelError::from)?;
+        let dim = dim as usize;
+        let mut out = Vec::with_capacity(ids.data.len() * dim);
+        for &raw_id in &ids.data {
+            if raw_id < 0.0 || raw_id.fract() != 0.0 || raw_id as u64 >= vocab {
+                return Err(KernelError::KernelExecutionFailed {
+                    reason: format!("token id {raw_id} is not below the vocabulary size {vocab}"),
+                });
+            }
+            let start = raw_id as usize * dim;
+            out.extend_from_slice(&table.data[start..start + dim]);
+        }
+        HostTensor::new([ids.data.len() as u64, dim as u64], out).map_err(KernelError::from)
+    }
+
     fn embedding(
         &self,
         executor: &ReferenceCpuExecutor,
@@ -263,8 +290,14 @@ impl PackedWeights for NativeState {
                 Some(self.matmul(executor, invocation, &weight))
             }
             "embedding" => {
-                let table = self.weight(&invocation.inputs.first()?.resource.id)?;
-                Some(self.embedding(executor, invocation, &table))
+                let id = &invocation.inputs.first()?.resource.id;
+                match self.weight(id) {
+                    Some(table) => Some(self.embedding(executor, invocation, &table)),
+                    // An f32 table (a k-quant table is expanded at load):
+                    // gather its rows in place instead of the Reference
+                    // CPU kernel's copy of the whole table per lookup.
+                    None => Some(Self::f32_embedding(executor, invocation, id)),
+                }
             }
             _ => None,
         }

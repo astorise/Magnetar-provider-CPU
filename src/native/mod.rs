@@ -46,7 +46,10 @@ pub fn simd_level() -> SimdLevel {
         }
         #[cfg(target_arch = "x86_64")]
         {
-            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            if std::is_x86_feature_detected!("avx2")
+                && std::is_x86_feature_detected!("fma")
+                && std::is_x86_feature_detected!("f16c")
+            {
                 return SimdLevel::Avx2;
             }
         }

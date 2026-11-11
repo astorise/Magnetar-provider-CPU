@@ -495,7 +495,7 @@ fn columns<const F: u8>(
 /// `vpmaddwd`; the products stay in eight f32 lanes per row, scaled by the
 /// run's half scales, and are summed horizontally once per column.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn columns_avx2<const F: u8>(
     reader: &RunReader<'_>,
     quantized: &QuantizedRows,
@@ -508,6 +508,7 @@ unsafe fn columns_avx2<const F: u8>(
     use std::arch::x86_64::*;
     let runs = k / RUN;
     let mut run = Run::default();
+    let mut cache = BlockCache::default();
     let mut acc = vec![_mm256_setzero_ps(); m];
     let mut mins = vec![0.0_f32; m];
     for c in 0..count {
@@ -516,23 +517,26 @@ unsafe fn columns_avx2<const F: u8>(
         mins.iter_mut().for_each(|value| *value = 0.0);
         for u in 0..runs {
             // SAFETY: AVX2 is enabled for this function.
-            let w = unsafe { vector_run::<F>(reader, first + c, u, &mut run) };
+            let w = unsafe { vector_run::<F>(reader, first + c, u, &mut run, &mut cache) };
             let has_min = run.min[0] != 0.0 || run.min[1] != 0.0;
-            let w0 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(w));
-            let w1 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(w, 1));
+            // `vpmaddubsw` takes unsigned times signed bytes: the weights'
+            // magnitudes (|-128| reads as an unsigned 128) against the
+            // activations carrying the weights' signs, exact since the
+            // activations stay within +-127.
+            let magnitudes = _mm256_sign_epi8(w, w);
             for r in 0..m {
                 let block = r * runs + u;
                 // SAFETY: each quantized block holds 32 values.
                 let x = unsafe {
                     _mm256_loadu_si256(quantized.values.as_ptr().add(block * RUN).cast())
                 };
-                let x0 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(x));
-                let x1 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(x, 1));
+                let pairs = _mm256_maddubs_epi16(magnitudes, _mm256_sign_epi8(x, w));
+                // Lanes 0-3 sum the first 16 values, lanes 4-7 the others.
+                let sums = _mm256_cvtepi32_ps(_mm256_madd_epi16(pairs, _mm256_set1_epi16(1)));
                 let d = quantized.scales[block];
-                let p0 = _mm256_cvtepi32_ps(_mm256_madd_epi16(w0, x0));
-                let p1 = _mm256_cvtepi32_ps(_mm256_madd_epi16(w1, x1));
-                acc[r] = _mm256_fmadd_ps(p0, _mm256_set1_ps(d * run.scale[0]), acc[r]);
-                acc[r] = _mm256_fmadd_ps(p1, _mm256_set1_ps(d * run.scale[1]), acc[r]);
+                let scales =
+                    _mm256_set_m128(_mm_set1_ps(d * run.scale[1]), _mm_set1_ps(d * run.scale[0]));
+                acc[r] = _mm256_fmadd_ps(sums, scales, acc[r]);
                 if has_min {
                     let sums = quantized.sums[block];
                     mins[r] += d * (run.min[0] * sums[0] as f32 + run.min[1] * sums[1] as f32);
@@ -552,21 +556,89 @@ unsafe fn columns_avx2<const F: u8>(
     }
 }
 
+/// A block's per-run half scales and mins, computed once per block
+/// (k-quant and IQ4_XS super-blocks hold eight runs).
+#[derive(Default)]
+struct BlockCache {
+    start: usize,
+    scales: [[f32; 2]; 8],
+    mins: [[f32; 2]; 8],
+}
+
+/// An `f16`'s value through the F16C conversion instruction.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c")]
+#[inline]
+fn half_f16c(bytes: &[u8], at: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let bits = i32::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(bits)))
+}
+
+/// Fills `cache` for `block` of format `format` (k-quants and IQ4_XS).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "f16c")]
+fn fill_block_cache(format: PackedWeightFormat, block: &[u8], cache: &mut BlockCache) {
+    match format {
+        PackedWeightFormat::Q4K => {
+            let d = half_f16c(block, 0);
+            let dmin = half_f16c(block, 2);
+            for run in 0..8 {
+                let (sc, m) = scale_min_k4(run, &block[4..16]);
+                cache.scales[run] = [d * f32::from(sc); 2];
+                cache.mins[run] = [dmin * f32::from(m); 2];
+            }
+        }
+        PackedWeightFormat::Q6K => {
+            let d = half_f16c(block, 208);
+            for run in 0..8 {
+                let (h, g) = (run / 4, run % 4);
+                let sc = |i: usize| d * f32::from(block[192 + 8 * h + 2 * g + i] as i8);
+                cache.scales[run] = [sc(0), sc(1)];
+                cache.mins[run] = [0.0, 0.0];
+            }
+        }
+        PackedWeightFormat::Iq4Xs => {
+            let d = half_f16c(block, 0);
+            for (run, scale) in iq4_xs_scales(&block[2..8]).into_iter().enumerate() {
+                cache.scales[run] = [d * f32::from(scale); 2];
+                cache.mins[run] = [0.0, 0.0];
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A run's 32 signed values as one AVX2 register, its scales and mins in
 /// `run`: decoded straight from the block bytes for `Q8_0` (a load),
-/// `Q4_K` (a shift and a mask) and the IQ4 formats (`vpshufb` through the
-/// non-linear table), through [`decode`] for the others.
+/// `Q4_K` (a shift and a mask), `Q6_K` (shifts, masks and a subtraction)
+/// and the IQ4 formats (`vpshufb` through the non-linear table), with
+/// block scales computed once per block; through [`decode`] for the others.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,f16c")]
 #[inline]
 unsafe fn vector_run<const F: u8>(
     reader: &RunReader<'_>,
     row: usize,
     index: usize,
     run: &mut Run,
+    cache: &mut BlockCache,
 ) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::*;
     let (block, local) = reader.block(row, index);
+    let format = FORMATS[F as usize];
+    if matches!(
+        format,
+        PackedWeightFormat::Q4K | PackedWeightFormat::Q6K | PackedWeightFormat::Iq4Xs
+    ) {
+        let start = block.as_ptr() as usize;
+        if cache.start != start {
+            fill_block_cache(format, block, cache);
+            cache.start = start;
+        }
+        run.scale = cache.scales[local];
+        run.min = cache.mins[local];
+    }
     let nibbles = |bytes: __m128i| {
         let low = _mm_and_si128(bytes, _mm_set1_epi8(0xF));
         let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), _mm_set1_epi8(0xF));
@@ -579,18 +651,13 @@ unsafe fn vector_run<const F: u8>(
     };
     match FORMATS[F as usize] {
         PackedWeightFormat::Q8_0 => {
-            let d = half(block, 0);
+            let d = half_f16c(block, 0);
             run.scale = [d, d];
             run.min = [0.0, 0.0];
             // SAFETY: a Q8_0 block holds 32 quants after its scale.
             unsafe { _mm256_loadu_si256(block.as_ptr().add(2).cast()) }
         }
         PackedWeightFormat::Q4K => {
-            let d = half(block, 0);
-            let dmin = half(block, 2);
-            let (sc, m) = scale_min_k4(local, &block[4..16]);
-            run.scale = [d * f32::from(sc); 2];
-            run.min = [dmin * f32::from(m); 2];
             // SAFETY: each Q4_K chunk holds 32 quant bytes.
             let bytes =
                 unsafe { _mm256_loadu_si256(block.as_ptr().add(16 + 32 * (local / 2)).cast()) };
@@ -601,8 +668,32 @@ unsafe fn vector_run<const F: u8>(
             };
             _mm256_and_si256(bytes, _mm256_set1_epi8(0xF))
         }
+        PackedWeightFormat::Q6K => {
+            let (h, g) = (local / 4, local % 4);
+            // SAFETY: the low and high quant bytes of a run are 32 each.
+            let (low, high) = unsafe {
+                (
+                    _mm256_loadu_si256(block.as_ptr().add(64 * h + 32 * (g % 2)).cast()),
+                    _mm256_loadu_si256(block.as_ptr().add(128 + 32 * h).cast()),
+                )
+            };
+            let low = if g < 2 {
+                low
+            } else {
+                _mm256_srli_epi16(low, 4)
+            };
+            let low = _mm256_and_si256(low, _mm256_set1_epi8(0xF));
+            let high = match g {
+                0 => high,
+                1 => _mm256_srli_epi16(high, 2),
+                2 => _mm256_srli_epi16(high, 4),
+                _ => _mm256_srli_epi16(high, 6),
+            };
+            let high = _mm256_slli_epi16(_mm256_and_si256(high, _mm256_set1_epi8(3)), 4);
+            _mm256_sub_epi8(_mm256_or_si256(low, high), _mm256_set1_epi8(32))
+        }
         PackedWeightFormat::Iq4Nl => {
-            let d = half(block, 0);
+            let d = half_f16c(block, 0);
             run.scale = [d, d];
             run.min = [0.0, 0.0];
             // SAFETY: an IQ4_NL block holds 16 index bytes after its scale.
@@ -611,9 +702,6 @@ unsafe fn vector_run<const F: u8>(
             }))
         }
         PackedWeightFormat::Iq4Xs => {
-            let scale = half(block, 0) * f32::from(iq4_xs_scales(&block[2..8])[local]);
-            run.scale = [scale, scale];
-            run.min = [0.0, 0.0];
             // SAFETY: each IQ4_XS run holds 16 index bytes.
             iq4(nibbles(unsafe {
                 _mm_loadu_si128(block.as_ptr().add(8 + 16 * local).cast())

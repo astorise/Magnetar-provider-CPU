@@ -453,6 +453,37 @@ fn columns<const F: u8>(
     #[cfg(target_arch = "x86_64")]
     if let Some(quantized) = activations.quantized
         && super::simd_level() >= super::SimdLevel::Avx2
+    {
+        let (m, k) = (activations.m, activations.k);
+        // SAFETY: AVX2, FMA and F16C were detected at run time.
+        let done = unsafe {
+            match FORMATS[F as usize] {
+                PackedWeightFormat::Q2K => {
+                    columns_q2k_avx2(reader, quantized, m, k, first, count, out);
+                    true
+                }
+                PackedWeightFormat::Q3K => {
+                    columns_q3k_avx2(reader, quantized, m, k, first, count, out);
+                    true
+                }
+                PackedWeightFormat::Iq4Xs => {
+                    columns_iq4xs_avx2(reader, quantized, m, k, first, count, out);
+                    true
+                }
+                PackedWeightFormat::Iq4Nl => {
+                    columns_iq4nl_avx2(reader, quantized, m, k, first, count, out);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if done {
+            return;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if let Some(quantized) = activations.quantized
+        && super::simd_level() >= super::SimdLevel::Avx2
         && FORMATS[F as usize] == PackedWeightFormat::Q6K
     {
         // SAFETY: AVX2, FMA and F16C were detected at run time.
@@ -762,6 +793,328 @@ unsafe fn columns_q6k_avx2(
             let half = _mm_add_ps(half, _mm_movehl_ps(half, half));
             let half = _mm_add_ss(half, _mm_shuffle_ps(half, half, 0b01));
             out[r * count + c] = _mm_cvtss_f32(half) - offsets[r];
+        }
+    }
+}
+
+/// The sum of an AVX2 register's eight f32 lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn hsum(lanes: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let half = _mm_add_ps(
+        _mm256_castps256_ps128(lanes),
+        _mm256_extractf128_ps(lanes, 1),
+    );
+    let half = _mm_add_ps(half, _mm_movehl_ps(half, half));
+    _mm_cvtss_f32(_mm_add_ss(half, _mm_shuffle_ps(half, half, 0b01)))
+}
+
+/// Accumulates one run of unsigned weight values `w` (as bytes) for every
+/// row: lanes 0-3 of the products scaled by `scale[0]`, lanes 4-7 by
+/// `scale[1]`, and each half's activation sum times `offset[p]`
+/// subtracted (a min, or a constant offset of the encoding times its
+/// scale).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn accumulate_unsigned(
+    w: std::arch::x86_64::__m256i,
+    scale: [f32; 2],
+    offset: [f32; 2],
+    quantized: &QuantizedRows,
+    runs: usize,
+    u: usize,
+    acc: &mut [std::arch::x86_64::__m256],
+    offsets: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let values = quantized.values.as_ptr();
+    for (r, (lanes, total)) in acc.iter_mut().zip(offsets.iter_mut()).enumerate() {
+        let index = r * runs + u;
+        // SAFETY: each quantized block holds 32 values.
+        let x = unsafe { _mm256_loadu_si256(values.add(index * RUN).cast()) };
+        let sums = _mm256_cvtepi32_ps(_mm256_madd_epi16(
+            _mm256_maddubs_epi16(w, x),
+            _mm256_set1_epi16(1),
+        ));
+        let da = quantized.scales[index];
+        let scales = _mm256_set_m128(_mm_set1_ps(da * scale[1]), _mm_set1_ps(da * scale[0]));
+        *lanes = _mm256_fmadd_ps(sums, scales, *lanes);
+        let [s0, s1] = quantized.sums[index];
+        *total += da * (offset[0] * s0 as f32 + offset[1] * s1 as f32);
+    }
+}
+
+/// [`accumulate_unsigned`] for signed weight values (one scale per run):
+/// `vpmaddubsw` on their magnitudes against the activations carrying their
+/// signs.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+fn accumulate_signed(
+    w: std::arch::x86_64::__m256i,
+    scale: f32,
+    quantized: &QuantizedRows,
+    runs: usize,
+    u: usize,
+    acc: &mut [std::arch::x86_64::__m256],
+) {
+    use std::arch::x86_64::*;
+    let values = quantized.values.as_ptr();
+    let magnitudes = _mm256_sign_epi8(w, w);
+    for (r, lanes) in acc.iter_mut().enumerate() {
+        let index = r * runs + u;
+        // SAFETY: each quantized block holds 32 values.
+        let x = unsafe { _mm256_loadu_si256(values.add(index * RUN).cast()) };
+        let sums = _mm256_cvtepi32_ps(_mm256_madd_epi16(
+            _mm256_maddubs_epi16(magnitudes, _mm256_sign_epi8(x, w)),
+            _mm256_set1_epi16(1),
+        ));
+        let da = quantized.scales[index];
+        *lanes = _mm256_fmadd_ps(sums, _mm256_set1_ps(da * scale), *lanes);
+    }
+}
+
+/// Specialized `Q2_K`: each half's 32 quant bytes loaded once for its four
+/// runs (bits `2 j`), unsigned 0..3 against the activations, mins through
+/// the activation sums.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn columns_q2k_avx2(
+    reader: &RunReader<'_>,
+    quantized: &QuantizedRows,
+    m: usize,
+    k: usize,
+    first: usize,
+    count: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    const BLOCK: usize = 84;
+    let (runs, blocks) = (k / RUN, k / 256);
+    let mut acc = vec![_mm256_setzero_ps(); m];
+    let mut mins = vec![0.0_f32; m];
+    let mask = _mm256_set1_epi8(3);
+    for c in 0..count {
+        acc.iter_mut()
+            .for_each(|lanes| *lanes = _mm256_setzero_ps());
+        mins.iter_mut().for_each(|value| *value = 0.0);
+        let row = &reader.bytes[(first + c) * reader.row_bytes..][..reader.row_bytes];
+        for b in 0..blocks {
+            let block = &row[b * BLOCK..][..BLOCK];
+            let d = half_f16c(block, 80);
+            let dmin = half_f16c(block, 82);
+            for h in 0..2 {
+                // SAFETY: a Q2_K half holds 32 quant bytes.
+                let bytes = unsafe { _mm256_loadu_si256(block.as_ptr().add(16 + 32 * h).cast()) };
+                let shifted = [
+                    bytes,
+                    _mm256_srli_epi16(bytes, 2),
+                    _mm256_srli_epi16(bytes, 4),
+                    _mm256_srli_epi16(bytes, 6),
+                ];
+                for (j, bits) in shifted.into_iter().enumerate() {
+                    let (sc0, sc1) = (block[8 * h + 2 * j], block[8 * h + 2 * j + 1]);
+                    accumulate_unsigned(
+                        _mm256_and_si256(bits, mask),
+                        [d * f32::from(sc0 & 0xF), d * f32::from(sc1 & 0xF)],
+                        [dmin * f32::from(sc0 >> 4), dmin * f32::from(sc1 >> 4)],
+                        quantized,
+                        runs,
+                        b * 8 + 4 * h + j,
+                        &mut acc,
+                        &mut mins,
+                    );
+                }
+            }
+        }
+        for r in 0..m {
+            out[r * count + c] = hsum(acc[r]) - mins[r];
+        }
+    }
+}
+
+/// Specialized `Q3_K`: each half's 32 quant bytes and the 32 mask bytes
+/// loaded once for its four runs, values kept unsigned (0..7) and their -4
+/// offset applied through the activation sums.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn columns_q3k_avx2(
+    reader: &RunReader<'_>,
+    quantized: &QuantizedRows,
+    m: usize,
+    k: usize,
+    first: usize,
+    count: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    const BLOCK: usize = 110;
+    let (runs, blocks) = (k / RUN, k / 256);
+    let mut acc = vec![_mm256_setzero_ps(); m];
+    let mut offsets = vec![0.0_f32; m];
+    let (low_mask, one) = (_mm256_set1_epi8(3), _mm256_set1_epi8(1));
+    for c in 0..count {
+        acc.iter_mut()
+            .for_each(|lanes| *lanes = _mm256_setzero_ps());
+        offsets.iter_mut().for_each(|value| *value = 0.0);
+        let row = &reader.bytes[(first + c) * reader.row_bytes..][..reader.row_bytes];
+        for b in 0..blocks {
+            let block = &row[b * BLOCK..][..BLOCK];
+            let d = half_f16c(block, 108);
+            let scales = q3_k_scales(&block[96..108]);
+            // SAFETY: a Q3_K block starts with 32 mask bytes.
+            let mask = unsafe { _mm256_loadu_si256(block.as_ptr().cast()) };
+            for h in 0..2 {
+                // SAFETY: a Q3_K half holds 32 quant bytes.
+                let bytes = unsafe { _mm256_loadu_si256(block.as_ptr().add(32 + 32 * h).cast()) };
+                for j in 0..4 {
+                    let low = _mm256_and_si256(
+                        _mm256_srl_epi16(bytes, _mm_cvtsi32_si128(2 * j as i32)),
+                        low_mask,
+                    );
+                    let high = _mm256_and_si256(
+                        _mm256_srl_epi16(mask, _mm_cvtsi32_si128((4 * h + j) as i32)),
+                        one,
+                    );
+                    let w = _mm256_or_si256(low, _mm256_slli_epi16(high, 2));
+                    let sc = |p: usize| d * f32::from(scales[8 * h + 2 * j + p] - 32);
+                    let scale = [sc(0), sc(1)];
+                    accumulate_unsigned(
+                        w,
+                        scale,
+                        [4.0 * scale[0], 4.0 * scale[1]],
+                        quantized,
+                        runs,
+                        b * 8 + 4 * h + j,
+                        &mut acc,
+                        &mut offsets,
+                    );
+                }
+            }
+        }
+        for r in 0..m {
+            out[r * count + c] = hsum(acc[r]) - offsets[r];
+        }
+    }
+}
+
+/// The IQ4 non-linear values for 32 indices given as two 16-byte runs'
+/// worth of packed nibbles: `(first run, second run)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn iq4_pair(
+    bytes: std::arch::x86_64::__m256i,
+) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
+    use std::arch::x86_64::*;
+    let mask = _mm256_set1_epi8(0xF);
+    let low = _mm256_and_si256(bytes, mask);
+    let high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
+    // SAFETY: the table holds 16 bytes.
+    let table = unsafe { _mm_loadu_si128(IQ4_NL_VALUES.as_ptr().cast()) };
+    let table = _mm256_set_m128i(table, table);
+    (
+        _mm256_shuffle_epi8(table, _mm256_permute2x128_si256(low, high, 0x20)),
+        _mm256_shuffle_epi8(table, _mm256_permute2x128_si256(low, high, 0x31)),
+    )
+}
+
+/// Specialized `IQ4_XS`: scales decoded once per super-block, two runs'
+/// index bytes loaded together and mapped through the table by
+/// `vpshufb`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn columns_iq4xs_avx2(
+    reader: &RunReader<'_>,
+    quantized: &QuantizedRows,
+    m: usize,
+    k: usize,
+    first: usize,
+    count: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    const BLOCK: usize = 136;
+    let (runs, blocks) = (k / RUN, k / 256);
+    let mut acc = vec![_mm256_setzero_ps(); m];
+    for c in 0..count {
+        acc.iter_mut()
+            .for_each(|lanes| *lanes = _mm256_setzero_ps());
+        let row = &reader.bytes[(first + c) * reader.row_bytes..][..reader.row_bytes];
+        for b in 0..blocks {
+            let block = &row[b * BLOCK..][..BLOCK];
+            let d = half_f16c(block, 0);
+            let scales = iq4_xs_scales(&block[2..8]);
+            for pair in 0..4 {
+                // SAFETY: two IQ4_XS runs hold 32 index bytes.
+                let bytes = unsafe { _mm256_loadu_si256(block.as_ptr().add(8 + 32 * pair).cast()) };
+                let (w0, w1) = iq4_pair(bytes);
+                for (i, w) in [(0, w0), (1, w1)] {
+                    let j = 2 * pair + i;
+                    accumulate_signed(
+                        w,
+                        d * f32::from(scales[j]),
+                        quantized,
+                        runs,
+                        b * 8 + j,
+                        &mut acc,
+                    );
+                }
+            }
+        }
+        for r in 0..m {
+            out[r * count + c] = hsum(acc[r]);
+        }
+    }
+}
+
+/// Specialized `IQ4_NL`: two consecutive blocks' index bytes gathered into
+/// one register and mapped through the table by `vpshufb`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn columns_iq4nl_avx2(
+    reader: &RunReader<'_>,
+    quantized: &QuantizedRows,
+    m: usize,
+    k: usize,
+    first: usize,
+    count: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    const BLOCK: usize = 18;
+    let runs = k / RUN;
+    let mut acc = vec![_mm256_setzero_ps(); m];
+    for c in 0..count {
+        acc.iter_mut()
+            .for_each(|lanes| *lanes = _mm256_setzero_ps());
+        let row = &reader.bytes[(first + c) * reader.row_bytes..][..reader.row_bytes];
+        let mut u = 0;
+        while u < runs {
+            let pair = u + 1 < runs;
+            let block0 = &row[u * BLOCK..][..BLOCK];
+            // SAFETY: each IQ4_NL block holds 16 index bytes after its scale.
+            let low = unsafe { _mm_loadu_si128(block0.as_ptr().add(2).cast()) };
+            let high = if pair {
+                // SAFETY: as above, for the next block.
+                unsafe { _mm_loadu_si128(row.as_ptr().add((u + 1) * BLOCK + 2).cast()) }
+            } else {
+                _mm_setzero_si128()
+            };
+            let (w0, w1) = iq4_pair(_mm256_set_m128i(high, low));
+            accumulate_signed(w0, half_f16c(block0, 0), quantized, runs, u, &mut acc);
+            if pair {
+                let d1 = half_f16c(&row[(u + 1) * BLOCK..][..BLOCK], 0);
+                accumulate_signed(w1, d1, quantized, runs, u + 1, &mut acc);
+            }
+            u += 2;
+        }
+        for r in 0..m {
+            out[r * count + c] = hsum(acc[r]);
         }
     }
 }

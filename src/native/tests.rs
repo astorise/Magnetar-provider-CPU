@@ -151,6 +151,22 @@ fn packed_matmuls_match_the_reference_cpu() {
     }
 }
 
+/// 32-value block formats whose row holds an odd number of runs take the
+/// paired kernels' single-run tail.
+#[test]
+fn odd_run_counts_match_the_reference_cpu() {
+    let (k, n) = (96_u64, 5_u64);
+    for format in [PackedWeightFormat::Q8_0, PackedWeightFormat::Iq4Nl] {
+        let weight = packed(format, n, k, true, 23);
+        let dense = weight.dequantize();
+        let state = state(true, 1);
+        let a = activations(2, k, 7);
+        let expected = matmul(&int8_rounded(&a), &dense, false, false).unwrap();
+        let actual = state.packed_matmul(&a, &weight).unwrap();
+        assert_close(&actual, &expected, &format!("{format:?} odd runs"));
+    }
+}
+
 /// A packed untransposed table serves embedding lookups, and its tied use
 /// as an output head (`transpose_b`) reads it packed.
 #[test]
@@ -283,6 +299,8 @@ fn packed_matmul_bandwidth() {
         PackedWeightFormat::Q6K,
         PackedWeightFormat::Iq4Xs,
         PackedWeightFormat::Q2K,
+        PackedWeightFormat::Q3K,
+        PackedWeightFormat::Iq4Nl,
         PackedWeightFormat::Iq2Xs,
     ] {
         for (k, n) in [(4096_u64, 14_336_u64), (14_336, 4096)] {

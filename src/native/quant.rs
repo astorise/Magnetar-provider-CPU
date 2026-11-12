@@ -434,6 +434,25 @@ fn columns<const F: u8>(
     #[cfg(target_arch = "x86_64")]
     if let Some(quantized) = activations.quantized
         && super::simd_level() >= super::SimdLevel::Avx2
+        && FORMATS[F as usize] == PackedWeightFormat::Q4K
+    {
+        // SAFETY: AVX2, FMA and F16C were detected at run time.
+        unsafe {
+            columns_q4k_avx2(
+                reader,
+                quantized,
+                activations.m,
+                activations.k,
+                first,
+                count,
+                out,
+            )
+        };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if let Some(quantized) = activations.quantized
+        && super::simd_level() >= super::SimdLevel::Avx2
     {
         // SAFETY: AVX2 and FMA were detected at run time (`simd_level`).
         unsafe {
@@ -540,6 +559,86 @@ unsafe fn columns_avx2<const F: u8>(
                 if has_min {
                     let sums = quantized.sums[block];
                     mins[r] += d * (run.min[0] * sums[0] as f32 + run.min[1] * sums[1] as f32);
+                }
+            }
+        }
+        for r in 0..m {
+            let lanes = acc[r];
+            let half = _mm_add_ps(
+                _mm256_castps256_ps128(lanes),
+                _mm256_extractf128_ps(lanes, 1),
+            );
+            let half = _mm_add_ps(half, _mm_movehl_ps(half, half));
+            let half = _mm_add_ss(half, _mm_shuffle_ps(half, half, 0b01));
+            out[r * count + c] = _mm_cvtss_f32(half) - mins[r];
+        }
+    }
+}
+
+/// [`columns_avx2`] specialized for `Q4_K`: one pass per super-block (its
+/// `d`, `dmin` and eight scale/min pairs decoded once), each 32-byte quant
+/// chunk loaded once for its two runs (low and high nibbles), and the
+/// unsigned nibbles multiplied with the signed activations by
+/// `vpmaddubsw` directly.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn columns_q4k_avx2(
+    reader: &RunReader<'_>,
+    quantized: &QuantizedRows,
+    m: usize,
+    k: usize,
+    first: usize,
+    count: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    const BLOCK: usize = 144;
+    let runs = k / RUN;
+    let blocks = k / 256;
+    debug_assert_eq!(reader.row_bytes, blocks * BLOCK);
+    let mut acc = vec![_mm256_setzero_ps(); m];
+    let mut mins = vec![0.0_f32; m];
+    let low_mask = _mm256_set1_epi8(0xF);
+    let ones = _mm256_set1_epi16(1);
+    let values = quantized.values.as_ptr();
+    for c in 0..count {
+        acc.iter_mut()
+            .for_each(|lanes| *lanes = _mm256_setzero_ps());
+        mins.iter_mut().for_each(|value| *value = 0.0);
+        let row = &reader.bytes[(first + c) * reader.row_bytes..][..reader.row_bytes];
+        for b in 0..blocks {
+            let block = &row[b * BLOCK..][..BLOCK];
+            let d = half_f16c(block, 0);
+            let dmin = half_f16c(block, 2);
+            let mut scale = [0.0_f32; 8];
+            let mut min = [0.0_f32; 8];
+            for j in 0..8 {
+                let (sc, mn) = scale_min_k4(j, &block[4..16]);
+                scale[j] = d * f32::from(sc);
+                min[j] = dmin * f32::from(mn);
+            }
+            for chunk in 0..4 {
+                // SAFETY: a Q4_K super-block holds four 32-byte quant chunks.
+                let bytes =
+                    unsafe { _mm256_loadu_si256(block.as_ptr().add(16 + 32 * chunk).cast()) };
+                let nibbles = [
+                    _mm256_and_si256(bytes, low_mask),
+                    _mm256_and_si256(_mm256_srli_epi16(bytes, 4), low_mask),
+                ];
+                for (half, w) in nibbles.into_iter().enumerate() {
+                    let j = 2 * chunk + half;
+                    let u = b * 8 + j;
+                    for r in 0..m {
+                        let index = r * runs + u;
+                        // SAFETY: each quantized block holds 32 values.
+                        let x = unsafe { _mm256_loadu_si256(values.add(index * RUN).cast()) };
+                        let sums =
+                            _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(w, x), ones));
+                        let da = quantized.scales[index];
+                        acc[r] = _mm256_fmadd_ps(sums, _mm256_set1_ps(da * scale[j]), acc[r]);
+                        let [s0, s1] = quantized.sums[index];
+                        mins[r] += da * min[j] * (s0 + s1) as f32;
+                    }
                 }
             }
         }

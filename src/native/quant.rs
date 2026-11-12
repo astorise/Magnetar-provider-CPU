@@ -453,6 +453,25 @@ fn columns<const F: u8>(
     #[cfg(target_arch = "x86_64")]
     if let Some(quantized) = activations.quantized
         && super::simd_level() >= super::SimdLevel::Avx2
+        && FORMATS[F as usize] == PackedWeightFormat::Q6K
+    {
+        // SAFETY: AVX2, FMA and F16C were detected at run time.
+        unsafe {
+            columns_q6k_avx2(
+                reader,
+                quantized,
+                activations.m,
+                activations.k,
+                first,
+                count,
+                out,
+            )
+        };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if let Some(quantized) = activations.quantized
+        && super::simd_level() >= super::SimdLevel::Avx2
     {
         // SAFETY: AVX2 and FMA were detected at run time (`simd_level`).
         unsafe {
@@ -651,6 +670,98 @@ unsafe fn columns_q4k_avx2(
             let half = _mm_add_ps(half, _mm_movehl_ps(half, half));
             let half = _mm_add_ss(half, _mm_shuffle_ps(half, half, 0b01));
             out[r * count + c] = _mm_cvtss_f32(half) - mins[r];
+        }
+    }
+}
+
+/// [`columns_avx2`] specialized for `Q6_K`: one pass per super-block, each
+/// half's two low-nibble chunks and high-bit chunk loaded once for its four
+/// runs, the six-bit values kept unsigned (0..63) for `vpmaddubsw` and their
+/// -32 offset applied through the activation sums.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn columns_q6k_avx2(
+    reader: &RunReader<'_>,
+    quantized: &QuantizedRows,
+    m: usize,
+    k: usize,
+    first: usize,
+    count: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    const BLOCK: usize = 210;
+    let runs = k / RUN;
+    let blocks = k / 256;
+    let mut acc = vec![_mm256_setzero_ps(); m];
+    let mut offsets = vec![0.0_f32; m];
+    let low_mask = _mm256_set1_epi8(0xF);
+    let high_mask = _mm256_set1_epi8(3);
+    let ones = _mm256_set1_epi16(1);
+    let values = quantized.values.as_ptr();
+    for c in 0..count {
+        acc.iter_mut()
+            .for_each(|lanes| *lanes = _mm256_setzero_ps());
+        offsets.iter_mut().for_each(|value| *value = 0.0);
+        let row = &reader.bytes[(first + c) * reader.row_bytes..][..reader.row_bytes];
+        for b in 0..blocks {
+            let block = &row[b * BLOCK..][..BLOCK];
+            let d = half_f16c(block, 208);
+            for h in 0..2 {
+                // SAFETY: a Q6_K half holds two 32-byte low chunks and one
+                // 32-byte high chunk.
+                let (low_a, low_b, high) = unsafe {
+                    (
+                        _mm256_loadu_si256(block.as_ptr().add(64 * h).cast()),
+                        _mm256_loadu_si256(block.as_ptr().add(64 * h + 32).cast()),
+                        _mm256_loadu_si256(block.as_ptr().add(128 + 32 * h).cast()),
+                    )
+                };
+                let high_bits = [
+                    high,
+                    _mm256_srli_epi16(high, 2),
+                    _mm256_srli_epi16(high, 4),
+                    _mm256_srli_epi16(high, 6),
+                ];
+                let low = [
+                    low_a,
+                    low_b,
+                    _mm256_srli_epi16(low_a, 4),
+                    _mm256_srli_epi16(low_b, 4),
+                ];
+                for g in 0..4 {
+                    let w = _mm256_or_si256(
+                        _mm256_and_si256(low[g], low_mask),
+                        _mm256_slli_epi16(_mm256_and_si256(high_bits[g], high_mask), 4),
+                    );
+                    let j = 4 * h + g;
+                    let sc0 = d * f32::from(block[192 + 8 * h + 2 * g] as i8);
+                    let sc1 = d * f32::from(block[192 + 8 * h + 2 * g + 1] as i8);
+                    let u = b * 8 + j;
+                    for r in 0..m {
+                        let index = r * runs + u;
+                        // SAFETY: each quantized block holds 32 values.
+                        let x = unsafe { _mm256_loadu_si256(values.add(index * RUN).cast()) };
+                        let sums =
+                            _mm256_cvtepi32_ps(_mm256_madd_epi16(_mm256_maddubs_epi16(w, x), ones));
+                        let da = quantized.scales[index];
+                        let scales = _mm256_set_m128(_mm_set1_ps(da * sc1), _mm_set1_ps(da * sc0));
+                        acc[r] = _mm256_fmadd_ps(sums, scales, acc[r]);
+                        let [s0, s1] = quantized.sums[index];
+                        offsets[r] += 32.0 * da * (sc0 * s0 as f32 + sc1 * s1 as f32);
+                    }
+                }
+            }
+        }
+        for r in 0..m {
+            let lanes = acc[r];
+            let half = _mm_add_ps(
+                _mm256_castps256_ps128(lanes),
+                _mm256_extractf128_ps(lanes, 1),
+            );
+            let half = _mm_add_ps(half, _mm_movehl_ps(half, half));
+            let half = _mm_add_ss(half, _mm_shuffle_ps(half, half, 0b01));
+            out[r * count + c] = _mm_cvtss_f32(half) - offsets[r];
         }
     }
 }

@@ -267,6 +267,45 @@ fn executor_stores_packed_weights() {
     );
 }
 
+/// Writing back the `Opaque` value a packed weight reads as keeps it, and
+/// a copy onto a packed weight's identity replaces it for execution too.
+#[test]
+fn packed_weights_survive_opaque_writes_and_yield_to_copies() {
+    let id = TensorResourceId::new("w");
+    let weight = packed(PackedWeightFormat::Q8_0, 2, 32, true, 43);
+    let executor = NativeCpuExecutor::with_settings(true, true, 1);
+    executor
+        .write_packed_weight_tensor(id.clone(), weight)
+        .unwrap();
+    let value = executor.read_tensor_value(&id).unwrap();
+    executor.write_tensor_value(id.clone(), value).unwrap();
+    assert!(executor.is_packed(&id));
+    let mut memory = MemoryManager::default();
+    let owner = || MemoryAllocationOwner::Session("test-session".into());
+    let source = TensorResourceId::new("source");
+    let replacement = HostTensor::new(vec![32, 2], vec![0.5; 64]).unwrap();
+    executor
+        .write_tensor_admitted(
+            &mut memory,
+            source.clone(),
+            replacement.clone(),
+            MemoryAllocationClass::Tensor,
+            owner(),
+        )
+        .unwrap();
+    executor
+        .copy_tensor_admitted(
+            &mut memory,
+            &source,
+            id.clone(),
+            MemoryAllocationClass::Tensor,
+            owner(),
+        )
+        .unwrap();
+    assert!(!executor.is_packed(&id));
+    assert_eq!(executor.read_tensor(&id).unwrap(), replacement);
+}
+
 /// The Provider has its own identity, Device and advertisements.
 #[test]
 fn provider_identity_is_distinct() {

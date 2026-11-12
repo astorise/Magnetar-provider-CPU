@@ -529,15 +529,18 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
     ) -> Result<(), MemoryError> {
-        self.forget_packed(&resource_id);
+        // A packed weight is replaced only once its replacement is admitted
+        // and stored: a denied admission leaves it resident.
         ProviderExecutionApi::write_tensor_admitted(
             &*self.inner,
             memory,
-            resource_id,
+            resource_id.clone(),
             tensor,
             class,
             owner,
-        )
+        )?;
+        self.forget_packed(&resource_id);
+        Ok(())
     }
 
     /// Like the CUDA Provider, never copies a resource out to answer this
@@ -558,8 +561,14 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         id: TensorResourceId,
         value: TensorValue,
     ) -> Result<(), ProviderExecutionError> {
-        self.forget_packed(&id);
-        ProviderExecutionApi::write_tensor_value(&*self.inner, id, value)
+        // Writing back an `Opaque` value (what `read_tensor_value` returns)
+        // stores nothing, so a packed weight stays resident.
+        let replaces = !matches!(value, TensorValue::Opaque);
+        ProviderExecutionApi::write_tensor_value(&*self.inner, id.clone(), value)?;
+        if replaces {
+            self.forget_packed(&id);
+        }
+        Ok(())
     }
 
     fn write_tensor_value_admitted(
@@ -570,15 +579,19 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
     ) -> Result<(), TensorValueAdmissionError> {
-        self.forget_packed(&resource_id);
+        let replaces = !matches!(value, TensorValue::Opaque);
         ProviderExecutionApi::write_tensor_value_admitted(
             &*self.inner,
             memory,
-            resource_id,
+            resource_id.clone(),
             value,
             class,
             owner,
-        )
+        )?;
+        if replaces {
+            self.forget_packed(&resource_id);
+        }
+        Ok(())
     }
 
     fn copy_tensor_admitted(
@@ -589,7 +602,17 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
     ) -> Result<MemoryAllocationId, TensorValueAdmissionError> {
-        ProviderExecutionApi::copy_tensor_admitted(&*self.inner, memory, from, to, class, owner)
+        let allocation = ProviderExecutionApi::copy_tensor_admitted(
+            &*self.inner,
+            memory,
+            from,
+            to.clone(),
+            class,
+            owner,
+        )?;
+        // The copy replaces whatever `to` held, a packed weight included.
+        self.forget_packed(&to);
+        Ok(allocation)
     }
 
     fn allocate_workspace(

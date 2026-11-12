@@ -1293,6 +1293,13 @@ pub struct ReferenceCpuExecutor {
     /// remains genuinely unadmitted, unchanged.
     resource_allocations: Mutex<BTreeMap<TensorResourceId, MemoryAllocationId>>,
     next_execution_ordinal: AtomicU64,
+    /// The Provider identity this executor reports in handles and memory
+    /// placements: the Reference CPU's, or the optimized CPU Provider's
+    /// when it wraps this executor ([`native`]).
+    provider_name: &'static str,
+    /// Packed weights and their kernels, when the optimized CPU Provider
+    /// wraps this executor; never set for the Reference CPU Provider.
+    packed: Option<Arc<dyn native::PackedWeights>>,
 }
 
 impl Default for ReferenceCpuExecutor {
@@ -1304,6 +1311,8 @@ impl Default for ReferenceCpuExecutor {
             kernel_executions: Mutex::new(BTreeMap::new()),
             resource_allocations: Mutex::new(BTreeMap::new()),
             next_execution_ordinal: AtomicU64::new(0),
+            provider_name: REFERENCE_CPU_PROVIDER_NAME,
+            packed: None,
         }
     }
 }
@@ -1318,7 +1327,10 @@ impl ReferenceCpuExecutor {
     }
 
     pub fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
-        self.storage.lock().unwrap().get(id).cloned()
+        if let Some(tensor) = self.storage.lock().unwrap().get(id) {
+            return Some(tensor.clone());
+        }
+        self.packed.as_ref()?.materialize(id)
     }
 
     /// Drops a tensor from this executor's opaque storage. Returns `true`
@@ -1357,7 +1369,7 @@ impl ReferenceCpuExecutor {
         let allocation = memory.allocate(MemoryAllocationRequest::new(
             class,
             byte_size,
-            MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME)),
+            MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(self.provider_name)),
             owner,
         ))?;
         let previous = self
@@ -1381,11 +1393,10 @@ impl ReferenceCpuExecutor {
 
     /// See [`ProviderExecutionApi::resident_shape`].
     pub fn resident_shape(&self, id: &TensorResourceId) -> Option<Vec<u64>> {
-        self.storage
-            .lock()
-            .unwrap()
-            .get(id)
-            .map(|tensor| tensor.shape.clone())
+        if let Some(tensor) = self.storage.lock().unwrap().get(id) {
+            return Some(tensor.shape.clone());
+        }
+        self.packed.as_ref()?.shape(id)
     }
 
     /// See [`ProviderExecutionApi::copy_tensor_admitted`]: a `HostTensor`
@@ -1411,9 +1422,7 @@ impl ReferenceCpuExecutor {
             .allocate(MemoryAllocationRequest::new(
                 class,
                 byte_size,
-                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(
-                    REFERENCE_CPU_PROVIDER_NAME,
-                )),
+                MemoryPlacement::ProviderOwnedOpaque(ProviderBinding::new(self.provider_name)),
                 owner,
             ))
             .map_err(TensorValueAdmissionError::Memory)?;
@@ -1728,7 +1737,7 @@ impl ReferenceCpuExecutor {
         memory: &mut MemoryManager,
         size_bytes: u64,
     ) -> Result<MemoryAllocationId, MemoryError> {
-        let provider = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+        let provider = ProviderBinding::new(self.provider_name);
         let request = MemoryAllocationRequest::new(
             MemoryAllocationClass::TemporaryWorkspace,
             size_bytes,
@@ -1754,7 +1763,7 @@ impl ReferenceCpuExecutor {
         invocation: &KernelInvocation,
         memory: &mut MemoryManager,
     ) -> KernelResult {
-        let provider = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+        let provider = ProviderBinding::new(self.provider_name);
         let mut admitted: Vec<(TensorResourceId, MemoryAllocationId)> =
             Vec::with_capacity(invocation.outputs.len());
         // Resource ids a caller already admitted before submission
@@ -1904,7 +1913,7 @@ impl ReferenceCpuExecutor {
 
     fn next_provider_execution_id(&self, label: &str) -> ProviderExecutionId {
         let ordinal = self.next_execution_ordinal.fetch_add(1, Ordering::Relaxed);
-        ProviderExecutionId::new(format!("{REFERENCE_CPU_PROVIDER_NAME}:{label}:{ordinal}"))
+        ProviderExecutionId::new(format!("{}:{label}:{ordinal}", self.provider_name))
     }
 
     /// Submits one Runtime-created [`KernelInvocation`] for execution and
@@ -1923,7 +1932,7 @@ impl ReferenceCpuExecutor {
         invocation: &KernelInvocation,
         memory: &mut MemoryManager,
     ) -> ProviderExecutionHandle {
-        let provider = ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME);
+        let provider = ProviderBinding::new(self.provider_name);
         let execution_id = self.next_provider_execution_id(invocation.id.as_str());
         let handle = ProviderExecutionHandle {
             id: execution_id.clone(),
@@ -2124,6 +2133,16 @@ impl ReferenceCpuExecutor {
         let mut result = KernelResult::success(invocation.id.clone());
         if name == "kv-write" {
             let descriptor = self.run_kv_write(invocation)?;
+            result
+                .output_readiness
+                .insert(descriptor.id.to_string(), true);
+            result.updated_resources.push(descriptor);
+            return Ok(result);
+        }
+        if let Some(packed) = &self.packed
+            && let Some(output) = packed.run(self, invocation)
+        {
+            let descriptor = self.store_output(invocation, 0, output?)?;
             result
                 .output_readiness
                 .insert(descriptor.id.to_string(), true);
@@ -2734,6 +2753,8 @@ impl Provider for ReferenceCpuProvider {
         Some(self.executor.clone())
     }
 }
+
+pub mod native;
 
 #[cfg(test)]
 mod tests;

@@ -15,11 +15,11 @@ mod pool;
 pub mod quant;
 
 use super::*;
-use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightWrite};
+use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightWrite};
 use std::sync::OnceLock;
 
 /// Stable, package-qualified optimized CPU Provider identity.
-pub use magnetar_runtime::reference_cpu::NATIVE_CPU_PROVIDER_NAME;
+pub use magnetar_provider_api::NATIVE_CPU_PROVIDER_NAME;
 pub const NATIVE_CPU_DEVICE_ID: &str = "cpu-native:host:0";
 pub const NATIVE_CPU_PROVIDER_VERSION: &str = "0.1.0";
 pub const PACKED_WEIGHTS_ENV: &str = "MAGNETAR_CPU_PACKED_WEIGHTS";

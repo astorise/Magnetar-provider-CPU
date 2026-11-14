@@ -1,7 +1,7 @@
 //! Tests of the optimized CPU Provider against the Reference CPU kernels.
 
 use super::*;
-use magnetar_runtime::packed_weight::PackedWeightFormat;
+use magnetar_provider_api::packed_weight::PackedWeightFormat;
 
 const FORMATS: [PackedWeightFormat; 13] = [
     PackedWeightFormat::Q8_0,
@@ -386,7 +386,7 @@ fn f32_tables_are_gathered_in_place() {
 /// A `KernelInvocation` of `kernel` reading `inputs`, for direct kernel
 /// calls.
 fn invocation_reading(kernel: &str, inputs: &[&TensorResourceId]) -> KernelInvocation {
-    use magnetar_runtime::kernel::{KernelInvocationId, KernelResource};
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
     let advertisement = native_cpu_kernel_advertisements()
         .into_iter()
         .find(|advertisement| advertisement.id.name == kernel)

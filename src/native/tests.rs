@@ -342,7 +342,11 @@ fn packed_matmul_bandwidth() {
         PackedWeightFormat::Q3K,
         PackedWeightFormat::Q5K,
         PackedWeightFormat::Iq4Nl,
+        PackedWeightFormat::Iq2Xxs,
         PackedWeightFormat::Iq2Xs,
+        PackedWeightFormat::Iq2S,
+        PackedWeightFormat::Iq3Xxs,
+        PackedWeightFormat::Iq3S,
     ] {
         for (k, n) in [(4096_u64, 14_336_u64), (14_336, 4096)] {
             let weight = packed(format, n, k, true, 51);
@@ -426,7 +430,7 @@ fn q3k_scales_unpack_like_the_runtime() {
     for (i, b) in block.iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(37).wrapping_add(11);
     }
-    let reference: Vec<f32> = magnetar_runtime::model_loading::q3_k_scales(&block[96..108])
+    let reference: Vec<f32> = magnetar_provider_api::q3_k_scales(&block[96..108])
         .iter()
         .map(|&s| f32::from(s - 32))
         .collect();

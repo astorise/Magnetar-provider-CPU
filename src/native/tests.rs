@@ -426,7 +426,7 @@ fn q3k_scales_unpack_like_the_runtime() {
     for (i, b) in block.iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(37).wrapping_add(11);
     }
-    let reference: Vec<f32> = magnetar_runtime::model_loading::q3_k_scales(&block[96..108])
+    let reference: Vec<f32> = magnetar_provider_api::q3_k_scales(&block[96..108])
         .iter()
         .map(|&s| f32::from(s - 32))
         .collect();

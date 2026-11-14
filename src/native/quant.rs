@@ -202,9 +202,9 @@ fn decode(format: PackedWeightFormat, block: &[u8], run: usize, out: &mut Run) {
                 let grid = iq_grids::IQ2XS_GRID[(code & 511) as usize];
                 signed_grid(grid, iq_signs(code >> 9), &mut out.q[8 * l..]);
             }
-            for p in 0..2 {
+            for (p, scale) in out.scale.iter_mut().enumerate() {
                 let sc = (block[66 + run] >> (4 * p)) & 0xF;
-                out.scale[p] = d * (0.5 + f32::from(sc)) * 0.25;
+                *scale = d * (0.5 + f32::from(sc)) * 0.25;
             }
             out.min = [0.0, 0.0];
         }
@@ -219,9 +219,9 @@ fn decode(format: PackedWeightFormat, block: &[u8], run: usize, out: &mut Run) {
                     &mut out.q[8 * l..],
                 );
             }
-            for p in 0..2 {
+            for (p, scale) in out.scale.iter_mut().enumerate() {
                 let sc = (block[74 + run] >> (4 * p)) & 0xF;
-                out.scale[p] = d * (0.5 + f32::from(sc)) * 0.25;
+                *scale = d * (0.5 + f32::from(sc)) * 0.25;
             }
             out.min = [0.0, 0.0];
         }

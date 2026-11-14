@@ -342,7 +342,11 @@ fn packed_matmul_bandwidth() {
         PackedWeightFormat::Q3K,
         PackedWeightFormat::Q5K,
         PackedWeightFormat::Iq4Nl,
+        PackedWeightFormat::Iq2Xxs,
         PackedWeightFormat::Iq2Xs,
+        PackedWeightFormat::Iq2S,
+        PackedWeightFormat::Iq3Xxs,
+        PackedWeightFormat::Iq3S,
     ] {
         for (k, n) in [(4096_u64, 14_336_u64), (14_336, 4096)] {
             let weight = packed(format, n, k, true, 51);

@@ -3,7 +3,7 @@
 use super::*;
 use magnetar_runtime::packed_weight::PackedWeightFormat;
 
-const FORMATS: [PackedWeightFormat; 12] = [
+const FORMATS: [PackedWeightFormat; 13] = [
     PackedWeightFormat::Q8_0,
     PackedWeightFormat::Q4K,
     PackedWeightFormat::Q6K,
@@ -16,12 +16,13 @@ const FORMATS: [PackedWeightFormat; 12] = [
     PackedWeightFormat::Iq2S,
     PackedWeightFormat::Iq3Xxs,
     PackedWeightFormat::Iq3S,
+    PackedWeightFormat::Q5K,
 ];
 
 /// Byte offsets of each block's `f16` scale fields.
 fn half_offsets(format: PackedWeightFormat) -> &'static [usize] {
     match format {
-        PackedWeightFormat::Q4K => &[0, 2],
+        PackedWeightFormat::Q4K | PackedWeightFormat::Q5K => &[0, 2],
         PackedWeightFormat::Q6K => &[208],
         PackedWeightFormat::Q2K => &[80, 82],
         PackedWeightFormat::Q3K => &[108],
@@ -339,6 +340,7 @@ fn packed_matmul_bandwidth() {
         PackedWeightFormat::Iq4Xs,
         PackedWeightFormat::Q2K,
         PackedWeightFormat::Q3K,
+        PackedWeightFormat::Q5K,
         PackedWeightFormat::Iq4Nl,
         PackedWeightFormat::Iq2Xs,
     ] {
@@ -410,4 +412,25 @@ fn invocation_reading(kernel: &str, inputs: &[&TensorResourceId]) -> KernelInvoc
         ));
     }
     invocation
+}
+
+/// The SSE unpacking of a `Q3_K` super-block's sixteen scales matches the
+/// Runtime's scalar one.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn q3k_scales_unpack_like_the_runtime() {
+    if simd_level() < SimdLevel::Avx2 {
+        return;
+    }
+    let mut block = [0u8; 110];
+    for (i, b) in block.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+    }
+    let reference: Vec<f32> = magnetar_runtime::model_loading::q3_k_scales(&block[96..108])
+        .iter()
+        .map(|&s| f32::from(s - 32))
+        .collect();
+    // SAFETY: AVX2 was detected above.
+    let simd = unsafe { quant::q3k_scales_avx2(&block, 1.0) };
+    assert_eq!(simd.to_vec(), reference);
 }

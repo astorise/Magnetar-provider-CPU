@@ -438,3 +438,129 @@ fn q3k_scales_unpack_like_the_runtime() {
     let simd = unsafe { quant::q3k_scales_avx2(&block, 1.0) };
     assert_eq!(simd.to_vec(), reference);
 }
+
+/// (queries, cached rows, key_count, window, causal).
+type AttentionCase = (u64, u64, Option<u64>, Option<u64>, bool);
+
+/// The multithreaded attention matches the Reference CPU kernel for
+/// multi-head and grouped-query attention, causal prefill, a decode step
+/// reading only `key_count` cached rows, a sliding window and bidirectional
+/// attention, on one and several threads.
+#[test]
+fn attention_matches_the_reference_cpu() {
+    use magnetar_core::operator::OperatorAttributeValue as Value;
+    let (heads, kv_heads, dim) = (4_u64, 2_u64, 16_u64);
+    let cases: [AttentionCase; 5] = [
+        // (queries, cached rows, key_count, window, causal)
+        (6, 6, None, None, true),
+        (1, 9, Some(7), None, true),
+        (5, 5, None, Some(3), true),
+        (4, 4, None, None, false),
+        (1, 7, None, None, true),
+    ];
+    for (threads, (queries, rows, key_count, window, causal)) in [1_usize, 4]
+        .into_iter()
+        .flat_map(|t| cases.into_iter().map(move |c| (t, c)))
+    {
+        let executor = NativeCpuExecutor::with_settings(true, true, threads);
+        let q = activations(queries, heads * dim, 61);
+        let k = activations(rows, kv_heads * dim, 62);
+        let v = activations(rows, kv_heads * dim, 63);
+        let ids = ["q", "k", "v"].map(TensorResourceId::new);
+        for (id, tensor) in ids.iter().zip([&q, &k, &v]) {
+            executor
+                .reference()
+                .write_tensor(id.clone(), tensor.clone());
+        }
+        let mut attributes = BTreeMap::new();
+        attributes.insert("head_count".into(), Value::Integer(heads as i64));
+        attributes.insert("head_dimension".into(), Value::Integer(dim as i64));
+        attributes.insert("kv_head_count".into(), Value::Integer(kv_heads as i64));
+        attributes.insert("causal".into(), Value::Boolean(causal));
+        if let Some(count) = key_count {
+            attributes.insert("key_count".into(), Value::Integer(count as i64));
+        }
+        if let Some(window) = window {
+            attributes.insert("window_size".into(), Value::Integer(window as i64));
+        }
+        let invocation = invocation_reading("attention", &[&ids[0], &ids[1], &ids[2]])
+            .with_attributes(attributes);
+        let actual = executor
+            .state
+            .attention(executor.reference(), &invocation)
+            .expect("handled natively")
+            .unwrap();
+        let (k, v) = match key_count {
+            Some(count) => (
+                leading_rows(&k, count).unwrap(),
+                leading_rows(&v, count).unwrap(),
+            ),
+            None => (k, v),
+        };
+        let expected = attention(&q, &k, &v, heads, dim, Some(kv_heads), window, causal).unwrap();
+        assert_close(
+            &actual,
+            &expected,
+            &format!("{threads} threads, {queries} queries over {rows} rows"),
+        );
+    }
+}
+
+/// Decode-step attention on Mistral 7B shapes (32 heads, 8 KV heads of 128,
+/// a 2048-row cache holding `key_count` keys) against the Reference CPU
+/// kernel (diagnostic: run with `--ignored --nocapture`).
+#[test]
+#[ignore = "timing diagnostic"]
+fn attention_decode_time() {
+    use magnetar_core::operator::OperatorAttributeValue as Value;
+    let threads = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let executor = NativeCpuExecutor::with_settings(true, true, threads);
+    let (heads, kv_heads, dim, rows) = (32_u64, 8_u64, 128_u64, 2048_u64);
+    let ids = ["q", "k", "v"].map(TensorResourceId::new);
+    let tensors = [
+        activations(1, heads * dim, 1),
+        activations(rows, kv_heads * dim, 2),
+        activations(rows, kv_heads * dim, 3),
+    ];
+    for (id, tensor) in ids.iter().zip(&tensors) {
+        executor
+            .reference()
+            .write_tensor(id.clone(), tensor.clone());
+    }
+    for key_count in [64_u64, 512, 2048] {
+        let mut attributes = BTreeMap::new();
+        attributes.insert("head_count".into(), Value::Integer(heads as i64));
+        attributes.insert("head_dimension".into(), Value::Integer(dim as i64));
+        attributes.insert("kv_head_count".into(), Value::Integer(kv_heads as i64));
+        attributes.insert("causal".into(), Value::Boolean(true));
+        attributes.insert("key_count".into(), Value::Integer(key_count as i64));
+        let invocation = invocation_reading("attention", &[&ids[0], &ids[1], &ids[2]])
+            .with_attributes(attributes);
+        let time = |run: &dyn Fn()| {
+            run();
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                run();
+            }
+            start.elapsed().as_secs_f64() * 1e3 / 20.0
+        };
+        let native = time(&|| {
+            executor
+                .state
+                .attention(executor.reference(), &invocation)
+                .unwrap()
+                .unwrap();
+        });
+        // What the Reference CPU kernel does: copy the inputs, then attend.
+        let reference = time(&|| {
+            let read = |i| executor.reference().input_tensor(&invocation, i).unwrap();
+            let (q, k, v) = (read(0), read(1), read(2));
+            let k = leading_rows(&k, key_count).unwrap();
+            let v = leading_rows(&v, key_count).unwrap();
+            attention(&q, &k, &v, heads, dim, Some(kv_heads), None, true).unwrap();
+        });
+        println!(
+            "{key_count} keys: native {native:.3} ms ({threads} threads), reference {reference:.3} ms"
+        );
+    }
+}

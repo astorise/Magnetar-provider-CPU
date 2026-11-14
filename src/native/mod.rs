@@ -81,6 +81,21 @@ struct NativeState {
     materialized: Mutex<(u64, f64)>,
 }
 
+/// A dot product in eight independent lanes, so it vectorizes.
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut lanes = [0.0_f32; 8];
+    let (a8, a_rest) = a.as_chunks::<8>();
+    let (b8, b_rest) = b.as_chunks::<8>();
+    for (x, y) in a8.iter().zip(b8) {
+        for i in 0..8 {
+            lanes[i] += x[i] * y[i];
+        }
+    }
+    let tail: f32 = a_rest.iter().zip(b_rest).map(|(x, y)| x * y).sum();
+    lanes.iter().sum::<f32>() + tail
+}
+
 /// `*mut f32` shared across pool tasks that write disjoint elements.
 struct SharedOut(*mut f32);
 // SAFETY: every task writes a disjoint set of output elements.
@@ -247,6 +262,119 @@ impl NativeState {
         HostTensor::new([ids.data.len() as u64, dim as u64], out).map_err(KernelError::from)
     }
 
+    /// The `attention` Kernel, multithreaded and reading K and V in place
+    /// (the Reference CPU kernel copies both whole caches per call): every
+    /// (head, query) pair is independent, so the pool shares them out.
+    /// `None` hands any case it does not handle, or that the Reference CPU
+    /// kernel rejects, to that kernel, which reports the error.
+    fn attention(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+    ) -> Option<Result<HostTensor, KernelError>> {
+        if cfg!(target_arch = "wasm32") {
+            return None;
+        }
+        let attributes = &invocation.attributes;
+        let head_count = ReferenceCpuExecutor::attribute_integer(attributes, "head_count")?;
+        let head_dimension = ReferenceCpuExecutor::attribute_integer(attributes, "head_dimension")?;
+        let kv_head_count = ReferenceCpuExecutor::attribute_integer(attributes, "kv_head_count")
+            .unwrap_or(head_count);
+        let window = ReferenceCpuExecutor::attribute_integer(attributes, "window_size");
+        let causal = ReferenceCpuExecutor::attribute_bool(attributes, "causal", false);
+        match attributes.get("attention_mask_kind") {
+            None => {}
+            Some(OperatorAttributeValue::String(kind))
+                if (kind == "causal" && causal) || (kind == "bidirectional" && !causal) => {}
+            Some(_) => return None,
+        }
+        if head_count == 0
+            || head_dimension == 0
+            || kv_head_count == 0
+            || !head_count.is_multiple_of(kv_head_count)
+            || window == Some(0)
+            || (window.is_some() && !causal)
+        {
+            return None;
+        }
+        let q = match executor.input_tensor(invocation, 0) {
+            Ok(q) => q,
+            Err(error) => return Some(Err(error)),
+        };
+        let storage = executor.storage.lock().unwrap();
+        let k = storage.get(&invocation.inputs.get(1)?.resource.id)?;
+        let v = storage.get(&invocation.inputs.get(2)?.resource.id)?;
+        let (seq_len, q_width) = q.rows_cols().ok()?;
+        let (k_rows, kv_width) = k.rows_cols().ok()?;
+        if v.shape != k.shape {
+            return None;
+        }
+        let kv_len = match ReferenceCpuExecutor::attribute_integer(attributes, "key_count") {
+            Some(count) if count <= k_rows => count,
+            Some(_) => return None,
+            None => k_rows,
+        };
+        if seq_len > kv_len
+            || head_count * head_dimension != q_width
+            || kv_head_count * head_dimension != kv_width
+        {
+            return None;
+        }
+        let (seq_len, kv_len) = (seq_len as usize, kv_len as usize);
+        let (q_width, kv_width, dim) =
+            (q_width as usize, kv_width as usize, head_dimension as usize);
+        let group = (head_count / kv_head_count) as usize;
+        let scale = 1.0 / (dim as f32).sqrt();
+        let offset = kv_len - seq_len;
+        let pairs = head_count as usize * seq_len;
+        let mut out = vec![0.0_f32; seq_len * q_width];
+        let chunk = pairs.div_ceil(self.pool.threads() * 4).max(1);
+        let shared = SharedOut(out.as_mut_ptr());
+        let shared = &shared;
+        let (q, k, v) = (&q.data, &k.data, &v.data);
+        self.pool.run(pairs.div_ceil(chunk), &|task| {
+            let mut weights = Vec::with_capacity(kv_len);
+            let mut row = vec![0.0_f32; dim];
+            for pair in task * chunk..((task + 1) * chunk).min(pairs) {
+                let (head, query) = (pair / seq_len, pair % seq_len);
+                let kv_offset = (head / group) * dim;
+                let position = offset + query;
+                let upper = if causal { position + 1 } else { kv_len };
+                let lower = window
+                    .map(|window| position.saturating_sub((window as usize).saturating_sub(1)))
+                    .unwrap_or(0)
+                    .min(upper);
+                let query_row = &q[query * q_width + head * dim..][..dim];
+                weights.clear();
+                weights
+                    .extend((lower..upper).map(|key| {
+                        dot(query_row, &k[key * kv_width + kv_offset..][..dim]) * scale
+                    }));
+                let max = weights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0_f32;
+                for weight in &mut weights {
+                    *weight = (*weight - max).exp();
+                    sum += *weight;
+                }
+                row.iter_mut().for_each(|value| *value = 0.0);
+                for (key, &weight) in (lower..upper).zip(&weights) {
+                    let value = &v[key * kv_width + kv_offset..][..dim];
+                    let weight = weight / sum;
+                    for (out, &x) in row.iter_mut().zip(value) {
+                        *out += weight * x;
+                    }
+                }
+                for (d, &value) in row.iter().enumerate() {
+                    // SAFETY: element (query, head * dim + d) belongs to
+                    // this pair only.
+                    unsafe { *shared.0.add(query * q_width + head * dim + d) = value };
+                }
+            }
+        });
+        drop(storage);
+        Some(HostTensor::new([seq_len as u64, q_width as u64], out).map_err(KernelError::from))
+    }
+
     fn embedding(
         &self,
         executor: &ReferenceCpuExecutor,
@@ -289,6 +417,7 @@ impl PackedWeights for NativeState {
                 let weight = self.weight(&invocation.inputs.get(1)?.resource.id)?;
                 Some(self.matmul(executor, invocation, &weight))
             }
+            "attention" => self.attention(executor, invocation),
             "embedding" => {
                 let id = &invocation.inputs.first()?.resource.id;
                 match self.weight(id) {

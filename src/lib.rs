@@ -94,44 +94,55 @@
 //! is defined in the error model for future use if a browser-specific limitation
 //! is identified; none is known today.
 
-use magnetar_runtime::affinity::{
-    DeviceBinding, FallbackClass, ProviderBinding, ProviderHealth, ProviderPressureLevel,
-    ProviderStatusSnapshot, ResourceAffinity,
-};
-use magnetar_runtime::capability::{CapabilityId, CapabilityVersion};
-use magnetar_runtime::compute::{
+use magnetar_core::ProviderError;
+use magnetar_core::{
     ComputeDType, DTypeDescriptor, ShapeDescriptor, TensorDescriptor, TensorDescriptorLimits,
     TensorResourceDescriptor, TensorResourceId,
 };
-use magnetar_runtime::device::{
-    Device, DeviceDescriptor, DeviceExecutionLimits, DeviceId, DeviceMetadata, DeviceType,
+use magnetar_core::{
+    DeviceBinding, FallbackClass, ProviderBinding, ProviderHealth, ProviderPressureLevel,
+    ProviderStatusSnapshot, ResourceAffinity,
 };
-use magnetar_runtime::kernel::{
-    KernelAdvertisement, KernelCancellationSupport, KernelError, KernelId,
-    KernelImplementationFamily, KernelInvocation, KernelKvCacheMetadata, KernelMemoryClass,
-    KernelObservation, KernelObservationKind, KernelOperatorVersionRange, KernelResult,
-    KernelResultStatus, KernelWorkspaceRequirements,
+use magnetar_core::{
+    ProviderExecutionError, ProviderExecutionErrorCode, ProviderExecutionPhase,
+    ScheduledOperationId,
 };
-use magnetar_runtime::memory::{
-    MemoryAllocationClass, MemoryAllocationId, MemoryAllocationOwner, MemoryAllocationRequest,
-    MemoryError, MemoryManager, MemoryPlacement, TensorResidency,
+use magnetar_core::{capability::CapabilityId, capability::CapabilityVersion};
+use magnetar_core::{
+    device::Device, device::DeviceDescriptor, device::DeviceExecutionLimits, device::DeviceId,
+    device::DeviceMetadata, device::DeviceType,
 };
-use magnetar_runtime::operator::{
-    OperatorAttributeValue, OperatorFamily, OperatorId, OperatorSpec,
-    ROPE_BANDED_FREQUENCY_SCALING_FEATURE, RopeBandedFrequencyScaling, TensorLayoutKind,
-    TensorRole,
+use magnetar_core::{
+    operator::OperatorAttributeValue, operator::OperatorFamily, operator::OperatorId,
+    operator::OperatorSpec, operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
+    operator::RopeBandedFrequencyScaling, operator::TensorLayoutKind, operator::TensorRole,
 };
-use magnetar_runtime::provider::{
-    PROVIDER_API_VERSION, Provider, ProviderError, ProviderExecutionApi, ProviderMetadata,
-    ProviderRegistry, TensorValue, TensorValueAdmissionError,
+use magnetar_graph::{
+    memory::MemoryAllocationClass, memory::MemoryAllocationId, memory::MemoryAllocationOwner,
+    memory::MemoryAllocationRequest, memory::MemoryError, memory::MemoryManager,
+    memory::MemoryPlacement, memory::TensorResidency,
 };
-use magnetar_runtime::scheduler::{
-    ProviderCancellationOutcome, ProviderExecutionError, ProviderExecutionErrorCode,
-    ProviderExecutionHandle, ProviderExecutionId, ProviderExecutionPhase, ProviderExecutionRequest,
-    ProviderExecutionResult, ProviderExecutionStatus, ScheduledOperationId, SchedulingState,
+use magnetar_kernel::{
+    kernel::KernelAdvertisement, kernel::KernelCancellationSupport, kernel::KernelError,
+    kernel::KernelId, kernel::KernelImplementationFamily, kernel::KernelInvocation,
+    kernel::KernelKvCacheMetadata, kernel::KernelMemoryClass, kernel::KernelObservation,
+    kernel::KernelObservationKind, kernel::KernelOperatorVersionRange, kernel::KernelResult,
+    kernel::KernelResultStatus, kernel::KernelWorkspaceRequirements,
 };
-use magnetar_runtime::tensor::{TensorLifecycleState, TensorReadiness, TensorResource};
-use magnetar_runtime::{ExecutionPlanId, HostTensor, ReferenceCpuError, ReferenceCpuErrorCode};
+use magnetar_provider_api::{
+    ExecutionPlanId, HostTensor, ReferenceCpuError, ReferenceCpuErrorCode,
+};
+use magnetar_provider_api::{
+    PROVIDER_API_VERSION, Provider, ProviderExecutionApi, ProviderMetadata, ProviderRegistry,
+    TensorValue, TensorValueAdmissionError,
+};
+use magnetar_provider_api::{
+    ProviderCancellationOutcome, ProviderExecutionHandle, ProviderExecutionId,
+    ProviderExecutionRequest, ProviderExecutionResult, ProviderExecutionStatus, SchedulingState,
+};
+use magnetar_provider_api::{
+    tensor::TensorLifecycleState, tensor::TensorReadiness, tensor::TensorResource,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -189,10 +200,10 @@ impl ReferenceCpuFeatureFlags {
 // ---------------------------------------------------------------------------
 
 // `ReferenceCpuError`/`ReferenceCpuErrorCode` are also imported from
-// `magnetar_runtime` rather than redefined here, for the same reason as
+// `magnetar_provider_api` rather than redefined here, for the same reason as
 // `HostTensor` above: `HostTensor::new`/`HostTensor::rows_cols` (defined in
-// `magnetar_runtime`, since inherent impls must live in the crate that
-// defines the type) already return `magnetar_runtime::ReferenceCpuError`,
+// `magnetar_provider_api`, since inherent impls must live in the crate that
+// defines the type) already return `magnetar_provider_api::ReferenceCpuError`,
 // so every kernel below that constructs or inspects a `HostTensor` is
 // already working in terms of that type. A locally redefined
 // `ReferenceCpuError` would also be unable to carry magnetar-runtime's own
@@ -200,7 +211,7 @@ impl ReferenceCpuFeatureFlags {
 // by [`ReferenceCpuExecutor`] below): Rust's orphan rule forbids
 // `impl From<Local> for Foreign` just as much as `impl From<Foreign> for
 // Foreign`, since `KernelError` is foreign to this crate either way -- that
-// conversion can only be written once, in `magnetar_runtime`, against its
+// conversion can only be written once, in `magnetar_provider_api`, against its
 // own canonical `ReferenceCpuError`, and is already available here via
 // `.into()`/`?` because the imported type is literally that same type.
 
@@ -208,7 +219,7 @@ impl ReferenceCpuFeatureFlags {
 // Host tensor storage (Provider-owned, opaque)
 // ---------------------------------------------------------------------------
 
-// `HostTensor` is defined in `magnetar_runtime` itself (re-exported at its
+// `HostTensor` is defined in `magnetar_provider_api` itself (re-exported at its
 // crate root), not here: `ProviderExecutionApi::write_tensor`/`read_tensor`/
 // `write_tensor_admitted` (in `magnetar-runtime/src/provider.rs`) are typed
 // directly against it, as the trait's provisional host-tensor-shaped

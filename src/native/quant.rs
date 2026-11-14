@@ -10,10 +10,10 @@
 //! sum1)`. Without int8 activations the same runs are applied to the f32
 //! activations.
 
-use magnetar_runtime::model_loading::{
+use magnetar_provider_api::{
     IQ4_NL_VALUES, f16_to_f32, iq_grids, iq_signs, iq4_xs_scales, q3_k_scales,
 };
-use magnetar_runtime::packed_weight::{PackedWeight, PackedWeightFormat};
+use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightFormat};
 
 /// Values per run.
 pub const RUN: usize = 32;

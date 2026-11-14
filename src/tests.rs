@@ -747,9 +747,9 @@ fn matmul_bias_is_bit_identical_to_matmul_then_add() {
         .iter()
         .find(|advertisement| advertisement.id.name == "matmul-bias")
         .expect("matmul-bias is advertised");
-    let catalog = magnetar_runtime::operator::initial_operator_catalog();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
     let operator = catalog.get(&advertisement.implemented_operator).unwrap();
-    use magnetar_runtime::kernel::{KernelInvocationId, KernelResource};
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
     let resource = |id: &str, shape: Vec<u64>| {
         KernelResource::new(
             TensorResourceDescriptor::new(
@@ -812,10 +812,10 @@ fn matmul_bias_is_bit_identical_to_matmul_then_add() {
 /// they replace.
 #[test]
 fn matmul_residual_and_silu_mul_are_bit_identical_to_their_pairs() {
-    use magnetar_runtime::kernel::{KernelInvocationId, KernelResource};
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
     let executor = ReferenceCpuExecutor::new();
     let advertisements = reference_cpu_kernel_advertisements();
-    let catalog = magnetar_runtime::operator::initial_operator_catalog();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
     let resource = |id: &str, shape: Vec<u64>| {
         KernelResource::new(
             TensorResourceDescriptor::new(

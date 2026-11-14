@@ -37,16 +37,17 @@ The broader `provider` capability spec governs the full
 
 ## Relationship to magnetar-runtime
 
-This crate depends only on `magnetar-runtime`'s public Provider/Device/
-Kernel/Tensor contracts (`providers/cpu -> magnetar-runtime`, never the
-reverse); `magnetar-runtime` compiles and tests cleanly without this crate
-present. It is pinned into the main
+This crate depends only on the Provider/Device/Kernel/Tensor contracts of the
+Magnetar layer crates (`magnetar-provider-api`, `magnetar-kernel`,
+`magnetar-graph` and `magnetar-core`), not on `magnetar-runtime` itself, and
+never the reverse; `magnetar-runtime` compiles and tests cleanly without this
+crate present. It is pinned into the main
 [Magnetar](https://github.com/astorise/Magnetar) repository as a git
 submodule at `providers/cpu`.
 
 One detail keeps this from being a clean, self-contained port: `HostTensor`,
 `ReferenceCpuError`, and `ReferenceCpuErrorCode` are *imported* from
-`magnetar_runtime` here rather than redefined locally, because
+`magnetar_provider_api` here rather than redefined locally, because
 `magnetar-runtime/src/provider.rs`'s `ProviderExecutionApi` trait
 (`write_tensor`/`read_tensor`/`write_tensor_admitted`) is still typed
 directly against `HostTensor` -- an explicitly documented, provisional

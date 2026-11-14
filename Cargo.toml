@@ -15,4 +15,7 @@ rust-version = "1.98"
 [dependencies]
 # `path` resolves inside a checkout of the parent Magnetar repository;
 # `version` is what `cargo publish` records for crates.io consumers.
-magnetar-runtime = { version = "1.0.0", path = "../../magnetar-runtime" }
+magnetar-core = { version = "1.0.0", path = "../../magnetar-core" }
+magnetar-graph = { version = "1.0.0", path = "../../magnetar-graph" }
+magnetar-kernel = { version = "1.0.0", path = "../../magnetar-kernel" }
+magnetar-provider-api = { version = "1.0.0", path = "../../magnetar-provider-api" }

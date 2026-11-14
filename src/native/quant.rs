@@ -1023,9 +1023,49 @@ unsafe fn columns_q2k_avx2(
     }
 }
 
+/// A `Q3_K` super-block's sixteen sub-block scales as `d * (scale - 32)`,
+/// unpacked from their twelve bytes with SSE (low nibbles from bytes 0..8,
+/// high two bits from bytes 8..12), not one at a time.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub(super) fn q3k_scales_avx2(block: &[u8], d: f32) -> [f32; 16] {
+    use std::arch::x86_64::*;
+    let packed = &block[96..108];
+    let low8 = u64::from_le_bytes(packed[..8].try_into().unwrap());
+    let high4 = u32::from_le_bytes(packed[8..12].try_into().unwrap());
+    let nibble = _mm_set1_epi8(0xF);
+    let low = _mm_cvtsi64_si128(low8 as i64);
+    // Scale i's low nibble: byte i % 8's low (i < 8) or high (i >= 8) one.
+    let low = _mm_unpacklo_epi64(
+        _mm_and_si128(low, nibble),
+        _mm_and_si128(_mm_srli_epi16(low, 4), nibble),
+    );
+    // Scale i's high two bits: bits 2 (i / 4) of byte 8 + i % 4.
+    let high = _mm_srlv_epi32(_mm_set1_epi32(high4 as i32), _mm_setr_epi32(0, 2, 4, 6));
+    let high = _mm_slli_epi16(_mm_and_si128(high, _mm_set1_epi8(3)), 4);
+    let scales = _mm_sub_epi8(_mm_or_si128(low, high), _mm_set1_epi8(32));
+    let d = _mm_set1_ps(d);
+    let mut out = [0.0_f32; 16];
+    for (q, chunk) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let bytes = match q {
+            0 => scales,
+            1 => _mm_srli_si128(scales, 4),
+            2 => _mm_srli_si128(scales, 8),
+            _ => _mm_srli_si128(scales, 12),
+        };
+        let values = _mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepi8_epi32(bytes)), d);
+        // SAFETY: `chunk` holds four f32s.
+        unsafe { _mm_storeu_ps(chunk.as_mut_ptr(), values) };
+    }
+    out
+}
+
 /// Specialized `Q3_K`: each half's 32 quant bytes and the 32 mask bytes
-/// loaded once for its four runs, values kept unsigned (0..7) and their -4
-/// offset applied through the activation sums.
+/// loaded once and shifted by constants from run to run (each run's high
+/// bit moved straight to bit 2), values kept
+/// unsigned (0..7) and their -4 offset applied through the activation
+/// sums; the sixteen scales unpacked with SSE once per super-block.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn columns_q3k_avx2(
@@ -1042,7 +1082,7 @@ unsafe fn columns_q3k_avx2(
     let (runs, blocks) = (k / RUN, k / 256);
     let mut acc = vec![_mm256_setzero_ps(); m];
     let mut offsets = vec![0.0_f32; m];
-    let (low_mask, one) = (_mm256_set1_epi8(3), _mm256_set1_epi8(1));
+    let (low_mask, bit2) = (_mm256_set1_epi8(3), _mm256_set1_epi8(4));
     for c in 0..count {
         acc.iter_mut()
             .for_each(|lanes| *lanes = _mm256_setzero_ps());
@@ -1050,25 +1090,31 @@ unsafe fn columns_q3k_avx2(
         let row = &reader.bytes[(first + c) * reader.row_bytes..][..reader.row_bytes];
         for b in 0..blocks {
             let block = &row[b * BLOCK..][..BLOCK];
-            let d = half_f16c(block, 108);
-            let scales = q3_k_scales(&block[96..108]);
+            let scales = q3k_scales_avx2(block, half_f16c(block, 108));
             // SAFETY: a Q3_K block starts with 32 mask bytes.
             let mask = unsafe { _mm256_loadu_si256(block.as_ptr().cast()) };
             for h in 0..2 {
                 // SAFETY: a Q3_K half holds 32 quant bytes.
-                let bytes = unsafe { _mm256_loadu_si256(block.as_ptr().add(32 + 32 * h).cast()) };
+                let mut bytes =
+                    unsafe { _mm256_loadu_si256(block.as_ptr().add(32 + 32 * h).cast()) };
                 for j in 0..4 {
-                    let low = _mm256_and_si256(
-                        _mm256_srl_epi16(bytes, _mm_cvtsi32_si128(2 * j as i32)),
-                        low_mask,
+                    // Run `n`'s high bit (bit `n` of each mask byte) moved
+                    // to bit 2: within each byte, as only bit 2 is kept.
+                    let high = match 4 * h + j {
+                        0 => _mm256_slli_epi16(mask, 2),
+                        1 => _mm256_slli_epi16(mask, 1),
+                        2 => mask,
+                        3 => _mm256_srli_epi16(mask, 1),
+                        4 => _mm256_srli_epi16(mask, 2),
+                        5 => _mm256_srli_epi16(mask, 3),
+                        6 => _mm256_srli_epi16(mask, 4),
+                        _ => _mm256_srli_epi16(mask, 5),
+                    };
+                    let w = _mm256_or_si256(
+                        _mm256_and_si256(bytes, low_mask),
+                        _mm256_and_si256(high, bit2),
                     );
-                    let high = _mm256_and_si256(
-                        _mm256_srl_epi16(mask, _mm_cvtsi32_si128((4 * h + j) as i32)),
-                        one,
-                    );
-                    let w = _mm256_or_si256(low, _mm256_slli_epi16(high, 2));
-                    let sc = |p: usize| d * f32::from(scales[8 * h + 2 * j + p] - 32);
-                    let scale = [sc(0), sc(1)];
+                    let scale = [scales[8 * h + 2 * j], scales[8 * h + 2 * j + 1]];
                     accumulate_unsigned(
                         w,
                         scale,
@@ -1079,6 +1125,7 @@ unsafe fn columns_q3k_avx2(
                         &mut acc,
                         &mut offsets,
                     );
+                    bytes = _mm256_srli_epi16(bytes, 2);
                 }
             }
         }

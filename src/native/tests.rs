@@ -413,3 +413,24 @@ fn invocation_reading(kernel: &str, inputs: &[&TensorResourceId]) -> KernelInvoc
     }
     invocation
 }
+
+/// The SSE unpacking of a `Q3_K` super-block's sixteen scales matches the
+/// Runtime's scalar one.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn q3k_scales_unpack_like_the_runtime() {
+    if simd_level() < SimdLevel::Avx2 {
+        return;
+    }
+    let mut block = [0u8; 110];
+    for (i, b) in block.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+    }
+    let reference: Vec<f32> = magnetar_runtime::model_loading::q3_k_scales(&block[96..108])
+        .iter()
+        .map(|&s| f32::from(s - 32))
+        .collect();
+    // SAFETY: AVX2 was detected above.
+    let simd = unsafe { quant::q3k_scales_avx2(&block, 1.0) };
+    assert_eq!(simd.to_vec(), reference);
+}

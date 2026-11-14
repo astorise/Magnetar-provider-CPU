@@ -69,7 +69,7 @@ fn signed_grid(grid: u64, signs: u8, out: &mut [i8]) {
 }
 
 /// Every packed format, indexed by the code the kernels are specialized on.
-const FORMATS: [PackedWeightFormat; 12] = [
+const FORMATS: [PackedWeightFormat; 13] = [
     PackedWeightFormat::Q8_0,
     PackedWeightFormat::Q4K,
     PackedWeightFormat::Q6K,
@@ -82,6 +82,7 @@ const FORMATS: [PackedWeightFormat; 12] = [
     PackedWeightFormat::Iq2S,
     PackedWeightFormat::Iq3Xxs,
     PackedWeightFormat::Iq3S,
+    PackedWeightFormat::Q5K,
 ];
 
 fn format_code(format: PackedWeightFormat) -> u8 {
@@ -113,6 +114,20 @@ fn decode(format: PackedWeightFormat, block: &[u8], run: usize, out: &mut Run) {
             let shift = 4 * (run % 2);
             for (q, &byte) in out.q.iter_mut().zip(&block[16 + 32 * chunk..][..32]) {
                 *q = ((byte >> shift) & 0xF) as i8;
+            }
+            out.scale = [d * f32::from(sc); 2];
+            out.min = [dmin * f32::from(m); 2];
+        }
+        PackedWeightFormat::Q5K => {
+            let d = half(block, 0);
+            let dmin = half(block, 2);
+            let (sc, m) = scale_min_k4(run, &block[4..16]);
+            let chunk = run / 2;
+            let shift = 4 * (run % 2);
+            let low = &block[48 + 32 * chunk..][..32];
+            let high = &block[16..48];
+            for ((q, &low), &high) in out.q.iter_mut().zip(low).zip(high) {
+                *q = (((low >> shift) & 0xF) | (((high >> run) & 1) << 4)) as i8;
             }
             out.scale = [d * f32::from(sc); 2];
             out.min = [dmin * f32::from(m); 2];
@@ -202,9 +217,9 @@ fn decode(format: PackedWeightFormat, block: &[u8], run: usize, out: &mut Run) {
                 let grid = iq_grids::IQ2XS_GRID[(code & 511) as usize];
                 signed_grid(grid, iq_signs(code >> 9), &mut out.q[8 * l..]);
             }
-            for p in 0..2 {
+            for (p, scale) in out.scale.iter_mut().enumerate() {
                 let sc = (block[66 + run] >> (4 * p)) & 0xF;
-                out.scale[p] = d * (0.5 + f32::from(sc)) * 0.25;
+                *scale = d * (0.5 + f32::from(sc)) * 0.25;
             }
             out.min = [0.0, 0.0];
         }
@@ -219,9 +234,9 @@ fn decode(format: PackedWeightFormat, block: &[u8], run: usize, out: &mut Run) {
                     &mut out.q[8 * l..],
                 );
             }
-            for p in 0..2 {
+            for (p, scale) in out.scale.iter_mut().enumerate() {
                 let sc = (block[74 + run] >> (4 * p)) & 0xF;
-                out.scale[p] = d * (0.5 + f32::from(sc)) * 0.25;
+                *scale = d * (0.5 + f32::from(sc)) * 0.25;
             }
             out.min = [0.0, 0.0];
         }
@@ -416,11 +431,11 @@ pub fn matmul_columns(
         ($($code:literal),*) => {
             match reader.code {
                 $($code => columns::<$code>(reader, activations, first, count, out),)*
-                _ => unreachable!("format codes are below 12"),
+                _ => unreachable!("format codes are below 13"),
             }
         };
     }
-    dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+    dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
 }
 
 /// [`matmul_columns`] for format code `F`.
@@ -464,6 +479,10 @@ fn columns<const F: u8>(
                 }
                 PackedWeightFormat::Q3K => {
                     columns_q3k_avx2(reader, quantized, m, k, first, count, out);
+                    true
+                }
+                PackedWeightFormat::Q5K => {
+                    columns_q5k_avx2(reader, quantized, m, k, first, count, out);
                     true
                 }
                 PackedWeightFormat::Iq4Xs => {
@@ -701,6 +720,73 @@ unsafe fn columns_q4k_avx2(
             let half = _mm_add_ps(half, _mm_movehl_ps(half, half));
             let half = _mm_add_ss(half, _mm_shuffle_ps(half, half, 0b01));
             out[r * count + c] = _mm_cvtss_f32(half) - mins[r];
+        }
+    }
+}
+
+/// Specialized `Q5_K`: [`columns_q4k_avx2`] with each super-block's
+/// 32-byte high-bit plane loaded once and bit `j` of each byte added as
+/// run `j`'s fifth bit; values stay unsigned (0..31), mins through the
+/// activation sums.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn columns_q5k_avx2(
+    reader: &RunReader<'_>,
+    quantized: &QuantizedRows,
+    m: usize,
+    k: usize,
+    first: usize,
+    count: usize,
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    const BLOCK: usize = 176;
+    let (runs, blocks) = (k / RUN, k / 256);
+    debug_assert_eq!(reader.row_bytes, blocks * BLOCK);
+    let mut acc = vec![_mm256_setzero_ps(); m];
+    let mut mins = vec![0.0_f32; m];
+    let (low_mask, one) = (_mm256_set1_epi8(0xF), _mm256_set1_epi8(1));
+    for c in 0..count {
+        acc.iter_mut()
+            .for_each(|lanes| *lanes = _mm256_setzero_ps());
+        mins.iter_mut().for_each(|value| *value = 0.0);
+        let row = &reader.bytes[(first + c) * reader.row_bytes..][..reader.row_bytes];
+        for b in 0..blocks {
+            let block = &row[b * BLOCK..][..BLOCK];
+            let d = half_f16c(block, 0);
+            let dmin = half_f16c(block, 2);
+            // SAFETY: a Q5_K super-block holds a 32-byte high-bit plane.
+            let high = unsafe { _mm256_loadu_si256(block.as_ptr().add(16).cast()) };
+            for chunk in 0..4 {
+                // SAFETY: a Q5_K super-block holds four 32-byte quant chunks.
+                let bytes =
+                    unsafe { _mm256_loadu_si256(block.as_ptr().add(48 + 32 * chunk).cast()) };
+                let nibbles = [
+                    _mm256_and_si256(bytes, low_mask),
+                    _mm256_and_si256(_mm256_srli_epi16(bytes, 4), low_mask),
+                ];
+                for (part, low) in nibbles.into_iter().enumerate() {
+                    let j = 2 * chunk + part;
+                    let bit =
+                        _mm256_and_si256(_mm256_srl_epi16(high, _mm_cvtsi32_si128(j as i32)), one);
+                    let w = _mm256_or_si256(low, _mm256_slli_epi16(bit, 4));
+                    let (sc, mn) = scale_min_k4(j, &block[4..16]);
+                    let (scale, min) = (d * f32::from(sc), dmin * f32::from(mn));
+                    accumulate_unsigned(
+                        w,
+                        [scale, scale],
+                        [min, min],
+                        quantized,
+                        runs,
+                        b * 8 + j,
+                        &mut acc,
+                        &mut mins,
+                    );
+                }
+            }
+        }
+        for r in 0..m {
+            out[r * count + c] = hsum(acc[r]) - mins[r];
         }
     }
 }

@@ -3,7 +3,7 @@
 use super::*;
 use magnetar_runtime::packed_weight::PackedWeightFormat;
 
-const FORMATS: [PackedWeightFormat; 12] = [
+const FORMATS: [PackedWeightFormat; 13] = [
     PackedWeightFormat::Q8_0,
     PackedWeightFormat::Q4K,
     PackedWeightFormat::Q6K,
@@ -16,12 +16,13 @@ const FORMATS: [PackedWeightFormat; 12] = [
     PackedWeightFormat::Iq2S,
     PackedWeightFormat::Iq3Xxs,
     PackedWeightFormat::Iq3S,
+    PackedWeightFormat::Q5K,
 ];
 
 /// Byte offsets of each block's `f16` scale fields.
 fn half_offsets(format: PackedWeightFormat) -> &'static [usize] {
     match format {
-        PackedWeightFormat::Q4K => &[0, 2],
+        PackedWeightFormat::Q4K | PackedWeightFormat::Q5K => &[0, 2],
         PackedWeightFormat::Q6K => &[208],
         PackedWeightFormat::Q2K => &[80, 82],
         PackedWeightFormat::Q3K => &[108],
@@ -339,6 +340,7 @@ fn packed_matmul_bandwidth() {
         PackedWeightFormat::Iq4Xs,
         PackedWeightFormat::Q2K,
         PackedWeightFormat::Q3K,
+        PackedWeightFormat::Q5K,
         PackedWeightFormat::Iq4Nl,
         PackedWeightFormat::Iq2Xs,
     ] {

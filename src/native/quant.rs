@@ -972,35 +972,43 @@ fn accumulate_signed(
     }
 }
 
-/// One IQ2/IQ3 run as its four 8-value grid entries, the four sign bytes
-/// (bit `i` negates value `i` of its group) and its two 16-value scales,
-/// read from the block exactly as [`decode`] does.
+/// [`iq_signs`] for every 7-bit index, computed at compile time: the
+/// kernels look a sign byte up instead of computing its parity (a
+/// `count_ones` the kernels' target features do not make a single
+/// instruction).
+static IQ_SIGNS: [u8; 128] = {
+    let mut table = [0_u8; 128];
+    let mut index = 0;
+    while index < 128 {
+        table[index] = iq_signs(index as u32);
+        index += 1;
+    }
+    table
+};
+
+/// One IQ2/IQ3 run's four sign bytes (bit `i` negates value `i` of its
+/// 8-value group) and its two 16-value scales, read as [`decode`] does.
 #[inline(always)]
-fn iq_grid_run(
+fn iq_signs_scale(
     format: PackedWeightFormat,
     block: &[u8],
     run: usize,
     d: f32,
-) -> ([u64; 4], [u8; 4], [f32; 2]) {
-    let mut grids = [0_u64; 4];
+) -> ([u8; 4], [f32; 2]) {
     let mut signs = [0_u8; 4];
     let scale = match format {
         PackedWeightFormat::Iq2Xxs => {
-            let indices = word(block, 2 + 8 * run);
             let aux = word(block, 6 + 8 * run);
-            for l in 0..4 {
-                grids[l] = iq_grids::IQ2XXS_GRID[((indices >> (8 * l)) & 0xFF) as usize];
-                signs[l] = iq_signs(aux >> (7 * l));
+            for (l, sign) in signs.iter_mut().enumerate() {
+                *sign = IQ_SIGNS[((aux >> (7 * l)) & 0x7F) as usize];
             }
             let scale = d * (0.5 + (aux >> 28) as f32) * 0.25;
             [scale, scale]
         }
         PackedWeightFormat::Iq2Xs => {
-            for l in 0..4 {
+            for (l, sign) in signs.iter_mut().enumerate() {
                 let at = 2 + 2 * (4 * run + l);
-                let code = u32::from(u16::from_le_bytes([block[at], block[at + 1]]));
-                grids[l] = iq_grids::IQ2XS_GRID[(code & 511) as usize];
-                signs[l] = iq_signs(code >> 9);
+                *sign = IQ_SIGNS[usize::from(block[at + 1] >> 1)];
             }
             let sc = block[66 + run];
             [
@@ -1009,12 +1017,7 @@ fn iq_grid_run(
             ]
         }
         PackedWeightFormat::Iq2S => {
-            for l in 0..4 {
-                let index = usize::from(block[2 + 4 * run + l])
-                    | ((usize::from(block[66 + run]) >> (2 * l)) & 3) << 8;
-                grids[l] = iq_grids::IQ2S_GRID[index];
-                signs[l] = block[34 + 4 * run + l];
-            }
+            signs.copy_from_slice(&block[34 + 4 * run..38 + 4 * run]);
             let sc = block[74 + run];
             [
                 d * (0.5 + f32::from(sc & 0xF)) * 0.25,
@@ -1023,31 +1026,83 @@ fn iq_grid_run(
         }
         PackedWeightFormat::Iq3Xxs => {
             let aux = word(block, 66 + 4 * run);
-            for l in 0..4 {
-                let low = iq_grids::IQ3XXS_GRID[usize::from(block[2 + 8 * run + 2 * l])];
-                let high = iq_grids::IQ3XXS_GRID[usize::from(block[3 + 8 * run + 2 * l])];
-                grids[l] = u64::from(low) | (u64::from(high) << 32);
-                signs[l] = iq_signs(aux >> (7 * l));
+            for (l, sign) in signs.iter_mut().enumerate() {
+                *sign = IQ_SIGNS[((aux >> (7 * l)) & 0x7F) as usize];
             }
             let scale = d * (0.5 + (aux >> 28) as f32) * 0.5;
             [scale, scale]
         }
         _ => {
-            let index = |i: usize| {
-                usize::from(block[2 + 8 * run + i]) | ((usize::from(block[66 + run]) >> i) & 1) << 8
-            };
-            for l in 0..4 {
-                let low = iq_grids::IQ3S_GRID[index(2 * l)];
-                let high = iq_grids::IQ3S_GRID[index(2 * l + 1)];
-                grids[l] = u64::from(low) | (u64::from(high) << 32);
-                signs[l] = block[74 + 4 * run + l];
-            }
+            signs.copy_from_slice(&block[74 + 4 * run..78 + 4 * run]);
             let sc = (block[106 + run / 2] >> (4 * (run % 2))) & 0xF;
             let scale = d * f32::from(1 + 2 * sc);
             [scale, scale]
         }
     };
-    (grids, signs, scale)
+    (signs, scale)
+}
+
+/// The grids as statics, so the gathers read one fixed table each.
+static IQ2XXS_GRID: [u64; 256] = iq_grids::IQ2XXS_GRID;
+static IQ2XS_GRID: [u64; 512] = iq_grids::IQ2XS_GRID;
+static IQ2S_GRID: [u64; 1024] = iq_grids::IQ2S_GRID;
+static IQ3XXS_GRID: [u32; 256] = iq_grids::IQ3XXS_GRID;
+static IQ3S_GRID: [u32; 512] = iq_grids::IQ3S_GRID;
+
+/// One IQ2/IQ3 run's 32 grid magnitudes, fetched with one AVX2 gather from
+/// indices computed in vector registers (the scalar path of
+/// a scalar decoder loads and assembles four or eight entries one by one).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn iq_grid_gather(
+    format: PackedWeightFormat,
+    block: &[u8],
+    run: usize,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let bytes4 =
+        |at: usize| _mm_cvtsi32_si128(i32::from_le_bytes(block[at..at + 4].try_into().unwrap()));
+    let bytes8 =
+        |at: usize| _mm_cvtsi64_si128(i64::from_le_bytes(block[at..at + 8].try_into().unwrap()));
+    // SAFETY (all gathers): every index is masked to its table's length.
+    unsafe {
+        match format {
+            PackedWeightFormat::Iq2Xxs => _mm256_i32gather_epi64::<8>(
+                IQ2XXS_GRID.as_ptr().cast(),
+                _mm_cvtepu8_epi32(bytes4(2 + 8 * run)),
+            ),
+            PackedWeightFormat::Iq2Xs => {
+                let codes = _mm_cvtepu16_epi32(bytes8(2 + 8 * run));
+                _mm256_i32gather_epi64::<8>(
+                    IQ2XS_GRID.as_ptr().cast(),
+                    _mm_and_si128(codes, _mm_set1_epi32(511)),
+                )
+            }
+            PackedWeightFormat::Iq2S => {
+                let low = _mm_cvtepu8_epi32(bytes4(2 + 4 * run));
+                let high = _mm_srlv_epi32(
+                    _mm_set1_epi32(i32::from(block[66 + run])),
+                    _mm_setr_epi32(0, 2, 4, 6),
+                );
+                let high = _mm_slli_epi32(_mm_and_si128(high, _mm_set1_epi32(3)), 8);
+                _mm256_i32gather_epi64::<8>(IQ2S_GRID.as_ptr().cast(), _mm_or_si128(low, high))
+            }
+            PackedWeightFormat::Iq3Xxs => _mm256_i32gather_epi32::<4>(
+                IQ3XXS_GRID.as_ptr().cast(),
+                _mm256_cvtepu8_epi32(bytes8(2 + 8 * run)),
+            ),
+            _ => {
+                let low = _mm256_cvtepu8_epi32(bytes8(2 + 8 * run));
+                let high = _mm256_srlv_epi32(
+                    _mm256_set1_epi32(i32::from(block[66 + run])),
+                    _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+                );
+                let high = _mm256_slli_epi32(_mm256_and_si256(high, _mm256_set1_epi32(1)), 8);
+                _mm256_i32gather_epi32::<4>(IQ3S_GRID.as_ptr().cast(), _mm256_or_si256(low, high))
+            }
+        }
+    }
 }
 
 /// Specialized IQ2/IQ3: each run's four grid entries gathered into one
@@ -1087,13 +1142,9 @@ unsafe fn columns_iq_grid_avx2<const F: u8>(
             let block = &row[b * block_bytes..][..block_bytes];
             let d = half_f16c(block, 0);
             for run in 0..8 {
-                let (grids, signs, scale) = iq_grid_run(format, block, run, d);
-                let magnitudes = _mm256_setr_epi64x(
-                    grids[0] as i64,
-                    grids[1] as i64,
-                    grids[2] as i64,
-                    grids[3] as i64,
-                );
+                let (signs, scale) = iq_signs_scale(format, block, run, d);
+                // SAFETY: AVX2 is enabled for this function.
+                let magnitudes = unsafe { iq_grid_gather(format, block, run) };
                 let sign_bytes =
                     _mm256_shuffle_epi8(_mm256_set1_epi32(i32::from_le_bytes(signs)), spread);
                 // 0xFF where the value is negative, 0 elsewhere.
@@ -1101,7 +1152,13 @@ unsafe fn columns_iq_grid_avx2<const F: u8>(
                 // The activations carry the weights' signs; the grid values
                 // are the (non-negative) magnitudes.
                 let u = b * 8 + run;
-                let scales = _mm256_set_m128(_mm_set1_ps(scale[1]), _mm_set1_ps(scale[0]));
+                // IQ2_XS and IQ2_S scale each half of a run on its own.
+                let scales =
+                    if matches!(format, PackedWeightFormat::Iq2Xs | PackedWeightFormat::Iq2S) {
+                        _mm256_set_m128(_mm_set1_ps(scale[1]), _mm_set1_ps(scale[0]))
+                    } else {
+                        _mm256_set1_ps(scale[0])
+                    };
                 for (r, lanes) in acc.iter_mut().enumerate() {
                     let index = r * runs + u;
                     // SAFETY: each quantized block holds 32 values.

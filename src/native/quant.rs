@@ -1049,6 +1049,102 @@ static IQ2S_GRID: [u64; 1024] = iq_grids::IQ2S_GRID;
 static IQ3XXS_GRID: [u32; 256] = iq_grids::IQ3XXS_GRID;
 static IQ3S_GRID: [u32; 512] = iq_grids::IQ3S_GRID;
 
+/// The environment variable choosing how the IQ2/IQ3 kernels read their
+/// grids: `1` with AVX2 gathers, `0` with scalar loads. Unset, gathers are
+/// used unless the kernel reports a microcode mitigation of Gather Data
+/// Sampling, which makes every gather instruction several times slower.
+pub const IQ_GATHER_ENV: &str = "MAGNETAR_CPU_IQ_GATHER";
+
+/// A process-wide override of [`iq_gather`] for tests and diagnostics: 0
+/// none, 1 scalar loads, 2 gathers. Both paths compute the same values.
+static IQ_GATHER_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Overrides [`iq_gather`] (`None` restores the automatic choice).
+pub fn set_iq_gather(gather: Option<bool>) {
+    let value = match gather {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    };
+    IQ_GATHER_OVERRIDE.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the IQ2/IQ3 kernels read their grids with gathers
+/// ([`IQ_GATHER_ENV`]).
+pub fn iq_gather() -> bool {
+    match IQ_GATHER_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static GATHER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATHER.get_or_init(|| match std::env::var(IQ_GATHER_ENV).as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => {
+            !std::fs::read_to_string("/sys/devices/system/cpu/vulnerabilities/gather_data_sampling")
+                .is_ok_and(|status| status.starts_with("Mitigation"))
+        }
+    })
+}
+
+/// [`iq_grid_gather`]'s magnitudes from four or eight scalar table loads,
+/// for hosts where gathers are slow.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn iq_grid_loads(
+    format: PackedWeightFormat,
+    block: &[u8],
+    run: usize,
+) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let mut grids = [0_u64; 4];
+    match format {
+        PackedWeightFormat::Iq2Xxs => {
+            for (l, grid) in grids.iter_mut().enumerate() {
+                *grid = IQ2XXS_GRID[usize::from(block[2 + 8 * run + l])];
+            }
+        }
+        PackedWeightFormat::Iq2Xs => {
+            for (l, grid) in grids.iter_mut().enumerate() {
+                let at = 2 + 2 * (4 * run + l);
+                let code = usize::from(u16::from_le_bytes([block[at], block[at + 1]]));
+                *grid = IQ2XS_GRID[code & 511];
+            }
+        }
+        PackedWeightFormat::Iq2S => {
+            let high = usize::from(block[66 + run]);
+            for (l, grid) in grids.iter_mut().enumerate() {
+                *grid =
+                    IQ2S_GRID[usize::from(block[2 + 4 * run + l]) | ((high >> (2 * l)) & 3) << 8];
+            }
+        }
+        PackedWeightFormat::Iq3Xxs => {
+            for (l, grid) in grids.iter_mut().enumerate() {
+                let low = IQ3XXS_GRID[usize::from(block[2 + 8 * run + 2 * l])];
+                let high = IQ3XXS_GRID[usize::from(block[3 + 8 * run + 2 * l])];
+                *grid = u64::from(low) | (u64::from(high) << 32);
+            }
+        }
+        _ => {
+            let high = usize::from(block[66 + run]);
+            let index = |i: usize| usize::from(block[2 + 8 * run + i]) | ((high >> i) & 1) << 8;
+            for (l, grid) in grids.iter_mut().enumerate() {
+                let low = IQ3S_GRID[index(2 * l)];
+                let high = IQ3S_GRID[index(2 * l + 1)];
+                *grid = u64::from(low) | (u64::from(high) << 32);
+            }
+        }
+    }
+    _mm256_setr_epi64x(
+        grids[0] as i64,
+        grids[1] as i64,
+        grids[2] as i64,
+        grids[3] as i64,
+    )
+}
+
 /// One IQ2/IQ3 run's 32 grid magnitudes, fetched with one AVX2 gather from
 /// indices computed in vector registers (the scalar path of
 /// a scalar decoder loads and assembles four or eight entries one by one).
@@ -1123,6 +1219,7 @@ unsafe fn columns_iq_grid_avx2<const F: u8>(
 ) {
     use std::arch::x86_64::*;
     let format = FORMATS[F as usize];
+    let gather = iq_gather();
     let block_bytes = format.block_bytes() as usize;
     let (runs, blocks) = (k / RUN, k / 256);
     let values = quantized.values.as_ptr();
@@ -1144,7 +1241,13 @@ unsafe fn columns_iq_grid_avx2<const F: u8>(
             for run in 0..8 {
                 let (signs, scale) = iq_signs_scale(format, block, run, d);
                 // SAFETY: AVX2 is enabled for this function.
-                let magnitudes = unsafe { iq_grid_gather(format, block, run) };
+                let magnitudes = unsafe {
+                    if gather {
+                        iq_grid_gather(format, block, run)
+                    } else {
+                        iq_grid_loads(format, block, run)
+                    }
+                };
                 let sign_bytes =
                     _mm256_shuffle_epi8(_mm256_set1_epi32(i32::from_le_bytes(signs)), spread);
                 // 0xFF where the value is negative, 0 elsewhere.

@@ -136,10 +136,7 @@ fn runs_decode_like_the_runtime() {
 #[test]
 fn packed_matmuls_match_the_reference_cpu() {
     let (k, n) = (512_u64, 37_u64);
-    // Both IQ2/IQ3 grid paths compute the same values, so the override
-    // cannot disturb a test running alongside.
-    for (format, gather) in FORMATS.into_iter().flat_map(|f| [(f, false), (f, true)]) {
-        quant::set_iq_gather(Some(gather));
+    for format in FORMATS {
         let weight = packed(format, n, k, true, 21);
         let dense = weight.dequantize();
         for (int8, threads) in [(true, 1), (true, 4), (false, 3)] {
@@ -149,15 +146,10 @@ fn packed_matmuls_match_the_reference_cpu() {
                 let seen = if int8 { int8_rounded(&a) } else { a.clone() };
                 let expected = matmul(&seen, &dense, false, false).unwrap();
                 let actual = state.packed_matmul(&a, &weight).unwrap();
-                assert_close(
-                    &actual,
-                    &expected,
-                    &format!("{format:?} int8 {int8} m {m} gather {gather}"),
-                );
+                assert_close(&actual, &expected, &format!("{format:?} int8 {int8} m {m}"));
             }
         }
     }
-    quant::set_iq_gather(None);
 }
 
 /// 32-value block formats whose row holds an odd number of runs take the
@@ -340,23 +332,8 @@ fn provider_identity_is_distinct() {
 fn packed_matmul_bandwidth() {
     let threads = std::thread::available_parallelism().map_or(1, |count| count.get());
     let state = state(true, threads);
-    println!(
-        "{threads} threads, {:?}, IQ grids read with gathers by default: {} (Gather Data \
-         Sampling: {})",
-        simd_level(),
-        quant::iq_gather(),
-        std::fs::read_to_string("/sys/devices/system/cpu/vulnerabilities/gather_data_sampling")
-            .map_or("unknown".into(), |status| status.trim().to_string())
-    );
-    let iq = [
-        PackedWeightFormat::Iq2Xxs,
-        PackedWeightFormat::Iq2Xs,
-        PackedWeightFormat::Iq2S,
-        PackedWeightFormat::Iq3Xxs,
-        PackedWeightFormat::Iq3S,
-    ];
-    // The IQ formats once per grid path: with scalar loads, then gathers.
-    let runs = [
+    println!("{threads} threads, {:?}", simd_level());
+    for format in [
         PackedWeightFormat::Q8_0,
         PackedWeightFormat::Q4K,
         PackedWeightFormat::Q6K,
@@ -365,19 +342,12 @@ fn packed_matmul_bandwidth() {
         PackedWeightFormat::Q3K,
         PackedWeightFormat::Q5K,
         PackedWeightFormat::Iq4Nl,
-    ]
-    .into_iter()
-    .map(|format| (format, None))
-    .chain(iq.into_iter().map(|format| (format, Some(false))))
-    .chain(iq.into_iter().map(|format| (format, Some(true))));
-    for (format, gather) in runs {
-        quant::set_iq_gather(gather);
-        let path = match gather {
-            None => "",
-            Some(false) => " loads",
-            Some(true) => " gather",
-        };
-        let format_name = format!("{format:?}{path}");
+        PackedWeightFormat::Iq2Xxs,
+        PackedWeightFormat::Iq2Xs,
+        PackedWeightFormat::Iq2S,
+        PackedWeightFormat::Iq3Xxs,
+        PackedWeightFormat::Iq3S,
+    ] {
         for (k, n) in [(4096_u64, 14_336_u64), (14_336, 4096)] {
             let weight = packed(format, n, k, true, 51);
             let a = activations(1, k, 52);
@@ -390,14 +360,13 @@ fn packed_matmul_bandwidth() {
             let seconds = start.elapsed().as_secs_f64() / f64::from(repeats);
             let bytes = weight.bytes().len() as f64;
             println!(
-                "{format_name} [1, {k}] x [{k}, {n}]: {:.2} ms ({:.1} GB/s over {:.1} MB)",
+                "{format:?} [1, {k}] x [{k}, {n}]: {:.2} ms ({:.1} GB/s over {:.1} MB)",
                 seconds * 1e3,
                 bytes / seconds / 1e9,
                 bytes / 1e6
             );
         }
     }
-    quant::set_iq_gather(None);
 }
 
 /// An f32 embedding table (a k-quant table expanded at load) is gathered

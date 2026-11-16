@@ -3,7 +3,7 @@
 use super::*;
 use magnetar_provider_api::packed_weight::PackedWeightFormat;
 
-const FORMATS: [PackedWeightFormat; 13] = [
+const FORMATS: [PackedWeightFormat; 14] = [
     PackedWeightFormat::Q8_0,
     PackedWeightFormat::Q4K,
     PackedWeightFormat::Q6K,
@@ -17,6 +17,7 @@ const FORMATS: [PackedWeightFormat; 13] = [
     PackedWeightFormat::Iq3Xxs,
     PackedWeightFormat::Iq3S,
     PackedWeightFormat::Q5K,
+    PackedWeightFormat::Q4_0,
 ];
 
 /// Byte offsets of each block's `f16` scale fields.
@@ -157,7 +158,11 @@ fn packed_matmuls_match_the_reference_cpu() {
 #[test]
 fn odd_run_counts_match_the_reference_cpu() {
     let (k, n) = (96_u64, 5_u64);
-    for format in [PackedWeightFormat::Q8_0, PackedWeightFormat::Iq4Nl] {
+    for format in [
+        PackedWeightFormat::Q8_0,
+        PackedWeightFormat::Iq4Nl,
+        PackedWeightFormat::Q4_0,
+    ] {
         let weight = packed(format, n, k, true, 23);
         let dense = weight.dequantize();
         let state = state(true, 1);
@@ -342,6 +347,7 @@ fn packed_matmul_bandwidth() {
         PackedWeightFormat::Q3K,
         PackedWeightFormat::Q5K,
         PackedWeightFormat::Iq4Nl,
+        PackedWeightFormat::Q4_0,
         PackedWeightFormat::Iq2Xxs,
         PackedWeightFormat::Iq2Xs,
         PackedWeightFormat::Iq2S,

@@ -11,7 +11,7 @@
 //! activations.
 
 use magnetar_provider_api::{
-    IQ4_NL_VALUES, f16_to_f32, iq_grids, iq_signs, iq4_xs_scales, q3_k_scales,
+    IQ4_NL_VALUES, Q4_0_VALUES, f16_to_f32, iq_grids, iq_signs, iq4_xs_scales, q3_k_scales,
 };
 use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightFormat};
 
@@ -69,7 +69,7 @@ fn signed_grid(grid: u64, signs: u8, out: &mut [i8]) {
 }
 
 /// Every packed format, indexed by the code the kernels are specialized on.
-const FORMATS: [PackedWeightFormat; 13] = [
+const FORMATS: [PackedWeightFormat; 14] = [
     PackedWeightFormat::Q8_0,
     PackedWeightFormat::Q4K,
     PackedWeightFormat::Q6K,
@@ -83,6 +83,7 @@ const FORMATS: [PackedWeightFormat; 13] = [
     PackedWeightFormat::Iq3Xxs,
     PackedWeightFormat::Iq3S,
     PackedWeightFormat::Q5K,
+    PackedWeightFormat::Q4_0,
 ];
 
 fn format_code(format: PackedWeightFormat) -> u8 {
@@ -176,12 +177,18 @@ fn decode(format: PackedWeightFormat, block: &[u8], run: usize, out: &mut Run) {
             }
             out.min = [0.0, 0.0];
         }
-        PackedWeightFormat::Iq4Nl => {
+        // `Q4_0` is laid out like `IQ4_NL`, its quants standing for `q - 8`.
+        PackedWeightFormat::Iq4Nl | PackedWeightFormat::Q4_0 => {
+            let table = if format == PackedWeightFormat::Q4_0 {
+                &Q4_0_VALUES
+            } else {
+                &IQ4_NL_VALUES
+            };
             let d = half(block, 0);
             for l in 0..16 {
                 let byte = block[2 + l];
-                out.q[l] = IQ4_NL_VALUES[usize::from(byte & 0xF)];
-                out.q[l + 16] = IQ4_NL_VALUES[usize::from(byte >> 4)];
+                out.q[l] = table[usize::from(byte & 0xF)];
+                out.q[l + 16] = table[usize::from(byte >> 4)];
             }
             out.scale = [d, d];
             out.min = [0.0, 0.0];
@@ -431,11 +438,11 @@ pub fn matmul_columns(
         ($($code:literal),*) => {
             match reader.code {
                 $($code => columns::<$code>(reader, activations, first, count, out),)*
-                _ => unreachable!("format codes are below 13"),
+                _ => unreachable!("format codes are below 14"),
             }
         };
     }
-    dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12)
+    dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
 }
 
 /// [`matmul_columns`] for format code `F`.
@@ -490,7 +497,11 @@ fn columns<const F: u8>(
                     true
                 }
                 PackedWeightFormat::Iq4Nl => {
-                    columns_iq4nl_avx2(reader, quantized, m, k, first, count, out);
+                    columns_iq4nl_avx2(reader, quantized, m, k, first, count, out, &IQ4_NL_VALUES);
+                    true
+                }
+                PackedWeightFormat::Q4_0 => {
+                    columns_iq4nl_avx2(reader, quantized, m, k, first, count, out, &Q4_0_VALUES);
                     true
                 }
                 PackedWeightFormat::Iq2Xxs
@@ -1350,20 +1361,21 @@ unsafe fn columns_q3k_avx2(
     }
 }
 
-/// The IQ4 non-linear values for 32 indices given as two 16-byte runs'
-/// worth of packed nibbles: `(first run, second run)`.
+/// `table`'s values for 32 indices given as two 16-byte runs' worth of
+/// packed nibbles: `(first run, second run)`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
 fn iq4_pair(
     bytes: std::arch::x86_64::__m256i,
+    table: &[i8; 16],
 ) -> (std::arch::x86_64::__m256i, std::arch::x86_64::__m256i) {
     use std::arch::x86_64::*;
     let mask = _mm256_set1_epi8(0xF);
     let low = _mm256_and_si256(bytes, mask);
     let high = _mm256_and_si256(_mm256_srli_epi16(bytes, 4), mask);
     // SAFETY: the table holds 16 bytes.
-    let table = unsafe { _mm_loadu_si128(IQ4_NL_VALUES.as_ptr().cast()) };
+    let table = unsafe { _mm_loadu_si128(table.as_ptr().cast()) };
     let table = _mm256_set_m128i(table, table);
     (
         _mm256_shuffle_epi8(table, _mm256_permute2x128_si256(low, high, 0x20)),
@@ -1400,7 +1412,7 @@ unsafe fn columns_iq4xs_avx2(
             for pair in 0..4 {
                 // SAFETY: two IQ4_XS runs hold 32 index bytes.
                 let bytes = unsafe { _mm256_loadu_si256(block.as_ptr().add(8 + 32 * pair).cast()) };
-                let (w0, w1) = iq4_pair(bytes);
+                let (w0, w1) = iq4_pair(bytes, &IQ4_NL_VALUES);
                 for (i, w) in [(0, w0), (1, w1)] {
                     let j = 2 * pair + i;
                     accumulate_signed(
@@ -1420,10 +1432,12 @@ unsafe fn columns_iq4xs_avx2(
     }
 }
 
-/// Specialized `IQ4_NL`: two consecutive blocks' index bytes gathered into
-/// one register and mapped through the table by `vpshufb`.
+/// Specialized `IQ4_NL`, and `Q4_0` laid out alike: two consecutive
+/// blocks' index bytes gathered into one register and mapped through
+/// `table` by `vpshufb`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma,f16c")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn columns_iq4nl_avx2(
     reader: &RunReader<'_>,
     quantized: &QuantizedRows,
@@ -1432,6 +1446,7 @@ unsafe fn columns_iq4nl_avx2(
     first: usize,
     count: usize,
     out: &mut [f32],
+    table: &[i8; 16],
 ) {
     use std::arch::x86_64::*;
     const BLOCK: usize = 18;
@@ -1453,7 +1468,7 @@ unsafe fn columns_iq4nl_avx2(
             } else {
                 _mm_setzero_si128()
             };
-            let (w0, w1) = iq4_pair(_mm256_set_m128i(high, low));
+            let (w0, w1) = iq4_pair(_mm256_set_m128i(high, low), table);
             accumulate_signed(w0, half_f16c(block0, 0), quantized, runs, u, &mut acc);
             if pair {
                 let d1 = half_f16c(&row[(u + 1) * BLOCK..][..BLOCK], 0);
@@ -1555,9 +1570,9 @@ unsafe fn vector_run<const F: u8>(
         let high = _mm_and_si128(_mm_srli_epi16(bytes, 4), _mm_set1_epi8(0xF));
         _mm256_set_m128i(high, low)
     };
-    let iq4 = |indices: __m256i| {
+    let iq4 = |indices: __m256i, table: &[i8; 16]| {
         // SAFETY: the table holds 16 bytes.
-        let table = unsafe { _mm_loadu_si128(IQ4_NL_VALUES.as_ptr().cast()) };
+        let table = unsafe { _mm_loadu_si128(table.as_ptr().cast()) };
         _mm256_shuffle_epi8(_mm256_set_m128i(table, table), indices)
     };
     match FORMATS[F as usize] {
@@ -1603,20 +1618,28 @@ unsafe fn vector_run<const F: u8>(
             let high = _mm256_slli_epi16(_mm256_and_si256(high, _mm256_set1_epi8(3)), 4);
             _mm256_sub_epi8(_mm256_or_si256(low, high), _mm256_set1_epi8(32))
         }
-        PackedWeightFormat::Iq4Nl => {
+        PackedWeightFormat::Iq4Nl | PackedWeightFormat::Q4_0 => {
             let d = half_f16c(block, 0);
             run.scale = [d, d];
             run.min = [0.0, 0.0];
-            // SAFETY: an IQ4_NL block holds 16 index bytes after its scale.
-            iq4(nibbles(unsafe {
-                _mm_loadu_si128(block.as_ptr().add(2).cast())
-            }))
+            let table = if format == PackedWeightFormat::Q4_0 {
+                &Q4_0_VALUES
+            } else {
+                &IQ4_NL_VALUES
+            };
+            // SAFETY: an IQ4_NL or Q4_0 block holds 16 index bytes after
+            // its scale.
+            iq4(
+                nibbles(unsafe { _mm_loadu_si128(block.as_ptr().add(2).cast()) }),
+                table,
+            )
         }
         PackedWeightFormat::Iq4Xs => {
             // SAFETY: each IQ4_XS run holds 16 index bytes.
-            iq4(nibbles(unsafe {
-                _mm_loadu_si128(block.as_ptr().add(8 + 16 * local).cast())
-            }))
+            iq4(
+                nibbles(unsafe { _mm_loadu_si128(block.as_ptr().add(8 + 16 * local).cast()) }),
+                &IQ4_NL_VALUES,
+            )
         }
         format => {
             decode(format, block, local, run);

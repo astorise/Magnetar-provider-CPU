@@ -2580,7 +2580,9 @@ impl ReferenceCpuExecutor {
                     .ok_or_else(|| KernelError::KernelAttributeUnsupported {
                         attribute: "group_count".into(),
                     })?;
-                batched_matmul(&a, &b, groups).map_err(KernelError::from)?
+                let transpose_b =
+                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                batched_matmul(&a, &b, groups, transpose_b).map_err(KernelError::from)?
             }
             "moe-experts" => {
                 let h = self.input_tensor(invocation, 0)?;

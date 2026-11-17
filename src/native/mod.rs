@@ -288,7 +288,15 @@ impl NativeState {
                 if (kind == "causal" && causal) || (kind == "bidirectional" && !causal) => {}
             Some(_) => return None,
         }
-        if head_count == 0
+        // V rows of another width than Q/K rows: the Reference CPU kernel.
+        if ReferenceCpuExecutor::attribute_integer(attributes, "value_head_dimension")
+            .is_some_and(|width| width != head_dimension)
+        {
+            return None;
+        }
+        let score_scale = ReferenceCpuExecutor::attribute_float_opt(attributes, "scale");
+        if score_scale.is_some_and(|scale| !scale.is_finite())
+            || head_count == 0
             || head_dimension == 0
             || kv_head_count == 0
             || !head_count.is_multiple_of(kv_head_count)
@@ -324,7 +332,7 @@ impl NativeState {
         let (q_width, kv_width, dim) =
             (q_width as usize, kv_width as usize, head_dimension as usize);
         let group = (head_count / kv_head_count) as usize;
-        let scale = 1.0 / (dim as f32).sqrt();
+        let scale = score_scale.unwrap_or(1.0 / (dim as f32).sqrt());
         let offset = kv_len - seq_len;
         let pairs = head_count as usize * seq_len;
         let mut out = vec![0.0_f32; seq_len * q_width];
@@ -420,13 +428,22 @@ impl PackedWeights for NativeState {
             "attention" => self.attention(executor, invocation),
             "embedding" => {
                 let id = &invocation.inputs.first()?.resource.id;
-                match self.weight(id) {
-                    Some(table) => Some(self.embedding(executor, invocation, &table)),
-                    // An f32 table (a k-quant table is expanded at load):
+                let rows = match self.weight(id) {
+                    Some(table) => self.embedding(executor, invocation, &table),
+                    // An f32 table (one this Provider received dequantized):
                     // gather its rows in place instead of the Reference
                     // CPU kernel's copy of the whole table per lookup.
-                    None => Some(Self::f32_embedding(executor, invocation, id)),
-                }
+                    None => Self::f32_embedding(executor, invocation, id),
+                };
+                // `scale` multiplies every gathered row.
+                let scale =
+                    ReferenceCpuExecutor::attribute_float_opt(&invocation.attributes, "scale");
+                Some(rows.and_then(|rows| match scale {
+                    Some(factor) => {
+                        operator_semantics::scale(&rows, factor).map_err(KernelError::from)
+                    }
+                    None => Ok(rows),
+                }))
             }
             _ => None,
         }

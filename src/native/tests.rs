@@ -512,6 +512,90 @@ fn attention_matches_the_reference_cpu() {
     }
 }
 
+/// The optimized CPU Provider's own attention and embedding honour the
+/// optional forms they read: an attention `scale` replaces
+/// `1/sqrt(head_dimension)`, V rows of another width than Q/K rows are left
+/// to the Reference CPU kernel, and an embedding `scale` multiplies the
+/// gathered rows.
+#[test]
+fn attention_and_embedding_honour_their_optional_forms() {
+    use magnetar_core::operator::OperatorAttributeValue as Value;
+    let (heads, dim) = (2_u64, 8_u64);
+    let executor = NativeCpuExecutor::with_settings(true, true, 2);
+    let q = activations(3, heads * dim, 81);
+    let k = activations(3, heads * dim, 82);
+    let v = activations(3, heads * dim, 83);
+    let ids = ["q", "k", "v"].map(TensorResourceId::new);
+    for (id, tensor) in ids.iter().zip([&q, &k, &v]) {
+        executor
+            .reference()
+            .write_tensor(id.clone(), tensor.clone());
+    }
+    let attributes = BTreeMap::from([
+        ("head_count".to_string(), Value::Integer(heads as i64)),
+        ("head_dimension".to_string(), Value::Integer(dim as i64)),
+        ("causal".to_string(), Value::Boolean(true)),
+        ("scale".to_string(), Value::Float(1.0)),
+    ]);
+    let invocation = invocation_reading("attention", &[&ids[0], &ids[1], &ids[2]])
+        .with_attributes(attributes.clone());
+    let actual = executor
+        .state
+        .attention(executor.reference(), &invocation)
+        .expect("handled natively")
+        .unwrap();
+    let expected = attention_scaled(&q, &k, &v, heads, dim, None, None, true, Some(1.0)).unwrap();
+    assert_close(&actual, &expected, "attention with scale 1");
+    let unscaled = attention(&q, &k, &v, heads, dim, None, None, true).unwrap();
+    assert!(
+        actual
+            .data
+            .iter()
+            .zip(&unscaled.data)
+            .any(|(a, b)| (a - b).abs() > 1e-3),
+        "the scale changes the result"
+    );
+
+    let mut wider_values = attributes;
+    wider_values.insert("value_head_dimension".into(), Value::Integer(4));
+    let invocation =
+        invocation_reading("attention", &[&ids[0], &ids[1], &ids[2]]).with_attributes(wider_values);
+    assert!(
+        executor
+            .state
+            .attention(executor.reference(), &invocation)
+            .is_none(),
+        "another V width runs the Reference CPU kernel"
+    );
+
+    let table = activations(10, 64, 84);
+    let table_id = TensorResourceId::new("table");
+    executor
+        .reference()
+        .write_tensor(table_id.clone(), table.clone());
+    let lookup = HostTensor::new([2], vec![3.0, 7.0]).unwrap();
+    let lookup_id = TensorResourceId::new("ids");
+    executor
+        .reference()
+        .write_tensor(lookup_id.clone(), lookup.clone());
+    let invocation = invocation_reading("embedding", &[&table_id, &lookup_id])
+        .with_attributes(BTreeMap::from([("scale".to_string(), Value::Float(2.5))]));
+    let actual = executor
+        .state
+        .run(executor.reference(), &invocation)
+        .expect("handled natively")
+        .unwrap();
+    let expected = embedding_lookup(&table, &lookup).unwrap();
+    assert_eq!(
+        actual.data,
+        expected
+            .data
+            .iter()
+            .map(|value| value * 2.5)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// Decode-step attention on Mistral 7B shapes (32 heads, 8 KV heads of 128,
 /// a 2048-row cache holding `key_count` keys) against the Reference CPU
 /// kernel (diagnostic: run with `--ignored --nocapture`).

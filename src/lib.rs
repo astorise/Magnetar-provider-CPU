@@ -141,7 +141,7 @@ use magnetar_provider_api::operator_semantics::{
 };
 use magnetar_provider_api::{
     ExecutionPlanId, HostTensor, KvStorePrecision, ReferenceCpuError, ReferenceCpuErrorCode,
-    kv_store_round_trip,
+    TurboQuantStoreState,
 };
 use magnetar_provider_api::{
     PROVIDER_API_VERSION, Provider, ProviderExecutionApi, ProviderMetadata, ProviderRegistry,
@@ -1562,9 +1562,9 @@ pub struct ReferenceCpuExecutor {
     /// remains genuinely unadmitted, unchanged.
     resource_allocations: Mutex<BTreeMap<TensorResourceId, MemoryAllocationId>>,
     /// The KV stores created in a TurboQuant precision, with their head
-    /// width (`turboquant-kv-history`): `kv-write` stores their rows as
-    /// their TurboQuant round trip.
-    kv_store_precisions: Mutex<BTreeMap<TensorResourceId, (KvStorePrecision, u64)>>,
+    /// width and offsets (`turboquant-kv-history`): `kv-write` stores
+    /// their rows as their TurboQuant round trip.
+    turboquant_stores: Mutex<BTreeMap<TensorResourceId, TurboQuantStoreState>>,
     next_execution_ordinal: AtomicU64,
     /// The Provider identity this executor reports in handles and memory
     /// placements: the Reference CPU's, or the optimized CPU Provider's
@@ -1583,7 +1583,7 @@ impl Default for ReferenceCpuExecutor {
             submitted: Mutex::new(BTreeMap::new()),
             kernel_executions: Mutex::new(BTreeMap::new()),
             resource_allocations: Mutex::new(BTreeMap::new()),
-            kv_store_precisions: Mutex::new(BTreeMap::new()),
+            turboquant_stores: Mutex::new(BTreeMap::new()),
             next_execution_ordinal: AtomicU64::new(0),
             provider_name: REFERENCE_CPU_PROVIDER_NAME,
             packed: None,
@@ -1610,7 +1610,7 @@ impl ReferenceCpuExecutor {
     /// Drops a tensor from this executor's opaque storage. Returns `true`
     /// if `id` was present and removed, `false` if it was already absent.
     pub fn release_tensor(&self, id: &TensorResourceId) -> bool {
-        self.kv_store_precisions.lock().unwrap().remove(id);
+        self.turboquant_stores.lock().unwrap().remove(id);
         self.storage.lock().unwrap().remove(id).is_some()
     }
 
@@ -1640,13 +1640,16 @@ impl ReferenceCpuExecutor {
             return false;
         };
         self.write_tensor(id.clone(), zeros);
-        let mut precisions = self.kv_store_precisions.lock().unwrap();
+        let mut stores = self.turboquant_stores.lock().unwrap();
         match precision {
             KvStorePrecision::F32 => {
-                precisions.remove(id);
+                stores.remove(id);
             }
             _ => {
-                precisions.insert(id.clone(), (precision, head_dimension));
+                stores.insert(
+                    id.clone(),
+                    TurboQuantStoreState::new(precision, head_dimension, *width),
+                );
             }
         }
         true
@@ -1655,7 +1658,11 @@ impl ReferenceCpuExecutor {
     /// The precision a KV store was created in, with its head width, when
     /// it is not f32.
     pub fn kv_store_precision(&self, id: &TensorResourceId) -> Option<(KvStorePrecision, u64)> {
-        self.kv_store_precisions.lock().unwrap().get(id).copied()
+        self.turboquant_stores
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|store| (store.precision, store.head_dimension))
     }
 
     /// See [`ProviderExecutionApi::release_admitted_tensor`]: releases the
@@ -1753,13 +1760,12 @@ impl ReferenceCpuExecutor {
         if let Some(previous) = previous {
             let _ = memory.release(previous);
         }
-        // A copied KV store keeps its precision.
-        let precision = self.kv_store_precision(from);
+        // A copied KV store keeps its precision and offsets.
         {
-            let mut precisions = self.kv_store_precisions.lock().unwrap();
-            match precision {
-                Some(precision) => precisions.insert(to.clone(), precision),
-                None => precisions.remove(&to),
+            let mut stores = self.turboquant_stores.lock().unwrap();
+            match stores.get(from).cloned() {
+                Some(store) => stores.insert(to.clone(), store),
+                None => stores.remove(&to),
             };
         }
         self.storage.lock().unwrap().insert(to, tensor);
@@ -1782,7 +1788,7 @@ impl ReferenceCpuExecutor {
     ) -> Result<(), ProviderExecutionError> {
         if let TensorValue::Host(tensor) = value {
             // A tensor written whole is f32, whatever the id held before.
-            self.kv_store_precisions.lock().unwrap().remove(&id);
+            self.turboquant_stores.lock().unwrap().remove(&id);
             self.write_tensor(id, tensor);
         }
         Ok(())
@@ -2453,17 +2459,27 @@ impl ReferenceCpuExecutor {
                 })?;
         // A TurboQuant store holds each row as its round trip
         // (`turboquant-kv-history`).
-        if let Some((precision, head_dimension)) = self.kv_store_precision(store_id) {
-            rows.data =
-                kv_store_round_trip(&rows.data, head_dimension, precision).ok_or_else(|| {
-                    KernelError::KernelAttributeUnsupported {
-                        attribute: format!(
-                            "kv-write rows of {:?} into a {} store of {head_dimension}-wide heads",
-                            rows.shape,
-                            precision.as_str()
-                        ),
-                    }
-                })?;
+        // A write at row 0 sets the store's offsets.
+        let turboquant = self
+            .turboquant_stores
+            .lock()
+            .unwrap()
+            .get_mut(store_id)
+            .map(|state| {
+                (
+                    state.write(&rows.data, row_offset),
+                    state.precision,
+                    state.head_dimension,
+                )
+            });
+        if let Some((stored, precision, head_dimension)) = turboquant {
+            rows.data = stored.ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                attribute: format!(
+                    "kv-write rows of {:?} into a {} store of {head_dimension}-wide heads",
+                    rows.shape,
+                    precision.as_str()
+                ),
+            })?;
         }
         let mut storage = self.storage.lock().unwrap();
         let store =

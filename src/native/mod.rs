@@ -761,6 +761,20 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         Ok(allocation)
     }
 
+    fn write_zeroed_kv_store(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        // The store replaces whatever `id` held, a packed weight included.
+        self.forget_packed(id);
+        Ok(self
+            .inner
+            .write_zeroed_kv_store(id, shape, precision, head_dimension))
+    }
+
     fn allocate_workspace(
         &self,
         memory: &mut MemoryManager,

@@ -114,7 +114,8 @@ use magnetar_core::{
 };
 use magnetar_core::{
     operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_TURBOQUANT_KV_FEATURE,
-    operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE, operator::CONCAT_HEADS_FEATURE,
+    operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
+    operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
     operator::ConcatAxis, operator::EMBEDDING_SCALE_FEATURE, operator::KV_WRITE_TURBOQUANT_FEATURE,
     operator::MOE_EXPERTS_ACTIVATION_FEATURE, operator::MOE_PER_EXPERT_SCALE_FEATURE,
     operator::OperatorAttributeValue, operator::OperatorFamily, operator::OperatorId,
@@ -137,7 +138,8 @@ use magnetar_kernel::{
     kernel::KernelResultStatus, kernel::KernelWorkspaceRequirements,
 };
 use magnetar_provider_api::operator_semantics::{
-    self, MoeExpertActivation, MoeExpertOptions, MoeRouting, moe_local_experts, row_scale, sigmoid,
+    self, MoeExpertActivation, MoeExpertOptions, MoeRouting, batched_matmul, moe_local_experts,
+    row_scale, sigmoid, value_heads,
 };
 use magnetar_provider_api::{
     ExecutionPlanId, HostTensor, KvStorePrecision, ReferenceCpuError, ReferenceCpuErrorCode,
@@ -1395,11 +1397,13 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         memory_classes: BTreeSet::new(),
         affinity: None,
     });
-    // Honours `scale` and `value_head_dimension`; reads TurboQuant stores,
-    // which hold f32 values (`turboquant-kv-history`).
+    // Honours `scale`, `value_head_dimension` and `value_head_stride`
+    // (`cache-latent-attention-history`); reads TurboQuant stores, which
+    // hold f32 values (`turboquant-kv-history`).
     attention.id.features.extend([
         ATTENTION_SCALE_FEATURE.to_string(),
         ATTENTION_VALUE_HEAD_DIMENSION_FEATURE.to_string(),
+        ATTENTION_VALUE_HEAD_STRIDE_FEATURE.to_string(),
         ATTENTION_TURBOQUANT_KV_FEATURE.to_string(),
     ]);
     let with_features = |operator: &str, family: OperatorFamily, features: &[&str]| {
@@ -1446,6 +1450,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("matmul-bias", OperatorFamily::LinearAlgebra),
         baseline_advertisement("matmul-residual", OperatorFamily::LinearAlgebra),
         baseline_advertisement("silu-mul", OperatorFamily::Activation),
+        baseline_advertisement("batched-matmul", OperatorFamily::LinearAlgebra),
         moe_experts,
         baseline_advertisement("row-scale", OperatorFamily::Tensor),
         embedding,
@@ -2567,6 +2572,16 @@ impl ReferenceCpuExecutor {
                 let up = self.input_tensor(invocation, 1)?;
                 mul(&silu(&gate), &up).map_err(KernelError::from)?
             }
+            "batched-matmul" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                let groups = Self::attribute_integer(&invocation.attributes, "group_count")
+                    .filter(|groups| *groups > 0)
+                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                        attribute: "group_count".into(),
+                    })?;
+                batched_matmul(&a, &b, groups).map_err(KernelError::from)?
+            }
             "moe-experts" => {
                 let h = self.input_tensor(invocation, 0)?;
                 let logits = self.input_tensor(invocation, 1)?;
@@ -2851,6 +2866,23 @@ impl ReferenceCpuExecutor {
                     Some(_) => {
                         return Err(KernelError::KernelAttributeUnsupported {
                             attribute: "value_head_dimension must be a positive integer".into(),
+                        });
+                    }
+                };
+                // V's heads may be wider than the value, which is their
+                // leading values (`value_head_stride`).
+                let v = match invocation.attributes.get("value_head_stride") {
+                    None => v,
+                    Some(OperatorAttributeValue::Integer(stride)) if *stride > 0 => value_heads(
+                        &v,
+                        kv_head_count.unwrap_or(head_count),
+                        *stride as u64,
+                        value_head_dimension,
+                    )
+                    .map_err(KernelError::from)?,
+                    Some(_) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "value_head_stride must be a positive integer".into(),
                         });
                     }
                 };

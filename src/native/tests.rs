@@ -556,7 +556,7 @@ fn attention_and_embedding_honour_their_optional_forms() {
         "the scale changes the result"
     );
 
-    let mut wider_values = attributes;
+    let mut wider_values = attributes.clone();
     wider_values.insert("value_head_dimension".into(), Value::Integer(4));
     let invocation =
         invocation_reading("attention", &[&ids[0], &ids[1], &ids[2]]).with_attributes(wider_values);
@@ -566,6 +566,17 @@ fn attention_and_embedding_honour_their_optional_forms() {
             .attention(executor.reference(), &invocation)
             .is_none(),
         "another V width runs the Reference CPU kernel"
+    );
+    let mut strided_values = attributes;
+    strided_values.insert("value_head_stride".into(), Value::Integer(dim as i64));
+    let invocation = invocation_reading("attention", &[&ids[0], &ids[1], &ids[2]])
+        .with_attributes(strided_values);
+    assert!(
+        executor
+            .state
+            .attention(executor.reference(), &invocation)
+            .is_none(),
+        "V heads read with a stride run the Reference CPU kernel"
     );
 
     let table = activations(10, 64, 84);

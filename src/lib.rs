@@ -113,8 +113,10 @@ use magnetar_core::{
     device::DeviceMetadata, device::DeviceType,
 };
 use magnetar_core::{
-    operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
-    operator::CONCAT_HEADS_FEATURE, operator::ConcatAxis, operator::EMBEDDING_SCALE_FEATURE,
+    operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_TURBOQUANT_KV_FEATURE,
+    operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
+    operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
+    operator::ConcatAxis, operator::EMBEDDING_SCALE_FEATURE, operator::KV_WRITE_TURBOQUANT_FEATURE,
     operator::MOE_EXPERTS_ACTIVATION_FEATURE, operator::MOE_PER_EXPERT_SCALE_FEATURE,
     operator::OperatorAttributeValue, operator::OperatorFamily, operator::OperatorId,
     operator::OperatorSpec, operator::RMSNORM_PER_HEAD_FEATURE,
@@ -136,10 +138,12 @@ use magnetar_kernel::{
     kernel::KernelResultStatus, kernel::KernelWorkspaceRequirements,
 };
 use magnetar_provider_api::operator_semantics::{
-    self, MoeExpertActivation, MoeExpertOptions, MoeRouting, moe_local_experts, row_scale, sigmoid,
+    self, MoeExpertActivation, MoeExpertOptions, MoeRouting, batched_matmul, moe_local_experts,
+    row_scale, sigmoid, value_heads,
 };
 use magnetar_provider_api::{
-    ExecutionPlanId, HostTensor, ReferenceCpuError, ReferenceCpuErrorCode,
+    ExecutionPlanId, HostTensor, KvStorePrecision, ReferenceCpuError, ReferenceCpuErrorCode,
+    TurboQuantStoreState,
 };
 use magnetar_provider_api::{
     PROVIDER_API_VERSION, Provider, ProviderExecutionApi, ProviderMetadata, ProviderRegistry,
@@ -1393,10 +1397,14 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         memory_classes: BTreeSet::new(),
         affinity: None,
     });
-    // Honours `scale` and `value_head_dimension`.
+    // Honours `scale`, `value_head_dimension` and `value_head_stride`
+    // (`cache-latent-attention-history`); reads TurboQuant stores, which
+    // hold f32 values (`turboquant-kv-history`).
     attention.id.features.extend([
         ATTENTION_SCALE_FEATURE.to_string(),
         ATTENTION_VALUE_HEAD_DIMENSION_FEATURE.to_string(),
+        ATTENTION_VALUE_HEAD_STRIDE_FEATURE.to_string(),
+        ATTENTION_TURBOQUANT_KV_FEATURE.to_string(),
     ]);
     let with_features = |operator: &str, family: OperatorFamily, features: &[&str]| {
         let mut advertisement = baseline_advertisement(operator, family);
@@ -1442,6 +1450,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("matmul-bias", OperatorFamily::LinearAlgebra),
         baseline_advertisement("matmul-residual", OperatorFamily::LinearAlgebra),
         baseline_advertisement("silu-mul", OperatorFamily::Activation),
+        baseline_advertisement("batched-matmul", OperatorFamily::LinearAlgebra),
         moe_experts,
         baseline_advertisement("row-scale", OperatorFamily::Tensor),
         embedding,
@@ -1454,7 +1463,12 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("activation", OperatorFamily::Activation),
         baseline_advertisement("add", OperatorFamily::Tensor),
         concat,
-        baseline_advertisement("kv-write", OperatorFamily::Tensor),
+        // Creates and writes TurboQuant stores (`turboquant-kv-history`).
+        with_features(
+            "kv-write",
+            OperatorFamily::Tensor,
+            &[KV_WRITE_TURBOQUANT_FEATURE],
+        ),
         baseline_advertisement("mul", OperatorFamily::Tensor),
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
@@ -1552,6 +1566,10 @@ pub struct ReferenceCpuExecutor {
     /// plain [`Self::write_tensor`] are never tracked here -- that path
     /// remains genuinely unadmitted, unchanged.
     resource_allocations: Mutex<BTreeMap<TensorResourceId, MemoryAllocationId>>,
+    /// The KV stores created in a TurboQuant precision, with their head
+    /// width and offsets (`turboquant-kv-history`): `kv-write` stores
+    /// their rows as their TurboQuant round trip.
+    turboquant_stores: Mutex<BTreeMap<TensorResourceId, TurboQuantStoreState>>,
     next_execution_ordinal: AtomicU64,
     /// The Provider identity this executor reports in handles and memory
     /// placements: the Reference CPU's, or the optimized CPU Provider's
@@ -1570,6 +1588,7 @@ impl Default for ReferenceCpuExecutor {
             submitted: Mutex::new(BTreeMap::new()),
             kernel_executions: Mutex::new(BTreeMap::new()),
             resource_allocations: Mutex::new(BTreeMap::new()),
+            turboquant_stores: Mutex::new(BTreeMap::new()),
             next_execution_ordinal: AtomicU64::new(0),
             provider_name: REFERENCE_CPU_PROVIDER_NAME,
             packed: None,
@@ -1596,7 +1615,59 @@ impl ReferenceCpuExecutor {
     /// Drops a tensor from this executor's opaque storage. Returns `true`
     /// if `id` was present and removed, `false` if it was already absent.
     pub fn release_tensor(&self, id: &TensorResourceId) -> bool {
+        self.turboquant_stores.lock().unwrap().remove(id);
         self.storage.lock().unwrap().remove(id).is_some()
+    }
+
+    /// See [`ProviderExecutionApi::write_zeroed_kv_store`]: an f32 store of
+    /// zeros whose `kv-write` rows are stored as their TurboQuant round trip
+    /// (`turboquant-kv-history`). `false` for a shape that is not
+    /// `[capacity, whole heads]` or an unsupported head width.
+    pub fn write_zeroed_kv_store(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+    ) -> bool {
+        let [capacity, width] = shape else {
+            return false;
+        };
+        if !precision.supports_head_dimension(head_dimension)
+            || !width.is_multiple_of(head_dimension)
+        {
+            return false;
+        }
+        let Ok(zeros) = HostTensor::new(
+            [*capacity, *width],
+            vec![0.0; (*capacity * *width) as usize],
+        ) else {
+            return false;
+        };
+        self.write_tensor(id.clone(), zeros);
+        let mut stores = self.turboquant_stores.lock().unwrap();
+        match precision {
+            KvStorePrecision::F32 => {
+                stores.remove(id);
+            }
+            _ => {
+                stores.insert(
+                    id.clone(),
+                    TurboQuantStoreState::new(precision, head_dimension, *width),
+                );
+            }
+        }
+        true
+    }
+
+    /// The precision a KV store was created in, with its head width, when
+    /// it is not f32.
+    pub fn kv_store_precision(&self, id: &TensorResourceId) -> Option<(KvStorePrecision, u64)> {
+        self.turboquant_stores
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|store| (store.precision, store.head_dimension))
     }
 
     /// See [`ProviderExecutionApi::release_admitted_tensor`]: releases the
@@ -1694,6 +1765,14 @@ impl ReferenceCpuExecutor {
         if let Some(previous) = previous {
             let _ = memory.release(previous);
         }
+        // A copied KV store keeps its precision and offsets.
+        {
+            let mut stores = self.turboquant_stores.lock().unwrap();
+            match stores.get(from).cloned() {
+                Some(store) => stores.insert(to.clone(), store),
+                None => stores.remove(&to),
+            };
+        }
         self.storage.lock().unwrap().insert(to, tensor);
         Ok(allocation.id)
     }
@@ -1713,6 +1792,8 @@ impl ReferenceCpuExecutor {
         value: TensorValue,
     ) -> Result<(), ProviderExecutionError> {
         if let TensorValue::Host(tensor) = value {
+            // A tensor written whole is f32, whatever the id held before.
+            self.turboquant_stores.lock().unwrap().remove(&id);
             self.write_tensor(id, tensor);
         }
         Ok(())
@@ -2359,7 +2440,7 @@ impl ReferenceCpuExecutor {
         &self,
         invocation: &KernelInvocation,
     ) -> Result<TensorResourceDescriptor, KernelError> {
-        let rows = self.input_tensor(invocation, 1)?;
+        let mut rows = self.input_tensor(invocation, 1)?;
         let row_offset =
             Self::attribute_integer(&invocation.attributes, "row_offset").ok_or_else(|| {
                 KernelError::KernelAttributeUnsupported {
@@ -2381,6 +2462,30 @@ impl ReferenceCpuExecutor {
                 .ok_or_else(|| KernelError::KernelExecutionFailed {
                     reason: "missing output at index 0".into(),
                 })?;
+        // A TurboQuant store holds each row as its round trip
+        // (`turboquant-kv-history`).
+        // A write at row 0 sets the store's offsets.
+        let turboquant = self
+            .turboquant_stores
+            .lock()
+            .unwrap()
+            .get_mut(store_id)
+            .map(|state| {
+                (
+                    state.write(&rows.data, row_offset),
+                    state.precision,
+                    state.head_dimension,
+                )
+            });
+        if let Some((stored, precision, head_dimension)) = turboquant {
+            rows.data = stored.ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                attribute: format!(
+                    "kv-write rows of {:?} into a {} store of {head_dimension}-wide heads",
+                    rows.shape,
+                    precision.as_str()
+                ),
+            })?;
+        }
         let mut storage = self.storage.lock().unwrap();
         let store =
             storage
@@ -2466,6 +2571,18 @@ impl ReferenceCpuExecutor {
                 let gate = self.input_tensor(invocation, 0)?;
                 let up = self.input_tensor(invocation, 1)?;
                 mul(&silu(&gate), &up).map_err(KernelError::from)?
+            }
+            "batched-matmul" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let b = self.input_tensor(invocation, 1)?;
+                let groups = Self::attribute_integer(&invocation.attributes, "group_count")
+                    .filter(|groups| *groups > 0)
+                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                        attribute: "group_count".into(),
+                    })?;
+                let transpose_b =
+                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                batched_matmul(&a, &b, groups, transpose_b).map_err(KernelError::from)?
             }
             "moe-experts" => {
                 let h = self.input_tensor(invocation, 0)?;
@@ -2751,6 +2868,23 @@ impl ReferenceCpuExecutor {
                     Some(_) => {
                         return Err(KernelError::KernelAttributeUnsupported {
                             attribute: "value_head_dimension must be a positive integer".into(),
+                        });
+                    }
+                };
+                // V's heads may be wider than the value, which is their
+                // leading values (`value_head_stride`).
+                let v = match invocation.attributes.get("value_head_stride") {
+                    None => v,
+                    Some(OperatorAttributeValue::Integer(stride)) if *stride > 0 => value_heads(
+                        &v,
+                        kv_head_count.unwrap_or(head_count),
+                        *stride as u64,
+                        value_head_dimension,
+                    )
+                    .map_err(KernelError::from)?,
+                    Some(_) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "value_head_stride must be a positive integer".into(),
                         });
                     }
                 };
@@ -3068,6 +3202,22 @@ impl ProviderExecutionApi for ReferenceCpuExecutor {
         owner: MemoryAllocationOwner,
     ) -> Result<MemoryAllocationId, TensorValueAdmissionError> {
         ReferenceCpuExecutor::copy_tensor_admitted(self, memory, from, to, class, owner)
+    }
+
+    fn write_zeroed_kv_store(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        Ok(ReferenceCpuExecutor::write_zeroed_kv_store(
+            self,
+            id,
+            shape,
+            precision,
+            head_dimension,
+        ))
     }
 
     fn allocate_workspace(

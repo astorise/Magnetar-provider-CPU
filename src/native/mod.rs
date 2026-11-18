@@ -288,9 +288,11 @@ impl NativeState {
                 if (kind == "causal" && causal) || (kind == "bidirectional" && !causal) => {}
             Some(_) => return None,
         }
-        // V rows of another width than Q/K rows: the Reference CPU kernel.
+        // V rows of another width than Q/K rows, or V heads wider than the
+        // value: the Reference CPU kernel.
         if ReferenceCpuExecutor::attribute_integer(attributes, "value_head_dimension")
             .is_some_and(|width| width != head_dimension)
+            || attributes.contains_key("value_head_stride")
         {
             return None;
         }
@@ -759,6 +761,20 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         // The copy replaces whatever `to` held, a packed weight included.
         self.forget_packed(&to);
         Ok(allocation)
+    }
+
+    fn write_zeroed_kv_store(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        // The store replaces whatever `id` held, a packed weight included.
+        self.forget_packed(id);
+        Ok(self
+            .inner
+            .write_zeroed_kv_store(id, shape, precision, head_dimension))
     }
 
     fn allocate_workspace(

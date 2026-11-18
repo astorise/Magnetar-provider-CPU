@@ -116,7 +116,8 @@ use magnetar_core::{
     operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_TURBOQUANT_KV_FEATURE,
     operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
     operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
-    operator::ConcatAxis, operator::EMBEDDING_SCALE_FEATURE, operator::KV_WRITE_TURBOQUANT_FEATURE,
+    operator::ConcatAxis, operator::EMBEDDING_SCALE_FEATURE,
+    operator::KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE, operator::KV_WRITE_TURBOQUANT_FEATURE,
     operator::MOE_EXPERTS_ACTIVATION_FEATURE, operator::MOE_PER_EXPERT_SCALE_FEATURE,
     operator::OperatorAttributeValue, operator::OperatorFamily, operator::OperatorId,
     operator::OperatorSpec, operator::RMSNORM_PER_HEAD_FEATURE,
@@ -1463,11 +1464,15 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("activation", OperatorFamily::Activation),
         baseline_advertisement("add", OperatorFamily::Tensor),
         concat,
-        // Creates and writes TurboQuant stores (`turboquant-kv-history`).
+        // Creates and writes TurboQuant stores (`turboquant-kv-history`),
+        // with an exact head (`keep-turboquant-kv-head-exact`).
         with_features(
             "kv-write",
             OperatorFamily::Tensor,
-            &[KV_WRITE_TURBOQUANT_FEATURE],
+            &[
+                KV_WRITE_TURBOQUANT_FEATURE,
+                KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE,
+            ],
         ),
         baseline_advertisement("mul", OperatorFamily::Tensor),
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
@@ -1630,6 +1635,20 @@ impl ReferenceCpuExecutor {
         precision: KvStorePrecision,
         head_dimension: u64,
     ) -> bool {
+        self.write_zeroed_kv_store_with_exact_head(id, shape, precision, head_dimension, 0)
+    }
+
+    /// See [`ProviderExecutionApi::write_zeroed_kv_store_with_exact_head`]:
+    /// [`Self::write_zeroed_kv_store`] whose first `exact_rows` rows stay
+    /// exact (`keep-turboquant-kv-head-exact`).
+    pub fn write_zeroed_kv_store_with_exact_head(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+        exact_rows: u64,
+    ) -> bool {
         let [capacity, width] = shape else {
             return false;
         };
@@ -1653,7 +1672,8 @@ impl ReferenceCpuExecutor {
             _ => {
                 stores.insert(
                     id.clone(),
-                    TurboQuantStoreState::new(precision, head_dimension, *width),
+                    TurboQuantStoreState::new(precision, head_dimension, *width)
+                        .with_exact_rows(exact_rows),
                 );
             }
         }
@@ -3217,6 +3237,24 @@ impl ProviderExecutionApi for ReferenceCpuExecutor {
             shape,
             precision,
             head_dimension,
+        ))
+    }
+
+    fn write_zeroed_kv_store_with_exact_head(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+        exact_rows: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        Ok(ReferenceCpuExecutor::write_zeroed_kv_store_with_exact_head(
+            self,
+            id,
+            shape,
+            precision,
+            head_dimension,
+            exact_rows,
         ))
     }
 

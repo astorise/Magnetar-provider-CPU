@@ -777,6 +777,25 @@ impl ProviderExecutionApi for NativeCpuExecutor {
             .write_zeroed_kv_store(id, shape, precision, head_dimension))
     }
 
+    fn write_zeroed_kv_store_with_exact_head(
+        &self,
+        id: &TensorResourceId,
+        shape: &[u64],
+        precision: KvStorePrecision,
+        head_dimension: u64,
+        exact_rows: u64,
+    ) -> Result<bool, ProviderExecutionError> {
+        // The store replaces whatever `id` held, a packed weight included.
+        self.forget_packed(id);
+        Ok(self.inner.write_zeroed_kv_store_with_exact_head(
+            id,
+            shape,
+            precision,
+            head_dimension,
+            exact_rows,
+        ))
+    }
+
     fn allocate_workspace(
         &self,
         memory: &mut MemoryManager,

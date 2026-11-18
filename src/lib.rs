@@ -113,8 +113,8 @@ use magnetar_core::{
     device::DeviceMetadata, device::DeviceType,
 };
 use magnetar_core::{
-    operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_TURBOQUANT_KV_FEATURE,
-    operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
+    operator::ATTENTION_LATENT_KV_FEATURE, operator::ATTENTION_SCALE_FEATURE,
+    operator::ATTENTION_TURBOQUANT_KV_FEATURE, operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
     operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
     operator::ConcatAxis, operator::EMBEDDING_SCALE_FEATURE,
     operator::KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE, operator::KV_WRITE_TURBOQUANT_FEATURE,
@@ -1399,12 +1399,14 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         affinity: None,
     });
     // Honours `scale`, `value_head_dimension` and `value_head_stride`
-    // (`cache-latent-attention-history`); reads TurboQuant stores, which
-    // hold f32 values (`turboquant-kv-history`).
+    // (`cache-latent-attention-history`) and `latent_kv_width`
+    // (`chunk-latent-prefills`); reads TurboQuant stores, which hold f32
+    // values (`turboquant-kv-history`).
     attention.id.features.extend([
         ATTENTION_SCALE_FEATURE.to_string(),
         ATTENTION_VALUE_HEAD_DIMENSION_FEATURE.to_string(),
         ATTENTION_VALUE_HEAD_STRIDE_FEATURE.to_string(),
+        ATTENTION_LATENT_KV_FEATURE.to_string(),
         ATTENTION_TURBOQUANT_KV_FEATURE.to_string(),
     ]);
     let with_features = |operator: &str, family: OperatorFamily, features: &[&str]| {
@@ -2879,6 +2881,27 @@ impl ReferenceCpuExecutor {
                         leading_rows(&k, key_count).map_err(KernelError::from)?,
                         leading_rows(&v, key_count).map_err(KernelError::from)?,
                     ),
+                };
+                // K and V are latent rows, each head's keys and values
+                // expanded by the fourth and fifth inputs
+                // (`chunk-latent-prefills`).
+                let (k, v) = match invocation.attributes.get("latent_kv_width") {
+                    None => (k, v),
+                    Some(OperatorAttributeValue::Integer(width)) if *width > 0 => {
+                        let w_k = self.input_tensor(invocation, 3)?;
+                        let w_v = self.input_tensor(invocation, 4)?;
+                        (
+                            operator_semantics::latent_keys(&k, &w_k, *width as u64, head_count)
+                                .map_err(KernelError::from)?,
+                            operator_semantics::latent_values(&v, &w_v, *width as u64)
+                                .map_err(KernelError::from)?,
+                        )
+                    }
+                    Some(_) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "latent_kv_width must be a positive integer".into(),
+                        });
+                    }
                 };
                 // V rows and the output may be narrower or wider than Q/K
                 // rows (`value_head_dimension`).

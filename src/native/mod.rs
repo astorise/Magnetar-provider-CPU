@@ -288,11 +288,12 @@ impl NativeState {
                 if (kind == "causal" && causal) || (kind == "bidirectional" && !causal) => {}
             Some(_) => return None,
         }
-        // V rows of another width than Q/K rows, or V heads wider than the
-        // value: the Reference CPU kernel.
+        // V rows of another width than Q/K rows, V heads wider than the
+        // value, or latent K and V: the Reference CPU kernel.
         if ReferenceCpuExecutor::attribute_integer(attributes, "value_head_dimension")
             .is_some_and(|width| width != head_dimension)
             || attributes.contains_key("value_head_stride")
+            || attributes.contains_key("latent_kv_width")
         {
             return None;
         }

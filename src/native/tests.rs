@@ -106,6 +106,7 @@ fn state(int8: bool, threads: usize) -> NativeState {
     NativeState {
         packed: Mutex::new(BTreeMap::new()),
         compact: Mutex::new(BTreeMap::new()),
+        padding_rows: std::sync::atomic::AtomicUsize::new(0),
         pool: pool::Pool::new(threads),
         int8_activations: int8,
         materialized: Mutex::new((0, 0.0)),
@@ -1084,4 +1085,47 @@ fn greedy_columns_are_selected_in_place() {
     );
     assert_eq!(executor.select_greedy_column(&logits, 1, &[], 0.0), Some(3));
     assert_eq!(executor.select_greedy_column(&logits, 2, &[], 0.0), None);
+}
+
+/// While a bucketed prefill replays, row matmuls compute only the rows
+/// before its padding (the padding rows are zero); a one-row product, or
+/// one no longer than the padding, is computed whole.
+#[test]
+fn replayed_prefills_skip_their_padding_rows() {
+    use magnetar_core::operator::OperatorAttributeValue as Value;
+    let executor = NativeCpuExecutor::with_settings(true, true, 2);
+    let (k, n) = (128_u64, 512_u64);
+    let weight = bf16_values(n, k, 141);
+    let ids = ["a", "w"].map(TensorResourceId::new);
+    executor
+        .write_weight_tensor(ids[1].clone(), weight.clone())
+        .unwrap();
+    let attributes = BTreeMap::from([("transpose_b".to_string(), Value::Boolean(true))]);
+    let invocation = invocation_reading("matmul", &[&ids[0], &ids[1]]).with_attributes(attributes);
+    for (rows, padding, live) in [(8_u64, 3_usize, 5_u64), (1, 3, 1), (3, 3, 3)] {
+        let a = activations(rows, k, 142);
+        executor.reference().write_tensor(ids[0].clone(), a.clone());
+        executor
+            .state
+            .padding_rows
+            .store(padding, std::sync::atomic::Ordering::Relaxed);
+        let actual = executor
+            .state
+            .run(executor.reference(), &invocation)
+            .expect("handled natively")
+            .unwrap();
+        executor
+            .state
+            .padding_rows
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let expected = matmul(&a, &weight, false, true).unwrap();
+        assert_eq!(actual.shape, expected.shape);
+        let split = (live * n) as usize;
+        assert_close(
+            &HostTensor::new([live, n], actual.data[..split].to_vec()).unwrap(),
+            &HostTensor::new([live, n], expected.data[..split].to_vec()).unwrap(),
+            &format!("{rows} rows, padding {padding}"),
+        );
+        assert!(actual.data[split..].iter().all(|&value| value == 0.0));
+    }
 }

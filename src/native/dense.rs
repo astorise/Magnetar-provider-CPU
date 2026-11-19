@@ -255,19 +255,20 @@ mod avx2 {
                         (i + 2) * n + first,
                         (i + 3) * n + first,
                     ];
-                    for r in 0..m {
-                        let x = &a[r * k + i..r * k + i + 4];
+                    if m == 1 {
+                        // One row (a decode step): its four scales once, then
+                        // each block of eight columns read and written once.
+                        let x = &a[i..i + 4];
                         let s = [
                             _mm256_set1_ps(x[0]),
                             _mm256_set1_ps(x[1]),
                             _mm256_set1_ps(x[2]),
                             _mm256_set1_ps(x[3]),
                         ];
-                        let out_row = r * count;
                         let mut c = 0;
                         while c < whole {
                             unsafe {
-                                let at = out.as_mut_ptr().add(out_row + c);
+                                let at = out.as_mut_ptr().add(c);
                                 let mut acc = _mm256_loadu_ps(at);
                                 for j in 0..4 {
                                     acc = _mm256_fmadd_ps(s[j], $load(weight, w[j] + c), acc);
@@ -276,6 +277,41 @@ mod avx2 {
                             }
                             c += 8;
                         }
+                    } else {
+                        // Several rows (a prefill): each block of eight
+                        // columns of the four weight rows is loaded (and
+                        // widened) once and serves every row of `a`.
+                        let mut c = 0;
+                        while c < whole {
+                            let wv = unsafe {
+                                [
+                                    $load(weight, w[0] + c),
+                                    $load(weight, w[1] + c),
+                                    $load(weight, w[2] + c),
+                                    $load(weight, w[3] + c),
+                                ]
+                            };
+                            for r in 0..m {
+                                unsafe {
+                                    let x = a.as_ptr().add(r * k + i);
+                                    let at = out.as_mut_ptr().add(r * count + c);
+                                    let mut acc = _mm256_loadu_ps(at);
+                                    for j in 0..4 {
+                                        acc = _mm256_fmadd_ps(
+                                            _mm256_broadcast_ss(&*x.add(j)),
+                                            wv[j],
+                                            acc,
+                                        );
+                                    }
+                                    _mm256_storeu_ps(at, acc);
+                                }
+                            }
+                            c += 8;
+                        }
+                    }
+                    for r in 0..m {
+                        let x = &a[r * k + i..r * k + i + 4];
+                        let out_row = r * count;
                         for c in whole..count {
                             let mut value = out[out_row + c];
                             for j in 0..4 {

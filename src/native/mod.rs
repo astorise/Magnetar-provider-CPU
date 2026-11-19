@@ -33,6 +33,10 @@ pub const THREADS_ENV: &str = "MAGNETAR_CPU_THREADS";
 pub const SIMD_ENV: &str = "MAGNETAR_CPU_SIMD";
 pub const COMPACT_WEIGHTS_ENV: &str = "MAGNETAR_CPU_COMPACT_WEIGHTS";
 pub const STEP_CAPTURE_ENV: &str = "MAGNETAR_CPU_STEP_CAPTURE";
+/// The capture attribute a replayed bucketed prefill advances by its
+/// padding row count (`replay-bucketed-prefill`), as the Runtime and the
+/// CUDA Provider name it: row matmuls skip that many trailing rows.
+pub const PADDING_ROWS_ATTRIBUTE: &str = "padding_rows";
 /// Dense weights at least this large are stored compact when every value
 /// is exactly a bfloat16 value; smaller ones (biases, norm weights) stay
 /// f32, as on the CUDA Provider.
@@ -126,6 +130,10 @@ impl CompactWeight {
 struct NativeState {
     packed: Mutex<BTreeMap<TensorResourceId, Arc<PackedWeight>>>,
     compact: Mutex<BTreeMap<TensorResourceId, Arc<CompactWeight>>>,
+    /// While a bucketed prefill replays, its padding row count: row
+    /// matmuls of more rows compute only the leading ones, whose results
+    /// are the only ones read (`capture-cpu-steps`).
+    padding_rows: std::sync::atomic::AtomicUsize,
     pool: pool::Pool,
     int8_activations: bool,
     /// Packed weights expanded to f32 for a caller or Kernel without a
@@ -160,6 +168,33 @@ impl NativeState {
 
     fn compact(&self, id: &TensorResourceId) -> Option<Arc<CompactWeight>> {
         self.compact.lock().unwrap().get(id).cloned()
+    }
+
+    /// `a`'s rows a row matmul computes, when not all of them: all but a
+    /// replayed prefill's padding rows. Every row of a one-row product (a
+    /// prefill's LM head reads the one gathered row), or of one no longer
+    /// than the padding, is computed.
+    fn live_rows(&self, a: &HostTensor) -> Option<HostTensor> {
+        let padding = self.padding_rows.load(std::sync::atomic::Ordering::Relaxed);
+        let (m, k) = a.rows_cols().ok()?;
+        let (m, k) = (m as usize, k as usize);
+        if padding == 0 || m <= 1 || padding >= m || a.shape.len() != 2 {
+            return None;
+        }
+        let live = m - padding;
+        HostTensor::new([live as u64, k as u64], a.data[..live * k].to_vec()).ok()
+    }
+
+    /// A product of `a`'s live rows, back to `rows` rows: the padding rows'
+    /// values are zero (never read).
+    fn with_padding_rows(product: HostTensor, rows: u64) -> Result<HostTensor, KernelError> {
+        let (live, n) = product.rows_cols().map_err(KernelError::from)?;
+        if live == rows {
+            return Ok(product);
+        }
+        let mut data = product.data;
+        data.resize((rows * n) as usize, 0.0);
+        HostTensor::new([rows, n], data).map_err(KernelError::from)
     }
 
     /// A matmul-family Kernel's sum or residual, after its product.
@@ -200,6 +235,8 @@ impl NativeState {
             Ok(a) => a,
             Err(error) => return Some(Err(error)),
         };
+        let rows = *a.shape.first()?;
+        let a = self.live_rows(&a).unwrap_or(a);
         let product = match self.compact(id) {
             Some(weight) => self.dense_product(
                 &a,
@@ -222,7 +259,13 @@ impl NativeState {
                 )?
             }
         };
-        Some(product.and_then(|product| Self::finish_matmul(executor, invocation, product)))
+        Some(product.and_then(|product| {
+            Self::finish_matmul(
+                executor,
+                invocation,
+                Self::with_padding_rows(product, rows)?,
+            )
+        }))
     }
 
     /// `a x b` for a dense `b` of stored shape `[rows, cols]`: logically
@@ -456,10 +499,16 @@ impl NativeState {
         // (a tied embedding table) is used transposed.
         let product = if transpose_a {
             matmul(&a, &self.expand(weight), transpose_a, transpose_b).map_err(KernelError::from)?
-        } else if weight.transposed() != transpose_b {
-            self.packed_matmul(&a, weight)?
         } else {
-            self.packed_axpy(&a, weight)?
+            let live = self.live_rows(&a);
+            let rows = a.shape[0];
+            let a = live.as_ref().unwrap_or(&a);
+            let product = if weight.transposed() != transpose_b {
+                self.packed_matmul(a, weight)?
+            } else {
+                self.packed_axpy(a, weight)?
+            };
+            Self::with_padding_rows(product, rows)?
         };
         Self::finish_matmul(executor, invocation, product)
     }
@@ -779,6 +828,7 @@ impl NativeCpuExecutor {
         let state = Arc::new(NativeState {
             packed: Mutex::new(BTreeMap::new()),
             compact: Mutex::new(BTreeMap::new()),
+            padding_rows: std::sync::atomic::AtomicUsize::new(0),
             pool: pool::Pool::new(threads),
             int8_activations,
             materialized: Mutex::new((0, 0.0)),
@@ -807,6 +857,25 @@ impl NativeCpuExecutor {
 
     pub fn threads(&self) -> usize {
         self.state.pool.threads()
+    }
+
+    /// Runs a replay's invocations, in order.
+    fn run_recorded(
+        &self,
+        invocations: &[KernelInvocation],
+    ) -> Result<(), magnetar_provider_api::StepReplayError> {
+        for invocation in invocations {
+            let started = self.profile.as_ref().map(|_| std::time::Instant::now());
+            let ran = self.inner.run_invocation(invocation);
+            self.profile(&invocation.kernel.name, started);
+            if let Err(error) = ran {
+                return Err(capture::replay_failed(format!(
+                    "replaying {}: {error:?}",
+                    invocation.kernel.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Fails the step capture in progress, if any: `what` writes host data
@@ -1217,18 +1286,24 @@ impl ProviderExecutionApi for NativeCpuExecutor {
             self.forget_packed(&id);
             self.inner.write_tensor(id, tensor);
         }
-        for invocation in &invocations {
-            let started = self.profile.as_ref().map(|_| std::time::Instant::now());
-            let ran = self.inner.run_invocation(invocation);
-            self.profile(&invocation.kernel.name, started);
-            if let Err(error) = ran {
-                return Err(capture::replay_failed(format!(
-                    "replaying {}: {error:?}",
-                    invocation.kernel.name
-                )));
-            }
-        }
-        Ok(())
+        // A replayed bucketed prefill: its row matmuls skip the padding.
+        let padding = if recording
+            .advancing
+            .iter()
+            .any(|name| name == PADDING_ROWS_ATTRIBUTE)
+        {
+            usize::try_from(offset).unwrap_or(0)
+        } else {
+            0
+        };
+        self.state
+            .padding_rows
+            .store(padding, std::sync::atomic::Ordering::Relaxed);
+        let ran = self.run_recorded(&invocations);
+        self.state
+            .padding_rows
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        ran
     }
 
     fn release_step_capture(&self, id: &magnetar_provider_api::StepCaptureId) {

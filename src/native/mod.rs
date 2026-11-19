@@ -11,8 +11,10 @@
 //! - [`THREADS_ENV`] bounds the worker pool;
 //! - [`SIMD_ENV`] `=scalar` disables the vector kernels;
 //! - [`COMPACT_WEIGHTS_ENV`] `=0` keeps every dense weight f32 instead of
-//!   storing an exact bfloat16 one as its bfloat16 bits ([`dense`]).
+//!   storing an exact bfloat16 one as its bfloat16 bits ([`dense`]);
+//! - [`STEP_CAPTURE_ENV`] `=0` declines step capture ([`capture`]).
 
+mod capture;
 mod dense;
 mod pool;
 pub mod quant;
@@ -30,6 +32,7 @@ pub const INT8_ACTIVATIONS_ENV: &str = "MAGNETAR_CPU_INT8_ACTIVATIONS";
 pub const THREADS_ENV: &str = "MAGNETAR_CPU_THREADS";
 pub const SIMD_ENV: &str = "MAGNETAR_CPU_SIMD";
 pub const COMPACT_WEIGHTS_ENV: &str = "MAGNETAR_CPU_COMPACT_WEIGHTS";
+pub const STEP_CAPTURE_ENV: &str = "MAGNETAR_CPU_STEP_CAPTURE";
 /// Dense weights at least this large are stored compact when every value
 /// is exactly a bfloat16 value; smaller ones (biases, norm weights) stay
 /// f32, as on the CUDA Provider.
@@ -713,6 +716,9 @@ pub struct NativeCpuExecutor {
     packed_weights: bool,
     /// Whether exact bfloat16 dense weights are stored compact.
     compact_weights: bool,
+    /// Whether steps are captured and replayed ([`capture`]).
+    step_capture: bool,
+    capture: Mutex<capture::CaptureState>,
     /// Per-Kernel invocation counts and seconds, when [`PROFILE_ENV`] is set.
     profile: Option<Mutex<BTreeMap<String, (u64, f64)>>>,
 }
@@ -764,6 +770,7 @@ impl NativeCpuExecutor {
             threads,
         );
         executor.compact_weights = std::env::var(COMPACT_WEIGHTS_ENV).as_deref() != Ok("0");
+        executor.step_capture = std::env::var(STEP_CAPTURE_ENV).as_deref() != Ok("0");
         executor
     }
 
@@ -786,6 +793,8 @@ impl NativeCpuExecutor {
             state,
             packed_weights,
             compact_weights: true,
+            step_capture: true,
+            capture: Mutex::new(capture::CaptureState::default()),
             profile: (std::env::var(PROFILE_ENV).as_deref() == Ok("1"))
                 .then(|| Mutex::new(BTreeMap::new())),
         }
@@ -798,6 +807,22 @@ impl NativeCpuExecutor {
 
     pub fn threads(&self) -> usize {
         self.state.pool.threads()
+    }
+
+    /// Fails the step capture in progress, if any: `what` writes host data
+    /// a replay would not write again.
+    fn poison_capture(&self, what: &str) {
+        self.capture.lock().unwrap().poison(what);
+    }
+
+    /// Adds `seconds` of Kernel `name` to the profile, when profiling.
+    fn profile(&self, name: &str, started: Option<std::time::Instant>) {
+        if let (Some(profile), Some(started)) = (&self.profile, started) {
+            let mut profile = profile.lock().unwrap();
+            let entry = profile.entry(name.to_string()).or_default();
+            entry.0 += 1;
+            entry.1 += started.elapsed().as_secs_f64();
+        }
     }
 
     /// Whether `id` is held packed, or compact.
@@ -866,12 +891,19 @@ impl ProviderExecutionApi for NativeCpuExecutor {
             invocation,
             memory,
         );
-        if let (Some(profile), Some(started)) = (&self.profile, started) {
-            let mut profile = profile.lock().unwrap();
-            let entry = profile.entry(invocation.kernel.name.clone()).or_default();
-            entry.0 += 1;
-            entry.1 += started.elapsed().as_secs_f64();
+        self.profile(&invocation.kernel.name, started);
+        let mut state = self.capture.lock().unwrap();
+        if let Some(recording) = &mut state.recording {
+            match &handle {
+                Ok(_) => recording.invocations.push(invocation.clone()),
+                Err(_) => {
+                    recording
+                        .failure
+                        .get_or_insert_with(|| "a submission failed".into());
+                }
+            }
         }
+        drop(state);
         handle
     }
 
@@ -887,6 +919,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         id: TensorResourceId,
         tensor: HostTensor,
     ) -> Result<(), ProviderExecutionError> {
+        self.poison_capture("a host tensor write");
         self.forget_packed(&id);
         ProviderExecutionApi::write_tensor(&*self.inner, id, tensor)
     }
@@ -899,6 +932,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         id: TensorResourceId,
         tensor: HostTensor,
     ) -> Result<(), ProviderExecutionError> {
+        self.poison_capture("a weight write");
         let compact = self
             .compact_weights
             .then(|| CompactWeight::of(&tensor))
@@ -921,6 +955,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         id: TensorResourceId,
         weight: PackedWeight,
     ) -> Result<PackedWeightWrite, ProviderExecutionError> {
+        self.poison_capture("a packed weight write");
         if !self.packed_weights {
             return Ok(PackedWeightWrite::Declined);
         }
@@ -959,6 +994,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
     ) -> Result<(), MemoryError> {
+        self.poison_capture("a host tensor write");
         // A packed weight is replaced only once its replacement is admitted
         // and stored: a denied admission leaves it resident.
         ProviderExecutionApi::write_tensor_admitted(
@@ -994,6 +1030,9 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         // Writing back an `Opaque` value (what `read_tensor_value` returns)
         // stores nothing, so a packed weight stays resident.
         let replaces = !matches!(value, TensorValue::Opaque);
+        if replaces {
+            self.poison_capture("a host tensor write");
+        }
         ProviderExecutionApi::write_tensor_value(&*self.inner, id.clone(), value)?;
         if replaces {
             self.forget_packed(&id);
@@ -1010,6 +1049,9 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         owner: MemoryAllocationOwner,
     ) -> Result<(), TensorValueAdmissionError> {
         let replaces = !matches!(value, TensorValue::Opaque);
+        if replaces {
+            self.poison_capture("a host tensor write");
+        }
         ProviderExecutionApi::write_tensor_value_admitted(
             &*self.inner,
             memory,
@@ -1032,6 +1074,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
     ) -> Result<MemoryAllocationId, TensorValueAdmissionError> {
+        self.poison_capture("a tensor copy");
         let allocation = ProviderExecutionApi::copy_tensor_admitted(
             &*self.inner,
             memory,
@@ -1052,6 +1095,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         precision: KvStorePrecision,
         head_dimension: u64,
     ) -> Result<bool, ProviderExecutionError> {
+        self.poison_capture("a KV store reset");
         // The store replaces whatever `id` held, a packed weight included.
         self.forget_packed(id);
         Ok(self
@@ -1067,6 +1111,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         head_dimension: u64,
         exact_rows: u64,
     ) -> Result<bool, ProviderExecutionError> {
+        self.poison_capture("a KV store reset");
         // The store replaces whatever `id` held, a packed weight included.
         self.forget_packed(id);
         Ok(self.inner.write_zeroed_kv_store_with_exact_head(
@@ -1088,6 +1133,139 @@ impl ProviderExecutionApi for NativeCpuExecutor {
 
     fn observations(&self) -> Vec<KernelObservation> {
         ProviderExecutionApi::observations(&*self.inner)
+    }
+
+    fn supports_step_capture(&self) -> bool {
+        self.step_capture && !cfg!(target_arch = "wasm32")
+    }
+
+    fn begin_step_capture(
+        &self,
+        request: &magnetar_provider_api::StepCaptureRequest,
+    ) -> Result<(), ProviderExecutionError> {
+        let mut state = self.capture.lock().unwrap();
+        if !self.supports_step_capture() || state.recording.is_some() {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::UnsupportedOperation,
+                ProviderExecutionPhase::Submit,
+                ProviderBinding::new(NATIVE_CPU_PROVIDER_NAME),
+                None,
+                "step capture is off or already in progress",
+            ));
+        }
+        state.recording = Some(capture::Recording {
+            advancing: request.advancing_attributes.clone(),
+            ..capture::Recording::default()
+        });
+        Ok(())
+    }
+
+    fn end_step_capture(
+        &self,
+    ) -> Result<magnetar_provider_api::StepCaptureId, ProviderExecutionError> {
+        let mut state = self.capture.lock().unwrap();
+        let failed = |reason: String| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::UnsupportedOperation,
+                ProviderExecutionPhase::Complete,
+                ProviderBinding::new(NATIVE_CPU_PROVIDER_NAME),
+                None,
+                reason,
+            )
+        };
+        let recording = state
+            .recording
+            .take()
+            .ok_or_else(|| failed("no step capture in progress".into()))?;
+        if let Some(reason) = recording.failure {
+            return Err(failed(reason));
+        }
+        let id = magnetar_provider_api::StepCaptureId::new(format!("cpu-step:{}", state.next));
+        state.next += 1;
+        state.captures.insert(id.clone(), Arc::new(recording));
+        Ok(id)
+    }
+
+    fn abort_step_capture(&self) {
+        self.capture.lock().unwrap().recording = None;
+    }
+
+    fn replay_step(
+        &self,
+        id: &magnetar_provider_api::StepCaptureId,
+        offset: u64,
+        inputs: Vec<(TensorResourceId, HostTensor)>,
+    ) -> Result<(), magnetar_provider_api::StepReplayError> {
+        let recording = self
+            .capture
+            .lock()
+            .unwrap()
+            .captures
+            .get(id)
+            .cloned()
+            .ok_or_else(|| magnetar_provider_api::StepReplayError::Invalidated {
+                reason: format!("no capture {}", id.as_str()),
+            })?;
+        // Every attribute advanced first: an offset that does not fit runs
+        // nothing.
+        let invocations = recording
+            .invocations
+            .iter()
+            .map(|invocation| capture::advanced(invocation, &recording.advancing, offset))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (id, tensor) in inputs {
+            self.forget_packed(&id);
+            self.inner.write_tensor(id, tensor);
+        }
+        for invocation in &invocations {
+            let started = self.profile.as_ref().map(|_| std::time::Instant::now());
+            let ran = self.inner.run_invocation(invocation);
+            self.profile(&invocation.kernel.name, started);
+            if let Err(error) = ran {
+                return Err(capture::replay_failed(format!(
+                    "replaying {}: {error:?}",
+                    invocation.kernel.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn release_step_capture(&self, id: &magnetar_provider_api::StepCaptureId) {
+        self.capture.lock().unwrap().captures.remove(id);
+    }
+
+    /// The highest-scoring column of `logits`' row `row` outside
+    /// `excluded`, each score divided by `temperature` unless it is 0,
+    /// read in place.
+    fn select_greedy_column(
+        &self,
+        logits: &TensorResourceId,
+        row: u64,
+        excluded: &[std::ops::Range<u64>],
+        temperature: f32,
+    ) -> Option<u64> {
+        let storage = self.inner.storage.lock().unwrap();
+        let tensor = storage.get(logits)?;
+        let columns = *tensor.shape.last()? as usize;
+        let start = usize::try_from(row).ok()?.checked_mul(columns)?;
+        let scores = tensor.data.get(start..start.checked_add(columns)?)?;
+        let mut best: Option<(f32, u64)> = None;
+        for (column, &score) in scores.iter().enumerate() {
+            let column = column as u64;
+            if !score.is_finite() || excluded.iter().any(|range| range.contains(&column)) {
+                continue;
+            }
+            let score = if temperature == 0.0 {
+                score
+            } else {
+                score / temperature
+            };
+            if best.is_none_or(|(value, _)| score > value) {
+                best = Some((score, column));
+            }
+        }
+        best.map(|(_, column)| column)
     }
 }
 

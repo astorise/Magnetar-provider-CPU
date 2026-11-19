@@ -941,3 +941,147 @@ fn pool_and_streamed_matmul_costs() {
         );
     }
 }
+
+/// `capture-cpu-steps`: a captured step ran as it was captured, and a
+/// replay writes its inputs and runs its invocations again with every
+/// advancing attribute increased by the offset; an offset off a store
+/// fails the replay, a host write during a capture fails the capture, a
+/// released capture no longer replays, and capture can be turned off.
+#[test]
+fn captured_steps_replay_with_advanced_attributes() {
+    use magnetar_core::operator::OperatorAttributeValue as Value;
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    use magnetar_provider_api::{StepCaptureRequest, StepReplayError};
+    let executor = NativeCpuExecutor::with_settings(true, true, 2);
+    assert!(executor.supports_step_capture());
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let advertisements = native_cpu_kernel_advertisements();
+    let find = |name: &str| {
+        advertisements
+            .iter()
+            .find(|advertisement| advertisement.id.name == name)
+            .unwrap()
+            .clone()
+    };
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let invocation = |advertisement: &KernelAdvertisement, id: &str| {
+        KernelInvocation::new(
+            KernelInvocationId::new(id),
+            advertisement.implemented_operator.clone(),
+            advertisement.id.clone(),
+            ProviderBinding::new(NATIVE_CPU_PROVIDER_NAME),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+    };
+    let (k, n, rows) = (16_u64, 8_u64, 6_u64);
+    let w = activations(k, n, 131);
+    let x0 = activations(1, k, 132);
+    let id = |name: &str| TensorResourceId::new(name);
+    executor.write_tensor(id("w"), w.clone()).unwrap();
+    executor
+        .write_tensor(
+            id("kv"),
+            HostTensor::new([rows, n], vec![0.0; (rows * n) as usize]).unwrap(),
+        )
+        .unwrap();
+    executor.write_tensor(id("x"), x0.clone()).unwrap();
+    let (matmul_kernel, kv_write) = (find("matmul"), find("kv-write"));
+    let project = invocation(&matmul_kernel, "project")
+        .with_input(resource("x", vec![1, k]))
+        .with_input(resource("w", vec![k, n]))
+        .with_output(resource("h", vec![1, n]));
+    let write = invocation(&kv_write, "write")
+        .with_input(resource("kv", vec![rows, n]))
+        .with_input(resource("h", vec![1, n]))
+        .with_output(resource("kv", vec![rows, n]))
+        .with_attributes(BTreeMap::from([(
+            "row_offset".to_string(),
+            Value::Integer(1),
+        )]));
+    let mut memory = MemoryManager::default();
+    let request = StepCaptureRequest {
+        advancing_attributes: vec!["row_offset".into()],
+    };
+    executor.begin_step_capture(&request).unwrap();
+    for (advertisement, invocation) in [(&matmul_kernel, &project), (&kv_write, &write)] {
+        let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+        let handle = executor
+            .submit_kernel(advertisement, operator, invocation, &mut memory)
+            .unwrap();
+        assert_eq!(
+            executor.complete_kernel(&handle).unwrap().status,
+            KernelResultStatus::Succeeded
+        );
+    }
+    let capture = executor.end_step_capture().unwrap();
+    let row = |store: &HostTensor, r: u64| {
+        HostTensor::new(
+            [1, n],
+            store.data[(r * n) as usize..((r + 1) * n) as usize].to_vec(),
+        )
+        .unwrap()
+    };
+    let x1 = activations(1, k, 133);
+    executor
+        .replay_step(&capture, 3, vec![(id("x"), x1.clone())])
+        .unwrap();
+    let kv = executor.read_tensor(&id("kv")).unwrap();
+    assert_close(
+        &row(&kv, 1),
+        &matmul(&x0, &w, false, false).unwrap(),
+        "captured row",
+    );
+    assert_close(
+        &row(&kv, 4),
+        &matmul(&x1, &w, false, false).unwrap(),
+        "replayed row",
+    );
+    assert!(row(&kv, 2).data.iter().all(|&value| value == 0.0));
+    assert!(matches!(
+        executor.replay_step(&capture, 5, Vec::new()),
+        Err(StepReplayError::Failed(_))
+    ));
+    executor.begin_step_capture(&request).unwrap();
+    executor.write_tensor(id("x"), x1).unwrap();
+    assert!(executor.end_step_capture().is_err());
+    executor.release_step_capture(&capture);
+    assert!(matches!(
+        executor.replay_step(&capture, 0, Vec::new()),
+        Err(StepReplayError::Invalidated { .. })
+    ));
+    let mut off = NativeCpuExecutor::with_settings(true, true, 1);
+    off.step_capture = false;
+    assert!(!off.supports_step_capture());
+    assert!(off.begin_step_capture(&request).is_err());
+}
+
+/// Greedy selection on the Provider reads the logits row in place and
+/// honours exclusions and the temperature, like host sampling.
+#[test]
+fn greedy_columns_are_selected_in_place() {
+    let executor = NativeCpuExecutor::with_settings(true, true, 1);
+    let logits = TensorResourceId::new("logits");
+    let values = vec![0.5, 9.0, 1.0, 3.0, f32::NAN, 0.0, 2.0, 7.0];
+    executor
+        .write_tensor(logits.clone(), HostTensor::new([2, 4], values).unwrap())
+        .unwrap();
+    assert_eq!(executor.select_greedy_column(&logits, 0, &[], 0.0), Some(1));
+    assert_eq!(
+        executor.select_greedy_column(&logits, 0, &[1..2], 0.5),
+        Some(3)
+    );
+    assert_eq!(executor.select_greedy_column(&logits, 1, &[], 0.0), Some(3));
+    assert_eq!(executor.select_greedy_column(&logits, 2, &[], 0.0), None);
+}

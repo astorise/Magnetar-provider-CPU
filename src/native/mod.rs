@@ -245,11 +245,41 @@ impl NativeState {
             return None;
         }
         let level = simd_level();
+        let threads = self.pool.threads();
         let mut out = vec![0.0_f32; m * n];
-        let chunk = n
-            .div_ceil(self.pool.threads() * 4)
-            .max(16)
-            .next_multiple_of(8);
+        // An input-major weight narrower than `INPUT_MAJOR_COLUMNS` per
+        // thread is shared out by blocks of whole rows (contiguous reads),
+        // each task summing its block into a partial product: a block of a
+        // few hundred columns per row would read short strided runs.
+        const INPUT_MAJOR_COLUMNS: usize = 2048;
+        if !transpose_b && n < threads * INPUT_MAJOR_COLUMNS && threads > 1 {
+            let tasks = threads.min(k.div_ceil(64)).max(1);
+            let block = k.div_ceil(tasks);
+            let mut partials = vec![0.0_f32; tasks * m * n];
+            let shared = SharedOut(partials.as_mut_ptr());
+            let shared = &shared;
+            self.pool.run(tasks, &|task| {
+                let rows = (task * block).min(k)..((task + 1) * block).min(k);
+                // SAFETY: partial `task` belongs to this task only.
+                let partial =
+                    unsafe { std::slice::from_raw_parts_mut(shared.0.add(task * m * n), m * n) };
+                dense::input_major(level, &a.data, m, k, rows, values, n, 0, n, partial);
+            });
+            let (first, rest) = partials.split_at(m * n);
+            out.copy_from_slice(first);
+            for partial in rest.chunks_exact(m * n) {
+                for (out, &value) in out.iter_mut().zip(partial) {
+                    *out += value;
+                }
+            }
+            return Some(HostTensor::new([m as u64, n as u64], out).map_err(KernelError::from));
+        }
+        let chunk = if transpose_b {
+            n.div_ceil(threads * 4).max(16)
+        } else {
+            n.div_ceil(threads * 2).max(INPUT_MAJOR_COLUMNS)
+        }
+        .next_multiple_of(8);
         let tasks = n.div_ceil(chunk);
         let shared = SharedOut(out.as_mut_ptr());
         let shared = &shared;
@@ -260,7 +290,18 @@ impl NativeState {
             if transpose_b {
                 dense::output_major(level, &a.data, m, k, values, first, count, &mut local);
             } else {
-                dense::input_major(level, &a.data, m, k, values, n, first, count, &mut local);
+                dense::input_major(
+                    level,
+                    &a.data,
+                    m,
+                    k,
+                    0..k,
+                    values,
+                    n,
+                    first,
+                    count,
+                    &mut local,
+                );
             }
             for r in 0..m {
                 for c in 0..count {

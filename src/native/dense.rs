@@ -79,15 +79,17 @@ pub(crate) fn output_major(
     }
 }
 
-/// `out[r * count + c] = sum_i a[r * k + i] * W[i][first + c]` for a weight
-/// stored input-major (`k` rows of `n` values), `out` holding `m x count`
-/// values.
+/// `out[r * count + c] = sum_{i in rows} a[r * k + i] * W[i][first + c]`
+/// for a weight stored input-major (`k` rows of `n` values), `out` holding
+/// `m x count` values: the whole product for `rows` `0..k`, a partial sum
+/// over a block of rows otherwise.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn input_major(
     level: SimdLevel,
     a: &[f32],
     m: usize,
     k: usize,
+    rows: std::ops::Range<usize>,
     weight: Values<'_>,
     n: usize,
     first: usize,
@@ -98,11 +100,11 @@ pub(crate) fn input_major(
     #[cfg(target_arch = "x86_64")]
     if level == SimdLevel::Avx2 {
         // SAFETY: as in `output_major`.
-        unsafe { avx2::input_major(a, m, k, weight, n, first, count, out) };
+        unsafe { avx2::input_major(a, m, k, rows, weight, n, first, count, out) };
         return;
     }
     let _ = level;
-    for i in 0..k {
+    for i in rows {
         let row = i * n + first;
         for r in 0..m {
             let scale = a[r * k + i];
@@ -234,6 +236,7 @@ mod avx2 {
                 a: &[f32],
                 m: usize,
                 k: usize,
+                rows: std::ops::Range<usize>,
                 weight: &[$element],
                 n: usize,
                 first: usize,
@@ -242,7 +245,48 @@ mod avx2 {
             ) {
                 let get = $get;
                 let whole = count - count % 8;
-                for i in 0..k {
+                // Rows four at a time: one read and write of the output
+                // block serves four weight rows.
+                let mut i = rows.start;
+                while i + 4 <= rows.end {
+                    let w = [
+                        i * n + first,
+                        (i + 1) * n + first,
+                        (i + 2) * n + first,
+                        (i + 3) * n + first,
+                    ];
+                    for r in 0..m {
+                        let x = &a[r * k + i..r * k + i + 4];
+                        let s = [
+                            _mm256_set1_ps(x[0]),
+                            _mm256_set1_ps(x[1]),
+                            _mm256_set1_ps(x[2]),
+                            _mm256_set1_ps(x[3]),
+                        ];
+                        let out_row = r * count;
+                        let mut c = 0;
+                        while c < whole {
+                            unsafe {
+                                let at = out.as_mut_ptr().add(out_row + c);
+                                let mut acc = _mm256_loadu_ps(at);
+                                for j in 0..4 {
+                                    acc = _mm256_fmadd_ps(s[j], $load(weight, w[j] + c), acc);
+                                }
+                                _mm256_storeu_ps(at, acc);
+                            }
+                            c += 8;
+                        }
+                        for c in whole..count {
+                            let mut value = out[out_row + c];
+                            for j in 0..4 {
+                                value = x[j].mul_add(get(weight, w[j] + c), value);
+                            }
+                            out[out_row + c] = value;
+                        }
+                    }
+                    i += 4;
+                }
+                for i in i..rows.end {
                     let row = i * n + first;
                     for r in 0..m {
                         let scale = a[r * k + i];
@@ -307,6 +351,7 @@ mod avx2 {
         a: &[f32],
         m: usize,
         k: usize,
+        rows: std::ops::Range<usize>,
         weight: Values<'_>,
         n: usize,
         first: usize,
@@ -315,8 +360,8 @@ mod avx2 {
     ) {
         unsafe {
             match weight {
-                Values::F32(values) => input_major_f32(a, m, k, values, n, first, count, out),
-                Values::Bf16(bits) => input_major_bf16(a, m, k, bits, n, first, count, out),
+                Values::F32(values) => input_major_f32(a, m, k, rows, values, n, first, count, out),
+                Values::Bf16(bits) => input_major_bf16(a, m, k, rows, bits, n, first, count, out),
             }
         }
     }

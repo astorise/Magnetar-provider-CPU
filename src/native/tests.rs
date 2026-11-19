@@ -716,7 +716,15 @@ fn dense_matmuls_match_the_reference_cpu() {
                             );
                         } else {
                             dense::input_major(
-                                level, &a.data, m as usize, k as usize, values, count, 0, count,
+                                level,
+                                &a.data,
+                                m as usize,
+                                k as usize,
+                                0..k as usize,
+                                values,
+                                count,
+                                0,
+                                count,
                                 &mut out,
                             );
                         }
@@ -881,5 +889,55 @@ fn dense_matmul_bandwidth() {
                 );
             }
         }
+    }
+}
+
+/// Diagnostic: what one pool run of trivial tasks costs (the fixed cost
+/// every pooled Kernel pays), and a decode-sized matmul against weights
+/// streamed from memory rather than cache.
+#[test]
+#[ignore = "timing diagnostic"]
+fn pool_and_streamed_matmul_costs() {
+    let threads = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let state = state(false, threads);
+    let repeats = 2000;
+    let start = std::time::Instant::now();
+    for _ in 0..repeats {
+        state.pool.run(threads * 4, &|_| {});
+    }
+    println!(
+        "pool run of {} empty tasks: {:.1} us",
+        threads * 4,
+        start.elapsed().as_secs_f64() / f64::from(repeats) * 1e6
+    );
+    // 48 distinct 4864 x 896 bfloat16 weights (418 MB): each read once per
+    // pass, as a decode step reads its layers'.
+    let (k, n) = (896_u64, 4864_u64);
+    let a = activations(1, k, 121);
+    let weights: Vec<Vec<u16>> = (0..48)
+        .map(|seed| {
+            bf16_values(n, k, 122 + seed)
+                .data
+                .iter()
+                .map(|v| (v.to_bits() >> 16) as u16)
+                .collect()
+        })
+        .collect();
+    for pass in 0..3 {
+        let start = std::time::Instant::now();
+        for bits in &weights {
+            state.dense_product(
+                &a,
+                dense::Values::Bf16(bits),
+                [n as usize, k as usize],
+                true,
+            );
+        }
+        let seconds = start.elapsed().as_secs_f64() / 48.0;
+        println!(
+            "pass {pass}: streamed bf16 [1, {k}] x [{k}, {n}]: {:.3} ms ({:.1} GB/s)",
+            seconds * 1e3,
+            (n * k * 2) as f64 / seconds / 1e9
+        );
     }
 }

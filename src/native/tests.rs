@@ -1079,7 +1079,7 @@ fn greedy_columns_are_selected_in_place() {
         .unwrap();
     assert_eq!(executor.select_greedy_column(&logits, 0, &[], 0.0), Some(1));
     assert_eq!(
-        executor.select_greedy_column(&logits, 0, &[1..2], 0.5),
+        executor.select_greedy_column(&logits, 0, std::slice::from_ref(&(1..2)), 0.5),
         Some(3)
     );
     assert_eq!(executor.select_greedy_column(&logits, 1, &[], 0.0), Some(3));

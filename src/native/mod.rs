@@ -9,8 +9,11 @@
 //! - [`PACKED_WEIGHTS_ENV`] `=0` declines packed weights (f32 at load);
 //! - [`INT8_ACTIVATIONS_ENV`] `=0` keeps f32 activations;
 //! - [`THREADS_ENV`] bounds the worker pool;
-//! - [`SIMD_ENV`] `=scalar` disables the vector kernels.
+//! - [`SIMD_ENV`] `=scalar` disables the vector kernels;
+//! - [`COMPACT_WEIGHTS_ENV`] `=0` keeps every dense weight f32 instead of
+//!   storing an exact bfloat16 one as its bfloat16 bits ([`dense`]).
 
+mod dense;
 mod pool;
 pub mod quant;
 
@@ -26,6 +29,11 @@ pub const PACKED_WEIGHTS_ENV: &str = "MAGNETAR_CPU_PACKED_WEIGHTS";
 pub const INT8_ACTIVATIONS_ENV: &str = "MAGNETAR_CPU_INT8_ACTIVATIONS";
 pub const THREADS_ENV: &str = "MAGNETAR_CPU_THREADS";
 pub const SIMD_ENV: &str = "MAGNETAR_CPU_SIMD";
+pub const COMPACT_WEIGHTS_ENV: &str = "MAGNETAR_CPU_COMPACT_WEIGHTS";
+/// Dense weights at least this large are stored compact when every value
+/// is exactly a bfloat16 value; smaller ones (biases, norm weights) stay
+/// f32, as on the CUDA Provider.
+pub const COMPACT_WEIGHT_MIN_ELEMENTS: usize = 1 << 16;
 /// Set to `1` to time every Kernel by name and print the totals when the
 /// executor drops (a diagnostic).
 pub const PROFILE_ENV: &str = "MAGNETAR_CPU_PROFILE";
@@ -72,8 +80,49 @@ pub(crate) trait PackedWeights: Send + Sync {
     fn shape(&self, id: &TensorResourceId) -> Option<Vec<u64>>;
 }
 
+/// A dense weight whose every value is exactly a bfloat16 value, held as
+/// those values' bfloat16 bits (`speed-up-dense-cpu-matmuls`): half the
+/// bytes of f32, every value unchanged.
+struct CompactWeight {
+    rows: usize,
+    cols: usize,
+    bits: Vec<u16>,
+}
+
+impl CompactWeight {
+    /// `tensor` compact, when it is a matrix of at least
+    /// [`COMPACT_WEIGHT_MIN_ELEMENTS`] exact bfloat16 values.
+    fn of(tensor: &HostTensor) -> Option<Self> {
+        let (rows, cols) = tensor.rows_cols().ok()?;
+        if tensor.shape.len() != 2 || tensor.data.len() < COMPACT_WEIGHT_MIN_ELEMENTS {
+            return None;
+        }
+        let bits = tensor
+            .data
+            .iter()
+            .map(|&value| dense::exact_bf16_bits(value))
+            .collect::<Option<Vec<u16>>>()?;
+        Some(Self {
+            rows: rows as usize,
+            cols: cols as usize,
+            bits,
+        })
+    }
+
+    fn expand(&self) -> HostTensor {
+        let values: Vec<f32> = self
+            .bits
+            .iter()
+            .map(|&bits| f32::from_bits(u32::from(bits) << 16))
+            .collect();
+        HostTensor::new([self.rows as u64, self.cols as u64], values)
+            .expect("a compact weight's shape holds its values")
+    }
+}
+
 struct NativeState {
     packed: Mutex<BTreeMap<TensorResourceId, Arc<PackedWeight>>>,
+    compact: Mutex<BTreeMap<TensorResourceId, Arc<CompactWeight>>>,
     pool: pool::Pool,
     int8_activations: bool,
     /// Packed weights expanded to f32 for a caller or Kernel without a
@@ -104,6 +153,149 @@ unsafe impl Sync for SharedOut {}
 impl NativeState {
     fn weight(&self, id: &TensorResourceId) -> Option<Arc<PackedWeight>> {
         self.packed.lock().unwrap().get(id).cloned()
+    }
+
+    fn compact(&self, id: &TensorResourceId) -> Option<Arc<CompactWeight>> {
+        self.compact.lock().unwrap().get(id).cloned()
+    }
+
+    /// A matmul-family Kernel's sum or residual, after its product.
+    fn finish_matmul(
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+        product: HostTensor,
+    ) -> Result<HostTensor, KernelError> {
+        match invocation.kernel.name.as_str() {
+            "matmul-bias" => {
+                add(&product, &executor.input_tensor(invocation, 2)?).map_err(KernelError::from)
+            }
+            "matmul-residual" => residual_add(&executor.input_tensor(invocation, 2)?, &product)
+                .map_err(KernelError::from),
+            _ => Ok(product),
+        }
+    }
+
+    /// A matmul-family Kernel whose weight (input 1) is dense: compact or
+    /// f32 (`speed-up-dense-cpu-matmuls`), across the pool. `None` hands
+    /// any form it does not handle (a transposed `a`, mismatched shapes) to
+    /// the Reference CPU kernel, which reports any error.
+    fn dense_matmul(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+        id: &TensorResourceId,
+    ) -> Option<Result<HostTensor, KernelError>> {
+        if cfg!(target_arch = "wasm32")
+            || ReferenceCpuExecutor::attribute_bool(&invocation.attributes, "transpose_a", false)
+            || ReferenceCpuExecutor::require_f32_accumulation(&invocation.attributes).is_err()
+        {
+            return None;
+        }
+        let transpose_b =
+            ReferenceCpuExecutor::attribute_bool(&invocation.attributes, "transpose_b", false);
+        let a = match executor.input_tensor(invocation, 0) {
+            Ok(a) => a,
+            Err(error) => return Some(Err(error)),
+        };
+        let product = match self.compact(id) {
+            Some(weight) => self.dense_product(
+                &a,
+                dense::Values::Bf16(&weight.bits),
+                [weight.rows, weight.cols],
+                transpose_b,
+            )?,
+            None => {
+                let storage = executor.storage.lock().unwrap();
+                let b = storage.get(id)?;
+                let (rows, cols) = b.rows_cols().ok()?;
+                if b.shape.len() != 2 {
+                    return None;
+                }
+                self.dense_product(
+                    &a,
+                    dense::Values::F32(&b.data),
+                    [rows as usize, cols as usize],
+                    transpose_b,
+                )?
+            }
+        };
+        Some(product.and_then(|product| Self::finish_matmul(executor, invocation, product)))
+    }
+
+    /// `a x b` for a dense `b` of stored shape `[rows, cols]`: logically
+    /// `[k, n]`, or `[n, k]` used transposed.
+    fn dense_product(
+        &self,
+        a: &HostTensor,
+        values: dense::Values<'_>,
+        [rows, cols]: [usize; 2],
+        transpose_b: bool,
+    ) -> Option<Result<HostTensor, KernelError>> {
+        let (m, k) = a.rows_cols().ok()?;
+        let (m, k) = (m as usize, k as usize);
+        if a.shape.len() != 2 {
+            return None;
+        }
+        let (inner, n) = if transpose_b {
+            (cols, rows)
+        } else {
+            (rows, cols)
+        };
+        if inner != k || m == 0 || n == 0 || k == 0 {
+            return None;
+        }
+        let level = simd_level();
+        let mut out = vec![0.0_f32; m * n];
+        let chunk = n
+            .div_ceil(self.pool.threads() * 4)
+            .max(16)
+            .next_multiple_of(8);
+        let tasks = n.div_ceil(chunk);
+        let shared = SharedOut(out.as_mut_ptr());
+        let shared = &shared;
+        self.pool.run(tasks, &|task| {
+            let first = task * chunk;
+            let count = chunk.min(n - first);
+            let mut local = vec![0.0_f32; m * count];
+            if transpose_b {
+                dense::output_major(level, &a.data, m, k, values, first, count, &mut local);
+            } else {
+                dense::input_major(level, &a.data, m, k, values, n, first, count, &mut local);
+            }
+            for r in 0..m {
+                for c in 0..count {
+                    // SAFETY: column `first + c` belongs to this task only.
+                    unsafe { *shared.0.add(r * n + first + c) = local[r * count + c] };
+                }
+            }
+        });
+        Some(HostTensor::new([m as u64, n as u64], out).map_err(KernelError::from))
+    }
+
+    /// The `embedding` Kernel over a compact table: each gathered row's
+    /// values, exactly.
+    fn compact_embedding(
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+        table: &CompactWeight,
+    ) -> Result<HostTensor, KernelError> {
+        let ids = executor.input_tensor(invocation, 1)?;
+        let (vocab, dim) = (table.rows as u64, table.cols);
+        let mut out = Vec::with_capacity(ids.data.len() * dim);
+        for &raw_id in &ids.data {
+            if raw_id < 0.0 || raw_id.fract() != 0.0 || raw_id as u64 >= vocab {
+                return Err(KernelError::KernelExecutionFailed {
+                    reason: format!("token id {raw_id} is not below the vocabulary size {vocab}"),
+                });
+            }
+            let start = raw_id as usize * dim;
+            out.extend(
+                table.bits[start..start + dim]
+                    .iter()
+                    .map(|&bits| f32::from_bits(u32::from(bits) << 16)),
+            );
+        }
+        HostTensor::new([ids.data.len() as u64, dim as u64], out).map_err(KernelError::from)
     }
 
     /// `a x W` for a packed `W` whose stored rows are the output columns.
@@ -225,14 +417,7 @@ impl NativeState {
         } else {
             self.packed_axpy(&a, weight)?
         };
-        match invocation.kernel.name.as_str() {
-            "matmul-bias" => {
-                add(&product, &executor.input_tensor(invocation, 2)?).map_err(KernelError::from)
-            }
-            "matmul-residual" => residual_add(&executor.input_tensor(invocation, 2)?, &product)
-                .map_err(KernelError::from),
-            _ => Ok(product),
-        }
+        Self::finish_matmul(executor, invocation, product)
     }
 
     fn f32_embedding(
@@ -425,18 +610,22 @@ impl PackedWeights for NativeState {
     ) -> Option<Result<HostTensor, KernelError>> {
         match invocation.kernel.name.as_str() {
             "matmul" | "matmul-bias" | "matmul-residual" => {
-                let weight = self.weight(&invocation.inputs.get(1)?.resource.id)?;
-                Some(self.matmul(executor, invocation, &weight))
+                let id = &invocation.inputs.get(1)?.resource.id;
+                match self.weight(id) {
+                    Some(weight) => Some(self.matmul(executor, invocation, &weight)),
+                    None => self.dense_matmul(executor, invocation, id),
+                }
             }
             "attention" => self.attention(executor, invocation),
             "embedding" => {
                 let id = &invocation.inputs.first()?.resource.id;
-                let rows = match self.weight(id) {
-                    Some(table) => self.embedding(executor, invocation, &table),
+                let rows = match (self.weight(id), self.compact(id)) {
+                    (Some(table), _) => self.embedding(executor, invocation, &table),
+                    (None, Some(table)) => Self::compact_embedding(executor, invocation, &table),
                     // An f32 table (one this Provider received dequantized):
                     // gather its rows in place instead of the Reference
                     // CPU kernel's copy of the whole table per lookup.
-                    None => Self::f32_embedding(executor, invocation, id),
+                    (None, None) => Self::f32_embedding(executor, invocation, id),
                 };
                 // `scale` multiplies every gathered row.
                 let scale =
@@ -453,12 +642,24 @@ impl PackedWeights for NativeState {
     }
 
     fn materialize(&self, id: &TensorResourceId) -> Option<HostTensor> {
-        self.weight(id).map(|weight| self.expand(&weight))
+        if let Some(weight) = self.weight(id) {
+            return Some(self.expand(&weight));
+        }
+        let weight = self.compact(id)?;
+        let started = std::time::Instant::now();
+        let tensor = weight.expand();
+        let mut materialized = self.materialized.lock().unwrap();
+        materialized.0 += 1;
+        materialized.1 += started.elapsed().as_secs_f64();
+        Some(tensor)
     }
 
     fn shape(&self, id: &TensorResourceId) -> Option<Vec<u64>> {
-        self.weight(id)
-            .map(|weight| weight.logical_shape().to_vec())
+        if let Some(weight) = self.weight(id) {
+            return Some(weight.logical_shape().to_vec());
+        }
+        self.compact(id)
+            .map(|weight| vec![weight.rows as u64, weight.cols as u64])
     }
 }
 
@@ -469,6 +670,8 @@ pub struct NativeCpuExecutor {
     inner: Arc<ReferenceCpuExecutor>,
     state: Arc<NativeState>,
     packed_weights: bool,
+    /// Whether exact bfloat16 dense weights are stored compact.
+    compact_weights: bool,
     /// Per-Kernel invocation counts and seconds, when [`PROFILE_ENV`] is set.
     profile: Option<Mutex<BTreeMap<String, (u64, f64)>>>,
 }
@@ -514,17 +717,20 @@ impl NativeCpuExecutor {
                     .map(|count| count.get())
                     .unwrap_or(1)
             });
-        Self::with_settings(
+        let mut executor = Self::with_settings(
             std::env::var(PACKED_WEIGHTS_ENV).as_deref() != Ok("0"),
             std::env::var(INT8_ACTIVATIONS_ENV).as_deref() != Ok("0"),
             threads,
-        )
+        );
+        executor.compact_weights = std::env::var(COMPACT_WEIGHTS_ENV).as_deref() != Ok("0");
+        executor
     }
 
     /// An executor with explicit controls (tests, embedders).
     pub fn with_settings(packed_weights: bool, int8_activations: bool, threads: usize) -> Self {
         let state = Arc::new(NativeState {
             packed: Mutex::new(BTreeMap::new()),
+            compact: Mutex::new(BTreeMap::new()),
             pool: pool::Pool::new(threads),
             int8_activations,
             materialized: Mutex::new((0, 0.0)),
@@ -538,6 +744,7 @@ impl NativeCpuExecutor {
             inner: Arc::new(inner),
             state,
             packed_weights,
+            compact_weights: true,
             profile: (std::env::var(PROFILE_ENV).as_deref() == Ok("1"))
                 .then(|| Mutex::new(BTreeMap::new())),
         }
@@ -552,13 +759,21 @@ impl NativeCpuExecutor {
         self.state.pool.threads()
     }
 
-    /// Whether `id` is held packed.
+    /// Whether `id` is held packed, or compact.
     pub fn is_packed(&self, id: &TensorResourceId) -> bool {
-        self.state.weight(id).is_some()
+        self.state.weight(id).is_some() || self.is_compact(id)
     }
 
+    /// Whether `id` is held as compact bfloat16 bits.
+    pub fn is_compact(&self, id: &TensorResourceId) -> bool {
+        self.state.compact(id).is_some()
+    }
+
+    /// Forgets a packed or compact weight `id`, which is being replaced.
     fn forget_packed(&self, id: &TensorResourceId) -> bool {
-        self.state.packed.lock().unwrap().remove(id).is_some()
+        let packed = self.state.packed.lock().unwrap().remove(id).is_some();
+        let compact = self.state.compact.lock().unwrap().remove(id).is_some();
+        packed || compact
     }
 }
 
@@ -633,6 +848,31 @@ impl ProviderExecutionApi for NativeCpuExecutor {
     ) -> Result<(), ProviderExecutionError> {
         self.forget_packed(&id);
         ProviderExecutionApi::write_tensor(&*self.inner, id, tensor)
+    }
+
+    /// A weight whose every value is exactly a bfloat16 value is stored
+    /// as those values' bits (`speed-up-dense-cpu-matmuls`); any other one
+    /// as f32.
+    fn write_weight_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: HostTensor,
+    ) -> Result<(), ProviderExecutionError> {
+        let compact = self
+            .compact_weights
+            .then(|| CompactWeight::of(&tensor))
+            .flatten();
+        let Some(compact) = compact else {
+            return self.write_tensor(id, tensor);
+        };
+        self.forget_packed(&id);
+        self.inner.storage.lock().unwrap().remove(&id);
+        self.state
+            .compact
+            .lock()
+            .unwrap()
+            .insert(id, Arc::new(compact));
+        Ok(())
     }
 
     fn write_packed_weight_tensor(

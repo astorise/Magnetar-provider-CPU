@@ -105,6 +105,7 @@ fn assert_close(actual: &HostTensor, expected: &HostTensor, what: &str) {
 fn state(int8: bool, threads: usize) -> NativeState {
     NativeState {
         packed: Mutex::new(BTreeMap::new()),
+        compact: Mutex::new(BTreeMap::new()),
         pool: pool::Pool::new(threads),
         int8_activations: int8,
         materialized: Mutex::new((0, 0.0)),
@@ -663,5 +664,222 @@ fn attention_decode_time() {
         println!(
             "{key_count} keys: native {native:.3} ms ({threads} threads), reference {reference:.3} ms"
         );
+    }
+}
+
+/// A `rows x cols` matrix of exact bfloat16 values in [-2, 2].
+fn bf16_values(rows: u64, cols: u64, seed: u32) -> HostTensor {
+    let data: Vec<f32> = activations(rows, cols, seed)
+        .data
+        .iter()
+        .map(|&value| f32::from_bits((value * 2.0).to_bits() & 0xffff_0000))
+        .collect();
+    HostTensor::new([rows, cols], data).unwrap()
+}
+
+/// `speed-up-dense-cpu-matmuls`: dense products against compact and f32
+/// weights, used transposed or not, match the Reference CPU matmul, with
+/// and without the vector kernels, for decode and prefill row counts and
+/// inner sizes off a multiple of the vector width.
+#[test]
+fn dense_matmuls_match_the_reference_cpu() {
+    for threads in [1, 3] {
+        let state = state(false, threads);
+        for (m, k, n) in [(1, 64, 37), (3, 70, 200), (8, 96, 33), (5, 9, 8)] {
+            for transpose_b in [false, true] {
+                let a = activations(m, k, 81 + m as u32);
+                let shape = if transpose_b { [n, k] } else { [k, n] };
+                let b = bf16_values(shape[0], shape[1], 83 + n as u32);
+                let expected = matmul(&a, &b, false, transpose_b).unwrap();
+                let bits: Vec<u16> = b.data.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+                for values in [dense::Values::F32(&b.data), dense::Values::Bf16(&bits)] {
+                    let actual = state
+                        .dense_product(
+                            &a,
+                            values,
+                            [shape[0] as usize, shape[1] as usize],
+                            transpose_b,
+                        )
+                        .expect("handled natively")
+                        .unwrap();
+                    assert_close(
+                        &actual,
+                        &expected,
+                        &format!("{m}x{k}x{n}, transposed {transpose_b}, {threads} thread(s)"),
+                    );
+                    for (level, what) in [(SimdLevel::Scalar, "scalar"), (simd_level(), "simd")] {
+                        let count = n as usize;
+                        let mut out = vec![0.0_f32; m as usize * count];
+                        if transpose_b {
+                            dense::output_major(
+                                level, &a.data, m as usize, k as usize, values, 0, count, &mut out,
+                            );
+                        } else {
+                            dense::input_major(
+                                level, &a.data, m as usize, k as usize, values, count, 0, count,
+                                &mut out,
+                            );
+                        }
+                        assert_close(
+                            &HostTensor::new([m, n], out).unwrap(),
+                            &expected,
+                            &format!("{m}x{k}x{n}, transposed {transpose_b}, {what}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A Model Instance weight of exact bfloat16 values is stored compact and
+/// reads back unchanged; an inexact or small one, or any with compact
+/// weights off, stays f32; a later write replaces a compact weight.
+#[test]
+fn exact_bfloat16_weights_are_stored_compact() {
+    let id = TensorResourceId::new("w");
+    let weight = bf16_values(256, 256, 91);
+    let executor = NativeCpuExecutor::with_settings(true, true, 2);
+    executor
+        .write_weight_tensor(id.clone(), weight.clone())
+        .unwrap();
+    assert!(executor.is_compact(&id));
+    assert!(
+        !executor
+            .reference()
+            .storage
+            .lock()
+            .unwrap()
+            .contains_key(&id)
+    );
+    assert_eq!(executor.read_tensor(&id).unwrap(), weight);
+    assert_eq!(executor.resident_shape(&id).unwrap(), vec![256, 256]);
+    assert!(matches!(
+        executor.read_tensor_value(&id),
+        Some(TensorValue::Opaque)
+    ));
+    // Writing back the `Opaque` value keeps it; a new value replaces it.
+    executor
+        .write_tensor_value(id.clone(), TensorValue::Opaque)
+        .unwrap();
+    assert!(executor.is_compact(&id));
+    let replacement = activations(256, 256, 92);
+    executor
+        .write_tensor(id.clone(), replacement.clone())
+        .unwrap();
+    assert!(!executor.is_compact(&id));
+    assert_eq!(executor.read_tensor(&id).unwrap(), replacement);
+
+    let inexact = TensorResourceId::new("inexact");
+    executor
+        .write_weight_tensor(inexact.clone(), activations(256, 256, 93))
+        .unwrap();
+    assert!(!executor.is_compact(&inexact));
+    let small = TensorResourceId::new("small");
+    executor
+        .write_weight_tensor(small.clone(), bf16_values(4, 64, 94))
+        .unwrap();
+    assert!(!executor.is_compact(&small));
+    let mut off = NativeCpuExecutor::with_settings(true, true, 1);
+    off.compact_weights = false;
+    off.write_weight_tensor(id.clone(), weight).unwrap();
+    assert!(!off.is_compact(&id));
+    assert!(executor.release_tensor(&inexact).unwrap());
+}
+
+/// The matmul family and the embedding lookup read compact weights in
+/// place, with the Reference CPU kernels' results.
+#[test]
+fn matmul_kernels_and_lookups_read_compact_weights() {
+    use magnetar_core::operator::OperatorAttributeValue as Value;
+    let executor = NativeCpuExecutor::with_settings(true, true, 2);
+    let (m, k, n) = (3_u64, 128_u64, 640_u64);
+    let weight = bf16_values(n, k, 101);
+    let ids = ["a", "w", "bias", "residual", "ids"].map(TensorResourceId::new);
+    executor
+        .write_weight_tensor(ids[1].clone(), weight.clone())
+        .unwrap();
+    assert!(executor.is_compact(&ids[1]));
+    let a = activations(m, k, 102);
+    let bias = activations(1, n, 103);
+    let bias = HostTensor::new([n], bias.data).unwrap();
+    let residual = activations(m, n, 104);
+    for (id, tensor) in [(&ids[0], &a), (&ids[2], &bias), (&ids[3], &residual)] {
+        executor
+            .reference()
+            .write_tensor(id.clone(), tensor.clone());
+    }
+    let mut attributes = BTreeMap::new();
+    attributes.insert("transpose_b".into(), Value::Boolean(true));
+    let product = matmul(&a, &weight, false, true).unwrap();
+    for (kernel, extra, expected) in [
+        ("matmul", None, product.clone()),
+        ("matmul-bias", Some(&ids[2]), add(&product, &bias).unwrap()),
+        (
+            "matmul-residual",
+            Some(&ids[3]),
+            residual_add(&residual, &product).unwrap(),
+        ),
+    ] {
+        let mut inputs = vec![&ids[0], &ids[1]];
+        inputs.extend(extra);
+        let invocation = invocation_reading(kernel, &inputs).with_attributes(attributes.clone());
+        let actual = executor
+            .state
+            .run(executor.reference(), &invocation)
+            .expect("handled natively")
+            .unwrap();
+        assert_close(&actual, &expected, kernel);
+    }
+    // The weight as an embedding table: rows gathered exactly.
+    let tokens = HostTensor::new([3], vec![5.0, 0.0, 639.0]).unwrap();
+    executor
+        .reference()
+        .write_tensor(ids[4].clone(), tokens.clone());
+    let invocation = invocation_reading("embedding", &[&ids[1], &ids[4]]);
+    let actual = executor
+        .state
+        .run(executor.reference(), &invocation)
+        .expect("handled natively")
+        .unwrap();
+    assert_eq!(actual, embedding_lookup(&weight, &tokens).unwrap());
+    // Nothing was expanded to f32 along the way.
+    assert_eq!(executor.state.materialized.lock().unwrap().0, 0);
+}
+
+/// Diagnostic: a decode-step dense matmul's time and weight bandwidth,
+/// compact and f32, output-major (a transposed checkpoint weight) and
+/// input-major.
+#[test]
+#[ignore = "timing diagnostic"]
+fn dense_matmul_bandwidth() {
+    let threads = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let state = state(false, threads);
+    println!("{threads} threads, {:?}", simd_level());
+    for (k, n) in [(896_u64, 4864_u64), (4864, 896), (896, 151_936)] {
+        let a = activations(1, k, 111);
+        for transpose_b in [true, false] {
+            let shape = if transpose_b { [n, k] } else { [k, n] };
+            let b = bf16_values(shape[0], shape[1], 112);
+            let bits: Vec<u16> = b.data.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+            for (values, bytes, what) in [
+                (dense::Values::F32(&b.data), b.data.len() * 4, "f32"),
+                (dense::Values::Bf16(&bits), bits.len() * 2, "bf16"),
+            ] {
+                let shape = [shape[0] as usize, shape[1] as usize];
+                state.dense_product(&a, values, shape, transpose_b);
+                let repeats = 20;
+                let start = std::time::Instant::now();
+                for _ in 0..repeats {
+                    state.dense_product(&a, values, shape, transpose_b);
+                }
+                let seconds = start.elapsed().as_secs_f64() / f64::from(repeats);
+                println!(
+                    "{what} [1, {k}] x [{k}, {n}] transposed {transpose_b}: {:.3} ms ({:.1} GB/s)",
+                    seconds * 1e3,
+                    bytes as f64 / seconds / 1e9
+                );
+            }
+        }
     }
 }

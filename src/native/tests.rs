@@ -865,8 +865,12 @@ fn dense_matmul_bandwidth() {
     let threads = std::thread::available_parallelism().map_or(1, |count| count.get());
     let state = state(false, threads);
     println!("{threads} threads, {:?}", simd_level());
+    let rows = std::env::var("MAGNETAR_CPU_BENCH_ROWS")
+        .ok()
+        .and_then(|rows| rows.parse::<u64>().ok())
+        .unwrap_or(1);
     for (k, n) in [(896_u64, 4864_u64), (4864, 896), (896, 151_936)] {
-        let a = activations(1, k, 111);
+        let a = activations(rows, k, 111);
         for transpose_b in [true, false] {
             let shape = if transpose_b { [n, k] } else { [k, n] };
             let b = bf16_values(shape[0], shape[1], 112);
@@ -884,7 +888,7 @@ fn dense_matmul_bandwidth() {
                 }
                 let seconds = start.elapsed().as_secs_f64() / f64::from(repeats);
                 println!(
-                    "{what} [1, {k}] x [{k}, {n}] transposed {transpose_b}: {:.3} ms ({:.1} GB/s)",
+                    "{what} [{rows}, {k}] x [{k}, {n}] transposed {transpose_b}: {:.3} ms ({:.1} GB/s)",
                     seconds * 1e3,
                     bytes as f64 / seconds / 1e9
                 );
@@ -1127,5 +1131,78 @@ fn replayed_prefills_skip_their_padding_rows() {
             &format!("{rows} rows, padding {padding}"),
         );
         assert!(actual.data[split..].iter().all(|&value| value == 0.0));
+    }
+}
+
+/// Both vector widths of the dense kernels (AVX2, and AVX-512F where the
+/// host has it) match the Reference CPU matmul, for decode and prefill row
+/// counts, inner and outer sizes off a multiple of either width, both
+/// layouts and both weight encodings.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn both_vector_widths_match_the_reference_cpu() {
+    if simd_level() != SimdLevel::Avx2 {
+        return;
+    }
+    let wide = std::is_x86_feature_detected!("avx512f");
+    for (m, k, n) in [
+        (1, 64, 48),
+        (1, 200, 37),
+        (3, 70, 200),
+        (8, 136, 40),
+        (5, 9, 17),
+    ] {
+        for transpose_b in [false, true] {
+            let a = activations(m, k, 151 + m as u32);
+            let shape = if transpose_b { [n, k] } else { [k, n] };
+            let b = bf16_values(shape[0], shape[1], 152 + n as u32);
+            let expected = matmul(&a, &b, false, transpose_b).unwrap();
+            let bits: Vec<u16> = b.data.iter().map(|v| (v.to_bits() >> 16) as u16).collect();
+            let (m, k, n) = (m as usize, k as usize, n as usize);
+            for values in [dense::Values::F32(&b.data), dense::Values::Bf16(&bits)] {
+                for width in [256, 512].into_iter().filter(|&width| width == 256 || wide) {
+                    let mut out = vec![0.0_f32; m * n];
+                    // SAFETY: AVX2 and FMA are present (`simd_level`), and
+                    // AVX-512F where width 512 runs.
+                    unsafe {
+                        match (width, transpose_b) {
+                            (256, true) => {
+                                dense::avx2::output_major(&a.data, m, k, values, 0, n, &mut out)
+                            }
+                            (256, false) => dense::avx2::input_major(
+                                &a.data,
+                                m,
+                                k,
+                                0..k,
+                                values,
+                                n,
+                                0,
+                                n,
+                                &mut out,
+                            ),
+                            (_, true) => {
+                                dense::avx512::output_major(&a.data, m, k, values, 0, n, &mut out)
+                            }
+                            (_, false) => dense::avx512::input_major(
+                                &a.data,
+                                m,
+                                k,
+                                0..k,
+                                values,
+                                n,
+                                0,
+                                n,
+                                &mut out,
+                            ),
+                        }
+                    }
+                    assert_close(
+                        &HostTensor::new([m as u64, n as u64], out).unwrap(),
+                        &expected,
+                        &format!("{m}x{k}x{n}, transposed {transpose_b}, width {width}"),
+                    );
+                }
+            }
+        }
     }
 }

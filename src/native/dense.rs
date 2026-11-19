@@ -29,6 +29,21 @@ impl Values<'_> {
     }
 }
 
+/// Whether the dense kernels of several rows (a prefill, compute-bound)
+/// use AVX-512F (sixteen lanes) where the host has it, rather than the
+/// AVX2 baseline; `MAGNETAR_CPU_SIMD=avx2` keeps them on AVX2. A single
+/// row (a decode step) is bound by memory bandwidth and stays on AVX2:
+/// locally, the wider kernel was slower there (8.2 against 6.7 ms for the
+/// LM head) and faster with 8 rows (12.2 against 21.1 ms).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn avx512() -> bool {
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WIDE.get_or_init(|| {
+        std::env::var(super::SIMD_ENV).as_deref() != Ok("avx2")
+            && std::is_x86_feature_detected!("avx512f")
+    })
+}
+
 /// The bfloat16 bits of `value`, when converting them back gives `value`.
 pub(crate) fn exact_bf16_bits(value: f32) -> Option<u16> {
     let bits = value.to_bits();
@@ -52,8 +67,14 @@ pub(crate) fn output_major(
     #[cfg(target_arch = "x86_64")]
     if level == SimdLevel::Avx2 {
         // SAFETY: `SimdLevel::Avx2` is only reported when AVX2 and FMA are
-        // available.
-        unsafe { avx2::output_major(a, m, k, weight, first, count, out) };
+        // available, and `avx512` only when AVX-512F is.
+        unsafe {
+            if m > 1 && avx512() {
+                avx512::output_major(a, m, k, weight, first, count, out);
+            } else {
+                avx2::output_major(a, m, k, weight, first, count, out);
+            }
+        }
         return;
     }
     let _ = level;
@@ -100,7 +121,13 @@ pub(crate) fn input_major(
     #[cfg(target_arch = "x86_64")]
     if level == SimdLevel::Avx2 {
         // SAFETY: as in `output_major`.
-        unsafe { avx2::input_major(a, m, k, rows, weight, n, first, count, out) };
+        unsafe {
+            if m > 1 && avx512() {
+                avx512::input_major(a, m, k, rows, weight, n, first, count, out);
+            } else {
+                avx2::input_major(a, m, k, rows, weight, n, first, count, out);
+            }
+        }
         return;
     }
     let _ = level;
@@ -117,7 +144,7 @@ pub(crate) fn input_major(
 }
 
 #[cfg(target_arch = "x86_64")]
-mod avx2 {
+pub(in crate::native) mod avx2 {
     use super::Values;
     use std::arch::x86_64::*;
 
@@ -364,7 +391,7 @@ mod avx2 {
 
     #[target_feature(enable = "avx2,fma")]
     #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn output_major(
+    pub(in crate::native) unsafe fn output_major(
         a: &[f32],
         m: usize,
         k: usize,
@@ -383,7 +410,288 @@ mod avx2 {
 
     #[target_feature(enable = "avx2,fma")]
     #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn input_major(
+    pub(in crate::native) unsafe fn input_major(
+        a: &[f32],
+        m: usize,
+        k: usize,
+        rows: std::ops::Range<usize>,
+        weight: Values<'_>,
+        n: usize,
+        first: usize,
+        count: usize,
+        out: &mut [f32],
+    ) {
+        unsafe {
+            match weight {
+                Values::F32(values) => input_major_f32(a, m, k, rows, values, n, first, count, out),
+                Values::Bf16(bits) => input_major_bf16(a, m, k, rows, bits, n, first, count, out),
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(in crate::native) mod avx512 {
+    use super::Values;
+    use std::arch::x86_64::*;
+
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    fn sum16(v: __m512) -> f32 {
+        _mm512_reduce_add_ps(v)
+    }
+
+    /// Sixteen f32 weight values from `index`.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn load_f32(values: &[f32], index: usize) -> __m512 {
+        unsafe { _mm512_loadu_ps(values.as_ptr().add(index)) }
+    }
+
+    /// Sixteen bfloat16 weight values from `index`, as f32.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    unsafe fn load_bf16(bits: &[u16], index: usize) -> __m512 {
+        unsafe {
+            let halves = _mm256_loadu_si256(bits.as_ptr().add(index) as *const __m256i);
+            _mm512_castsi512_ps(_mm512_slli_epi32::<16>(_mm512_cvtepu16_epi32(halves)))
+        }
+    }
+
+    /// The kernels for one weight encoding, each a loop with one load
+    /// function (no per-load dispatch).
+    macro_rules! kernels {
+        ($output_major:ident, $input_major:ident, $element:ty, $load:ident, $get:expr) => {
+            /// Rows of `a` taken four at a time (one with four independent
+            /// accumulators): each weight vector loaded once serves them.
+            #[target_feature(enable = "avx512f")]
+            #[allow(clippy::too_many_arguments)]
+            unsafe fn $output_major(
+                a: &[f32],
+                m: usize,
+                k: usize,
+                weight: &[$element],
+                first: usize,
+                count: usize,
+                out: &mut [f32],
+            ) {
+                let get = $get;
+                let whole = k - k % 16;
+                if m == 1 {
+                    let wide = k - k % 64;
+                    for c in 0..count {
+                        let row = (first + c) * k;
+                        let mut acc = [_mm512_setzero_ps(); 4];
+                        let mut i = 0;
+                        while i < wide {
+                            for (j, acc) in acc.iter_mut().enumerate() {
+                                let at = i + 16 * j;
+                                unsafe {
+                                    let w = $load(weight, row + at);
+                                    let x = _mm512_loadu_ps(a.as_ptr().add(at));
+                                    *acc = _mm512_fmadd_ps(x, w, *acc);
+                                }
+                            }
+                            i += 64;
+                        }
+                        while i < whole {
+                            unsafe {
+                                let w = $load(weight, row + i);
+                                let x = _mm512_loadu_ps(a.as_ptr().add(i));
+                                acc[0] = _mm512_fmadd_ps(x, w, acc[0]);
+                            }
+                            i += 16;
+                        }
+                        let pair = _mm512_add_ps(
+                            _mm512_add_ps(acc[0], acc[1]),
+                            _mm512_add_ps(acc[2], acc[3]),
+                        );
+                        let mut sum = sum16(pair);
+                        for t in whole..k {
+                            sum = a[t].mul_add(get(weight, row + t), sum);
+                        }
+                        out[c] = sum;
+                    }
+                    return;
+                }
+                for c in 0..count {
+                    let row = (first + c) * k;
+                    let mut r = 0;
+                    while r < m {
+                        let rows = (m - r).min(4);
+                        let mut acc = [_mm512_setzero_ps(); 4];
+                        let mut i = 0;
+                        while i < whole {
+                            let w = unsafe { $load(weight, row + i) };
+                            for (j, acc) in acc.iter_mut().enumerate().take(rows) {
+                                let x = unsafe { _mm512_loadu_ps(a.as_ptr().add((r + j) * k + i)) };
+                                *acc = _mm512_fmadd_ps(x, w, *acc);
+                            }
+                            i += 16;
+                        }
+                        for (j, acc) in acc.iter().enumerate().take(rows) {
+                            let mut sum = sum16(*acc);
+                            for t in whole..k {
+                                sum = a[(r + j) * k + t].mul_add(get(weight, row + t), sum);
+                            }
+                            out[(r + j) * count + c] = sum;
+                        }
+                        r += rows;
+                    }
+                }
+            }
+
+            #[target_feature(enable = "avx512f")]
+            #[allow(clippy::too_many_arguments)]
+            unsafe fn $input_major(
+                a: &[f32],
+                m: usize,
+                k: usize,
+                rows: std::ops::Range<usize>,
+                weight: &[$element],
+                n: usize,
+                first: usize,
+                count: usize,
+                out: &mut [f32],
+            ) {
+                let get = $get;
+                let whole = count - count % 16;
+                // Rows four at a time: one read and write of the output
+                // block serves four weight rows.
+                let mut i = rows.start;
+                while i + 4 <= rows.end {
+                    let w = [
+                        i * n + first,
+                        (i + 1) * n + first,
+                        (i + 2) * n + first,
+                        (i + 3) * n + first,
+                    ];
+                    if m == 1 {
+                        // One row (a decode step): its four scales once, then
+                        // each block of sixteen columns read and written once.
+                        let x = &a[i..i + 4];
+                        let s = [
+                            _mm512_set1_ps(x[0]),
+                            _mm512_set1_ps(x[1]),
+                            _mm512_set1_ps(x[2]),
+                            _mm512_set1_ps(x[3]),
+                        ];
+                        let mut c = 0;
+                        while c < whole {
+                            unsafe {
+                                let at = out.as_mut_ptr().add(c);
+                                let mut acc = _mm512_loadu_ps(at);
+                                for j in 0..4 {
+                                    acc = _mm512_fmadd_ps(s[j], $load(weight, w[j] + c), acc);
+                                }
+                                _mm512_storeu_ps(at, acc);
+                            }
+                            c += 16;
+                        }
+                    } else {
+                        // Several rows (a prefill): each block of sixteen
+                        // columns of the four weight rows is loaded (and
+                        // widened) once and serves every row of `a`.
+                        let mut c = 0;
+                        while c < whole {
+                            let wv = unsafe {
+                                [
+                                    $load(weight, w[0] + c),
+                                    $load(weight, w[1] + c),
+                                    $load(weight, w[2] + c),
+                                    $load(weight, w[3] + c),
+                                ]
+                            };
+                            for r in 0..m {
+                                unsafe {
+                                    let x = a.as_ptr().add(r * k + i);
+                                    let at = out.as_mut_ptr().add(r * count + c);
+                                    let mut acc = _mm512_loadu_ps(at);
+                                    for j in 0..4 {
+                                        acc =
+                                            _mm512_fmadd_ps(_mm512_set1_ps(*x.add(j)), wv[j], acc);
+                                    }
+                                    _mm512_storeu_ps(at, acc);
+                                }
+                            }
+                            c += 16;
+                        }
+                    }
+                    for r in 0..m {
+                        let x = &a[r * k + i..r * k + i + 4];
+                        let out_row = r * count;
+                        for c in whole..count {
+                            let mut value = out[out_row + c];
+                            for j in 0..4 {
+                                value = x[j].mul_add(get(weight, w[j] + c), value);
+                            }
+                            out[out_row + c] = value;
+                        }
+                    }
+                    i += 4;
+                }
+                for i in i..rows.end {
+                    let row = i * n + first;
+                    for r in 0..m {
+                        let scale = a[r * k + i];
+                        let s = _mm512_set1_ps(scale);
+                        let out_row = r * count;
+                        let mut c = 0;
+                        while c < whole {
+                            unsafe {
+                                let w = $load(weight, row + c);
+                                let at = out.as_mut_ptr().add(out_row + c);
+                                _mm512_storeu_ps(at, _mm512_fmadd_ps(s, w, _mm512_loadu_ps(at)));
+                            }
+                            c += 16;
+                        }
+                        for c in whole..count {
+                            out[out_row + c] =
+                                scale.mul_add(get(weight, row + c), out[out_row + c]);
+                        }
+                    }
+                }
+            }
+        };
+    }
+
+    kernels!(
+        output_major_f32,
+        input_major_f32,
+        f32,
+        load_f32,
+        |values: &[f32], index: usize| values[index]
+    );
+    kernels!(
+        output_major_bf16,
+        input_major_bf16,
+        u16,
+        load_bf16,
+        |bits: &[u16], index: usize| f32::from_bits(u32::from(bits[index]) << 16)
+    );
+
+    #[target_feature(enable = "avx512f")]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native) unsafe fn output_major(
+        a: &[f32],
+        m: usize,
+        k: usize,
+        weight: Values<'_>,
+        first: usize,
+        count: usize,
+        out: &mut [f32],
+    ) {
+        unsafe {
+            match weight {
+                Values::F32(values) => output_major_f32(a, m, k, values, first, count, out),
+                Values::Bf16(bits) => output_major_bf16(a, m, k, bits, first, count, out),
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native) unsafe fn input_major(
         a: &[f32],
         m: usize,
         k: usize,

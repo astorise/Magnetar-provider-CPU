@@ -119,12 +119,13 @@ use magnetar_core::{
     operator::ConcatAxis, operator::EMBEDDING_SCALE_FEATURE,
     operator::KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE, operator::KV_WRITE_TURBOQUANT_FEATURE,
     operator::MOE_EXPERTS_ACTIVATION_FEATURE, operator::MOE_PER_EXPERT_SCALE_FEATURE,
-    operator::OperatorAttributeValue, operator::OperatorFamily, operator::OperatorId,
-    operator::OperatorSpec, operator::RMSNORM_PER_HEAD_FEATURE,
-    operator::RMSNORM_WITHOUT_WEIGHT_FEATURE, operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
-    operator::ROPE_PARTIAL_ROTARY_FEATURE, operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE,
-    operator::RopeBandedFrequencyScaling, operator::RopeYarnFrequencyScaling,
-    operator::TensorLayoutKind, operator::TensorRole, operator::concat_axis,
+    operator::MOE_SIGMOID_ROUTING_FEATURE, operator::OperatorAttributeValue,
+    operator::OperatorFamily, operator::OperatorId, operator::OperatorSpec,
+    operator::RMSNORM_PER_HEAD_FEATURE, operator::RMSNORM_WITHOUT_WEIGHT_FEATURE,
+    operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE, operator::ROPE_PARTIAL_ROTARY_FEATURE,
+    operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE, operator::RopeBandedFrequencyScaling,
+    operator::RopeYarnFrequencyScaling, operator::TensorLayoutKind, operator::TensorRole,
+    operator::concat_axis,
 };
 use magnetar_graph::{
     memory::MemoryAllocationClass, memory::MemoryAllocationId, memory::MemoryAllocationOwner,
@@ -1432,7 +1433,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
     let moe_experts = with_features(
         "moe-experts",
         OperatorFamily::LinearAlgebra,
-        &[MOE_EXPERTS_ACTIVATION_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE],
+        &[
+            MOE_EXPERTS_ACTIVATION_FEATURE,
+            MOE_PER_EXPERT_SCALE_FEATURE,
+            MOE_SIGMOID_ROUTING_FEATURE,
+        ],
     );
     let rope = with_features(
         "rope",
@@ -2659,23 +2664,55 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
-                let per_expert_scale = match invocation.inputs.len() {
-                    6 => Some(self.input_tensor(invocation, 5)?),
-                    _ => None,
-                };
-                operator_semantics::moe_experts_local_with(
-                    &h,
-                    &logits,
-                    [&gate, &up, &down],
-                    routing,
-                    first,
-                    count,
-                    MoeExpertOptions {
-                        activation,
-                        per_expert_scale: per_expert_scale.as_ref(),
-                    },
+                let sigmoid = operator_semantics::sigmoid_routing_from_attributes(
+                    &invocation.attributes,
+                    routing.top_k,
                 )
-                .map_err(KernelError::from)?
+                .map_err(KernelError::from)?;
+                let (bias, per_expert_scale) = match (sigmoid.is_some(), invocation.inputs.len()) {
+                    (false, 5) => (None, None),
+                    (false, 6) => (None, Some(self.input_tensor(invocation, 5)?)),
+                    (true, 6) => (Some(self.input_tensor(invocation, 5)?), None),
+                    (true, 7) => (
+                        Some(self.input_tensor(invocation, 5)?),
+                        Some(self.input_tensor(invocation, 6)?),
+                    ),
+                    _ => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: "moe-experts input count does not match routing".into(),
+                        });
+                    }
+                };
+                let options = MoeExpertOptions {
+                    activation,
+                    per_expert_scale: per_expert_scale.as_ref(),
+                };
+                let output = if let (Some(sigmoid), Some(bias)) = (sigmoid, bias.as_ref()) {
+                    operator_semantics::moe_experts_local_sigmoid_with(
+                        &h,
+                        &logits,
+                        [&gate, &up, &down],
+                        routing,
+                        first,
+                        count,
+                        operator_semantics::MoeSigmoidExpertOptions {
+                            experts: options,
+                            routing: sigmoid,
+                            selection_bias: bias,
+                        },
+                    )
+                } else {
+                    operator_semantics::moe_experts_local_with(
+                        &h,
+                        &logits,
+                        [&gate, &up, &down],
+                        routing,
+                        first,
+                        count,
+                        options,
+                    )
+                };
+                output.map_err(KernelError::from)?
             }
             "row-scale" => {
                 let x = self.input_tensor(invocation, 0)?;

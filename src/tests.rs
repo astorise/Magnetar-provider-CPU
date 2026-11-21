@@ -77,6 +77,97 @@ fn geodesic_residual_provider_matches_pinned_pytorch_reference() {
     }
 }
 
+#[test]
+fn sigmoid_moe_provider_matches_transformers_grouped_router() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|item| item.id.name == "moe-experts")
+        .unwrap();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let inputs = [
+        ("h", HostTensor::new([1, 1], vec![1.0]).unwrap()),
+        (
+            "logits",
+            HostTensor::new([1, 8], vec![2.0, -1.0, 0.2, -2.0, 1.0, 0.1, -1.0, 0.4]).unwrap(),
+        ),
+        ("gate", HostTensor::new([1, 8], vec![1.0; 8]).unwrap()),
+        ("up", HostTensor::new([1, 8], vec![1.0; 8]).unwrap()),
+        (
+            "down",
+            HostTensor::new([1, 8], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap(),
+        ),
+        (
+            "bias",
+            HostTensor::new([8], vec![-0.9, 0.4, 0.0, 0.0, 0.0, 0.3, 0.1, 0.2]).unwrap(),
+        ),
+        (
+            "scale",
+            HostTensor::new([8], vec![1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 1.0, 0.5]).unwrap(),
+        ),
+    ];
+    let mut invocation = KernelInvocation::new(
+        KernelInvocationId::new("sigmoid-moe"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    for (name, tensor) in inputs {
+        invocation = invocation.with_input(resource(name, tensor.shape.clone()));
+        executor.write_tensor(TensorResourceId::new(name), tensor);
+    }
+    invocation = invocation
+        .with_output(resource("out", vec![1, 1]))
+        .with_attributes(BTreeMap::from([
+            ("experts".into(), OperatorAttributeValue::Integer(8)),
+            ("top_k".into(), OperatorAttributeValue::Integer(2)),
+            (
+                "routing_scoring".into(),
+                OperatorAttributeValue::String("sigmoid".into()),
+            ),
+            (
+                "routing_normalization".into(),
+                OperatorAttributeValue::String("always".into()),
+            ),
+            ("routing_scale".into(), OperatorAttributeValue::Float(2.45)),
+            (
+                "routing_group_count".into(),
+                OperatorAttributeValue::Integer(2),
+            ),
+            (
+                "routing_group_selected".into(),
+                OperatorAttributeValue::Integer(1),
+            ),
+        ]));
+    assert_eq!(
+        executor
+            .execute_invocation(advertisement, operator, &invocation)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    let actual = executor.read_tensor(&TensorResourceId::new("out")).unwrap();
+    let expected =
+        (1.0 / (1.0 + (-1.0_f32).exp())) * (6.0 * 2.0 * 1.144_644_5 + 8.0 * 0.5 * 1.305_355_7);
+    assert!((actual.data[0] - expected).abs() < 1e-5);
+}
+
 struct Rng(u64);
 
 impl Rng {

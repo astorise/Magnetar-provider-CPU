@@ -1467,6 +1467,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         rmsnorm,
         rope,
         attention,
+        baseline_advertisement("encoder-attention", OperatorFamily::Attention),
         baseline_advertisement("softmax", OperatorFamily::Activation),
         baseline_advertisement("silu", OperatorFamily::Activation),
         baseline_advertisement("gelu", OperatorFamily::Activation),
@@ -2884,6 +2885,19 @@ impl ReferenceCpuExecutor {
                     pairing,
                     frequencies,
                     Self::attribute_float_opt(&invocation.attributes, "partial_rotary_factor"),
+                )
+                .map_err(KernelError::from)?
+            }
+            "encoder-attention" => {
+                let config =
+                    operator_semantics::encoder_attention_from_attributes(&invocation.attributes)
+                        .map_err(KernelError::from)?;
+                operator_semantics::encoder_attention(
+                    &self.input_tensor(invocation, 0)?,
+                    &self.input_tensor(invocation, 1)?,
+                    &self.input_tensor(invocation, 2)?,
+                    &self.input_tensor(invocation, 3)?,
+                    config,
                 )
                 .map_err(KernelError::from)?
             }

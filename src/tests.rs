@@ -288,6 +288,71 @@ fn ungated_relu_squared_moe_matches_pytorch_and_supports_optional_scale() {
     );
 }
 
+#[test]
+fn encoder_attention_respects_bidirectional_window_and_padding() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|item| item.id.name == "encoder-attention")
+        .unwrap();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let mut invocation = KernelInvocation::new(
+        KernelInvocationId::new("encoder"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    for (name, tensor) in [
+        ("q", HostTensor::new([3, 2], vec![0.0; 6]).unwrap()),
+        ("k", HostTensor::new([3, 2], vec![0.0; 6]).unwrap()),
+        (
+            "v",
+            HostTensor::new([3, 2], vec![1.0, 2.0, 3.0, 4.0, 90.0, 90.0]).unwrap(),
+        ),
+        ("mask", HostTensor::new([3], vec![1.0, 1.0, 0.0]).unwrap()),
+    ] {
+        invocation = invocation.with_input(resource(name, tensor.shape.clone()));
+        executor.write_tensor(TensorResourceId::new(name), tensor);
+    }
+    invocation = invocation
+        .with_output(resource("out", vec![3, 2]))
+        .with_attributes(BTreeMap::from([
+            ("head_count".into(), OperatorAttributeValue::Integer(1)),
+            ("head_dimension".into(), OperatorAttributeValue::Integer(2)),
+            ("local_radius".into(), OperatorAttributeValue::Integer(1)),
+        ]));
+    assert_eq!(
+        executor
+            .execute_invocation(advertisement, operator, &invocation)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(
+        executor
+            .read_tensor(&TensorResourceId::new("out"))
+            .unwrap()
+            .data,
+        vec![2.0, 3.0, 2.0, 3.0, 3.0, 4.0]
+    );
+}
+
 struct Rng(u64);
 
 impl Rng {

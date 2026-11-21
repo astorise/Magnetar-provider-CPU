@@ -1468,6 +1468,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         rope,
         attention,
         baseline_advertisement("encoder-attention", OperatorFamily::Attention),
+        baseline_advertisement("differential-attention", OperatorFamily::Attention),
         baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mimo", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mixer", OperatorFamily::LinearAlgebra),
@@ -3079,6 +3080,29 @@ impl ReferenceCpuExecutor {
                 operator_semantics::slice_last(&self.input_tensor(invocation, 0)?, start, width)
                     .map_err(KernelError::from)?
             }
+            "differential-attention" => {
+                if invocation.inputs.len() != 4
+                    || invocation.outputs.len() != 1
+                    || invocation
+                        .inputs
+                        .iter()
+                        .any(|input| input.resource.id == invocation.outputs[0].resource.id)
+                {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "differential-attention needs four inputs and a distinct output"
+                            .into(),
+                    });
+                }
+                let config = operator_semantics::differential_attention_from_attributes(
+                    &invocation.attributes,
+                )
+                .map_err(KernelError::from)?;
+                let inputs = (0..4)
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                operator_semantics::differential_attention(&inputs, config)
+                    .map_err(KernelError::from)?
+            }
             "encoder-attention" => {
                 let config =
                     operator_semantics::encoder_attention_from_attributes(&invocation.attributes)
@@ -3335,10 +3359,13 @@ impl ReferenceCpuExecutor {
                 });
             }
         };
-        if matches!(name, "affine-layernorm" | "gelu-exact" | "slice-last")
-            && invocation.outputs.first().is_none_or(|resource| {
-                resource.resource.descriptor.shape.dimensions != output.shape
-            })
+        if matches!(
+            name,
+            "affine-layernorm" | "gelu-exact" | "slice-last" | "differential-attention"
+        ) && invocation
+            .outputs
+            .first()
+            .is_none_or(|resource| resource.resource.descriptor.shape.dimensions != output.shape)
         {
             return Err(KernelError::KernelExecutionFailed {
                 reason: format!("{name} output descriptor does not match computed shape"),

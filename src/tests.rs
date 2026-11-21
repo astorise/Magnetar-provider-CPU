@@ -716,6 +716,81 @@ fn token_shift_keeps_raw_state_and_rejects_aliasing() {
 }
 
 #[test]
+fn differential_attention_subtracts_noise_and_rejects_aliasing() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|item| item.id.name == "differential-attention")
+        .unwrap();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let inputs = [
+        ("query", vec![1, 3, 1], vec![1.0, 2.0, 3.0]),
+        ("key", vec![1, 1, 1], vec![1.0]),
+        ("value", vec![1, 1, 1], vec![2.0]),
+        ("lambda", vec![1, 1], vec![0.0]),
+    ];
+    let mut invocation = KernelInvocation::new(
+        KernelInvocationId::new("differential-attention"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    for (name, shape, data) in inputs {
+        invocation = invocation.with_input(resource(name, shape.clone()));
+        executor.write_tensor(
+            TensorResourceId::new(name),
+            HostTensor::new(shape, data).unwrap(),
+        );
+    }
+    invocation = invocation
+        .with_output(resource("out", vec![1, 2, 1]))
+        .with_attributes(BTreeMap::from([
+            ("scale".into(), OperatorAttributeValue::Float(1.0)),
+            ("softcap".into(), OperatorAttributeValue::Float(0.0)),
+            ("window_left".into(), OperatorAttributeValue::Integer(0)),
+            (
+                "round_bfloat16".into(),
+                OperatorAttributeValue::Boolean(false),
+            ),
+        ]));
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    let read = |name| {
+        executor
+            .read_tensor(&TensorResourceId::new(name))
+            .unwrap()
+            .data
+    };
+    assert_eq!(read("out"), vec![1.0, 1.0]);
+    let mut aliased = invocation.clone();
+    aliased.outputs[0] = resource("query", vec![1, 2, 1]);
+    assert_ne!(
+        executor
+            .execute_invocation(advertisement, operator, &aliased)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(read("query"), vec![1.0, 2.0, 3.0]);
+}
+
+#[test]
 fn encoder_affine_exact_gelu_and_slice_execute_as_distinct_kernels() {
     use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
     let executor = ReferenceCpuExecutor::new();

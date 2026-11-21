@@ -1471,6 +1471,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mimo", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mixer", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("token-shift", OperatorFamily::Tensor),
         baseline_advertisement("affine-layernorm", OperatorFamily::Normalization),
         baseline_advertisement("gelu-exact", OperatorFamily::Activation),
         baseline_advertisement("slice-last", OperatorFamily::Tensor),
@@ -2995,6 +2996,51 @@ impl ReferenceCpuExecutor {
                 }) {
                     return Err(KernelError::KernelExecutionFailed {
                         reason: format!("{name} output descriptor does not match computed shape"),
+                    });
+                }
+                for (index, tensor) in computed.into_iter().enumerate() {
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    result
+                        .output_readiness
+                        .insert(descriptor.id.to_string(), true);
+                    result.updated_resources.push(descriptor);
+                }
+                return Ok(result);
+            }
+            "token-shift" => {
+                if invocation.inputs.len() != 4 || invocation.outputs.len() != 2 {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "token-shift requires four inputs and two outputs".into(),
+                    });
+                }
+                let outputs = &invocation.outputs;
+                for (index, output) in outputs.iter().enumerate() {
+                    if outputs[..index]
+                        .iter()
+                        .any(|other| other.resource.id == output.resource.id)
+                        || invocation
+                            .inputs
+                            .iter()
+                            .any(|input| input.resource.id == output.resource.id)
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason:
+                                "token-shift outputs must be distinct from all inputs and outputs"
+                                    .into(),
+                        });
+                    }
+                }
+                let inputs = (0..invocation.inputs.len())
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let computed =
+                    operator_semantics::token_shift(&inputs).map_err(KernelError::from)?;
+                if outputs.iter().zip(&computed).any(|(resource, tensor)| {
+                    resource.resource.descriptor.shape.dimensions != tensor.shape
+                }) {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "token-shift output descriptor does not match computed shape"
+                            .into(),
                     });
                 }
                 for (index, tensor) in computed.into_iter().enumerate() {

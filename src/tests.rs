@@ -647,6 +647,75 @@ fn mamba3_mixer_invocation_returns_states_and_rejects_aliasing() {
 }
 
 #[test]
+fn token_shift_keeps_raw_state_and_rejects_aliasing() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|item| item.id.name == "token-shift")
+        .unwrap();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let inputs = [
+        ("raw", vec![2, 1, 2], vec![2.0, 4.0, 6.0, 10.0]),
+        ("gate", vec![2, 1], vec![0.0, 0.0]),
+        ("start", vec![2], vec![1.0, 0.0]),
+        ("previous", vec![1, 2], vec![100.0, 200.0]),
+    ];
+    let mut invocation = KernelInvocation::new(
+        KernelInvocationId::new("token-shift"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    for (name, shape, data) in inputs {
+        invocation = invocation.with_input(resource(name, shape.clone()));
+        executor.write_tensor(
+            TensorResourceId::new(name),
+            HostTensor::new(shape, data).unwrap(),
+        );
+    }
+    invocation = invocation
+        .with_output(resource("mixed", vec![2, 1, 2]))
+        .with_output(resource("next", vec![1, 2]));
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    assert_eq!(result.updated_resources.len(), 2);
+    let read = |name| {
+        executor
+            .read_tensor(&TensorResourceId::new(name))
+            .unwrap()
+            .data
+    };
+    assert_eq!(read("mixed"), vec![2.0, 4.0, 4.0, 7.0]);
+    assert_eq!(read("next"), vec![6.0, 10.0]);
+    let mut aliased = invocation.clone();
+    aliased.outputs[1] = resource("previous", vec![1, 2]);
+    assert_ne!(
+        executor
+            .execute_invocation(advertisement, operator, &aliased)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(read("previous"), vec![100.0, 200.0]);
+}
+
+#[test]
 fn encoder_affine_exact_gelu_and_slice_execute_as_distinct_kernels() {
     use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
     let executor = ReferenceCpuExecutor::new();

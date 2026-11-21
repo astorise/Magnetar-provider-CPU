@@ -437,6 +437,154 @@ fn mamba2_invocation_returns_three_distinct_outputs_and_rejects_aliasing() {
     assert_eq!(read("ssm_state"), vec![0.0]);
 }
 
+#[test]
+fn encoder_affine_exact_gelu_and_slice_execute_as_distinct_kernels() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    for (name, tensor) in [
+        (
+            "x",
+            HostTensor::new([2, 4], vec![-2.0, 0.0, 0.5, 3.0, 1.0, -1.0, 2.0, -2.0]).unwrap(),
+        ),
+        (
+            "scale",
+            HostTensor::new([4], vec![1.0, 0.5, -1.0, 2.0]).unwrap(),
+        ),
+        (
+            "bias",
+            HostTensor::new([4], vec![0.25, -0.1, 0.7, 0.9]).unwrap(),
+        ),
+    ] {
+        executor.write_tensor(TensorResourceId::new(name), tensor);
+    }
+    let run = |name: &str, inputs: Vec<(&str, Vec<u64>)>, output: (&str, Vec<u64>), attributes| {
+        let advertisement = advertisements
+            .iter()
+            .find(|item| item.id.name == name)
+            .unwrap();
+        let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+        let mut invocation = KernelInvocation::new(
+            KernelInvocationId::new(name),
+            advertisement.implemented_operator.clone(),
+            advertisement.id.clone(),
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        );
+        for (id, shape) in inputs {
+            invocation = invocation.with_input(resource(id, shape));
+        }
+        invocation = invocation
+            .with_output(resource(output.0, output.1))
+            .with_attributes(attributes);
+        assert_eq!(
+            executor
+                .execute_invocation(advertisement, operator, &invocation)
+                .status,
+            KernelResultStatus::Succeeded,
+            "{name}"
+        );
+    };
+    run(
+        "affine-layernorm",
+        vec![("x", vec![2, 4]), ("scale", vec![4]), ("bias", vec![4])],
+        ("norm", vec![2, 4]),
+        BTreeMap::from([("epsilon".into(), OperatorAttributeValue::Float(1e-5))]),
+    );
+    run(
+        "gelu-exact",
+        vec![("norm", vec![2, 4])],
+        ("gelu", vec![2, 4]),
+        BTreeMap::new(),
+    );
+    run(
+        "slice-last",
+        vec![("gelu", vec![2, 4])],
+        ("out", vec![2, 2]),
+        BTreeMap::from([
+            ("start".into(), OperatorAttributeValue::Integer(1)),
+            ("width".into(), OperatorAttributeValue::Integer(2)),
+        ]),
+    );
+    let actual = executor.read_tensor(&TensorResourceId::new("out")).unwrap();
+    for (&actual, expected) in
+        actual
+            .data
+            .iter()
+            .zip([-0.085_945_67, 0.463_285_98, -0.140_943_65, -0.161_602_23])
+    {
+        assert!((actual - expected).abs() < 2e-6, "{actual} != {expected}");
+    }
+    let gelu = advertisements
+        .iter()
+        .find(|item| item.id.name == "gelu-exact")
+        .unwrap();
+    let operator = catalog.get(&gelu.implemented_operator).unwrap();
+    let alias = KernelInvocation::new(
+        KernelInvocationId::new("gelu-alias"),
+        gelu.implemented_operator.clone(),
+        gelu.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(resource("x", vec![2, 4]))
+    .with_output(resource("x", vec![2, 4]));
+    assert_ne!(
+        executor.execute_invocation(gelu, operator, &alias).status,
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(
+        executor
+            .read_tensor(&TensorResourceId::new("x"))
+            .unwrap()
+            .data,
+        vec![-2.0, 0.0, 0.5, 3.0, 1.0, -1.0, 2.0, -2.0]
+    );
+    let slice = advertisements
+        .iter()
+        .find(|item| item.id.name == "slice-last")
+        .unwrap();
+    let operator = catalog.get(&slice.implemented_operator).unwrap();
+    let wrong_shape = KernelInvocation::new(
+        KernelInvocationId::new("slice-shape"),
+        slice.implemented_operator.clone(),
+        slice.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(resource("x", vec![2, 4]))
+    .with_output(resource("wrong", vec![2, 3]))
+    .with_attributes(BTreeMap::from([
+        ("start".into(), OperatorAttributeValue::Integer(1)),
+        ("width".into(), OperatorAttributeValue::Integer(2)),
+    ]));
+    assert_ne!(
+        executor
+            .execute_invocation(slice, operator, &wrong_shape)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    assert!(
+        executor
+            .read_tensor(&TensorResourceId::new("wrong"))
+            .is_none()
+    );
+}
+
 struct Rng(u64);
 
 impl Rng {

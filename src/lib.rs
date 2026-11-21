@@ -1469,6 +1469,9 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         attention,
         baseline_advertisement("encoder-attention", OperatorFamily::Attention),
         baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("affine-layernorm", OperatorFamily::Normalization),
+        baseline_advertisement("gelu-exact", OperatorFamily::Activation),
+        baseline_advertisement("slice-last", OperatorFamily::Tensor),
         baseline_advertisement("softmax", OperatorFamily::Activation),
         baseline_advertisement("silu", OperatorFamily::Activation),
         baseline_advertisement("gelu", OperatorFamily::Activation),
@@ -2541,6 +2544,16 @@ impl ReferenceCpuExecutor {
 
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
+        if matches!(name, "affine-layernorm" | "gelu-exact" | "slice-last")
+            && invocation.outputs.iter().any(|output| {
+                invocation
+                    .inputs
+                    .iter()
+                    .any(|input| input.resource.id == output.resource.id)
+            })
+        {
+            return Err(KernelError::KernelAliasingUnsupported);
+        }
         let mut result = KernelResult::success(invocation.id.clone());
         if name == "kv-write" {
             let descriptor = self.run_kv_write(invocation)?;
@@ -2937,6 +2950,33 @@ impl ReferenceCpuExecutor {
                 }
                 return Ok(result);
             }
+            "affine-layernorm" => {
+                if !(2..=3).contains(&invocation.inputs.len()) {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "affine-layernorm expects scale and optional bias".into(),
+                    });
+                }
+                let epsilon = operator_semantics::affine_layernorm_epsilon(&invocation.attributes)
+                    .map_err(KernelError::from)?;
+                let input = self.input_tensor(invocation, 0)?;
+                let scale = self.input_tensor(invocation, 1)?;
+                let bias = if invocation.inputs.len() == 3 {
+                    Some(self.input_tensor(invocation, 2)?)
+                } else {
+                    None
+                };
+                operator_semantics::affine_layernorm(&input, &scale, bias.as_ref(), epsilon)
+                    .map_err(KernelError::from)?
+            }
+            "gelu-exact" => operator_semantics::gelu_exact(&self.input_tensor(invocation, 0)?)
+                .map_err(KernelError::from)?,
+            "slice-last" => {
+                let (start, width) =
+                    operator_semantics::slice_last_attributes(&invocation.attributes)
+                        .map_err(KernelError::from)?;
+                operator_semantics::slice_last(&self.input_tensor(invocation, 0)?, start, width)
+                    .map_err(KernelError::from)?
+            }
             "encoder-attention" => {
                 let config =
                     operator_semantics::encoder_attention_from_attributes(&invocation.attributes)
@@ -3193,6 +3233,15 @@ impl ReferenceCpuExecutor {
                 });
             }
         };
+        if matches!(name, "affine-layernorm" | "gelu-exact" | "slice-last")
+            && invocation.outputs.first().is_none_or(|resource| {
+                resource.resource.descriptor.shape.dimensions != output.shape
+            })
+        {
+            return Err(KernelError::KernelExecutionFailed {
+                reason: format!("{name} output descriptor does not match computed shape"),
+            });
+        }
         let descriptor = self.store_output(invocation, 0, output)?;
         result
             .output_readiness

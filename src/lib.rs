@@ -1469,6 +1469,10 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         attention,
         baseline_advertisement("encoder-attention", OperatorFamily::Attention),
         baseline_advertisement("differential-attention", OperatorFamily::Attention),
+        baseline_advertisement(
+            "projected-differential-attention",
+            OperatorFamily::Attention,
+        ),
         baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mimo", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mixer", OperatorFamily::LinearAlgebra),
@@ -2954,7 +2958,7 @@ impl ReferenceCpuExecutor {
                 }
                 return Ok(result);
             }
-            name @ ("mamba3-mimo" | "mamba3-mixer") => {
+            name @ ("mamba3-mimo" | "mamba3-mixer" | "projected-differential-attention") => {
                 if invocation.outputs.len() != 5 {
                     return Err(KernelError::KernelExecutionFailed {
                         reason: format!("{name} requires exactly five outputs"),
@@ -2985,11 +2989,18 @@ impl ReferenceCpuExecutor {
                         operator_semantics::mamba3_mimo_from_attributes(&invocation.attributes)
                             .map_err(KernelError::from)?;
                     operator_semantics::mamba3_mimo(&inputs, config)
-                } else {
+                } else if name == "mamba3-mixer" {
                     let config =
                         operator_semantics::mamba3_mixer_from_attributes(&invocation.attributes)
                             .map_err(KernelError::from)?;
                     operator_semantics::mamba3_mixer(&inputs, config)
+                } else {
+                    let config =
+                        operator_semantics::projected_differential_attention_from_attributes(
+                            &invocation.attributes,
+                        )
+                        .map_err(KernelError::from)?;
+                    operator_semantics::projected_differential_attention(&inputs, config)
                 }
                 .map_err(KernelError::from)?;
                 if outputs.iter().zip(&computed).any(|(resource, tensor)| {

@@ -1478,6 +1478,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         ),
         baseline_advertisement("mul", OperatorFamily::Tensor),
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
+        baseline_advertisement("geodesic-residual", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
         baseline_advertisement("layout-conversion", OperatorFamily::Layout),
     ]
@@ -2593,6 +2594,22 @@ impl ReferenceCpuExecutor {
                 let gate = self.input_tensor(invocation, 0)?;
                 let up = self.input_tensor(invocation, 1)?;
                 mul(&silu(&gate), &up).map_err(KernelError::from)?
+            }
+            "geodesic-residual" => {
+                let layer_index = Self::attribute_integer(&invocation.attributes, "layer_index")
+                    .and_then(|index| u32::try_from(index).ok())
+                    .filter(|index| *index != u32::MAX)
+                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                        attribute: "layer_index".into(),
+                    })?;
+                magnetar_provider_api::operator_semantics::geodesic_residual(
+                    &self.input_tensor(invocation, 0)?,
+                    &self.input_tensor(invocation, 1)?,
+                    &self.input_tensor(invocation, 2)?,
+                    &self.input_tensor(invocation, 3)?,
+                    layer_index,
+                )
+                .map_err(KernelError::from)?
             }
             "batched-matmul" => {
                 let a = self.input_tensor(invocation, 0)?;

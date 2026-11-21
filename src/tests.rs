@@ -11,6 +11,72 @@
 
 use super::*;
 
+#[test]
+fn geodesic_residual_provider_matches_pinned_pytorch_reference() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|item| item.id.name == "geodesic-residual")
+        .unwrap();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let inputs = [
+        (
+            "x",
+            HostTensor::new([1, 4], vec![1.0, -2.0, 0.5, 4.0]).unwrap(),
+        ),
+        (
+            "g",
+            HostTensor::new([1, 4], vec![0.7, 1.2, -1.0, 0.3]).unwrap(),
+        ),
+        ("scale", HostTensor::new([1], vec![1.2]).unwrap()),
+        ("bias", HostTensor::new([1], vec![0.04]).unwrap()),
+    ];
+    let mut invocation = KernelInvocation::new(
+        KernelInvocationId::new("geodesic"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    for (name, tensor) in inputs {
+        invocation = invocation.with_input(resource(name, tensor.shape.clone()));
+        executor.write_tensor(TensorResourceId::new(name), tensor);
+    }
+    invocation = invocation
+        .with_output(resource("out", vec![1, 4]))
+        .with_attributes(BTreeMap::from([(
+            "layer_index".into(),
+            OperatorAttributeValue::Integer(0),
+        )]));
+    assert_eq!(
+        executor
+            .execute_invocation(advertisement, operator, &invocation)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    let actual = executor.read_tensor(&TensorResourceId::new("out")).unwrap();
+    let expected = [1.8208141, -0.37730992, -0.7845274, 4.1444893];
+    for (actual, expected) in actual.data.iter().zip(expected) {
+        assert!((actual - expected).abs() < 1e-6);
+    }
+}
+
 struct Rng(u64);
 
 impl Rng {

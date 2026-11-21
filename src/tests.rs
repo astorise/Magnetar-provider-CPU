@@ -168,6 +168,126 @@ fn sigmoid_moe_provider_matches_transformers_grouped_router() {
     assert!((actual.data[0] - expected).abs() < 1e-5);
 }
 
+#[test]
+fn ungated_relu_squared_moe_matches_pytorch_and_supports_optional_scale() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|item| item.id.name == "moe-experts")
+        .unwrap();
+    assert!(advertisement.id.features.contains(MOE_RELU_SQUARED_FEATURE));
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    for with_scale in [false, true] {
+        let mut invocation = KernelInvocation::new(
+            KernelInvocationId::new("relu2-moe"),
+            advertisement.implemented_operator.clone(),
+            advertisement.id.clone(),
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        );
+        let mut inputs = vec![
+            ("h", HostTensor::new([1, 1], vec![2.0]).unwrap()),
+            ("logits", HostTensor::new([1, 2], vec![0.4, -0.3]).unwrap()),
+            ("in", HostTensor::new([1, 2], vec![-3.0, 2.0]).unwrap()),
+            ("down", HostTensor::new([1, 2], vec![7.0, 3.0]).unwrap()),
+            ("bias", HostTensor::new([2], vec![-0.5, 0.4]).unwrap()),
+        ];
+        if with_scale {
+            inputs.push(("scale", HostTensor::new([2], vec![1.0, 0.5]).unwrap()));
+        }
+        for (name, tensor) in inputs {
+            invocation = invocation.with_input(resource(name, tensor.shape.clone()));
+            executor.write_tensor(TensorResourceId::new(name), tensor);
+        }
+        invocation = invocation
+            .with_output(resource("out", vec![1, 1]))
+            .with_attributes(BTreeMap::from([
+                ("experts".into(), OperatorAttributeValue::Integer(2)),
+                ("top_k".into(), OperatorAttributeValue::Integer(1)),
+                (
+                    "activation".into(),
+                    OperatorAttributeValue::String("relu_squared".into()),
+                ),
+                (
+                    "routing_scoring".into(),
+                    OperatorAttributeValue::String("sigmoid".into()),
+                ),
+                (
+                    "routing_normalization".into(),
+                    OperatorAttributeValue::String("multiple".into()),
+                ),
+                ("routing_scale".into(), OperatorAttributeValue::Float(2.45)),
+            ]));
+        assert_eq!(
+            executor
+                .execute_invocation(advertisement, operator, &invocation)
+                .status,
+            KernelResultStatus::Succeeded
+        );
+        let actual = executor.read_tensor(&TensorResourceId::new("out")).unwrap();
+        // Independently evaluated in PyTorch, including non-normalized top-1.
+        let expected = if with_scale { 25.022_781 } else { 50.045_563 };
+        assert!((actual.data[0] - expected).abs() < 1e-5);
+    }
+    let activation = advertisements
+        .iter()
+        .find(|item| item.id.name == "activation")
+        .unwrap();
+    assert!(
+        activation
+            .id
+            .features
+            .contains(ACTIVATION_RELU_SQUARED_FEATURE)
+    );
+    let operator = catalog.get(&activation.implemented_operator).unwrap();
+    executor.write_tensor(
+        TensorResourceId::new("activation.in"),
+        HostTensor::new([3], vec![-2.0, 0.5, 3.0]).unwrap(),
+    );
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("relu2-activation"),
+        activation.implemented_operator.clone(),
+        activation.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(resource("activation.in", vec![3]))
+    .with_output(resource("activation.out", vec![3]))
+    .with_attributes(BTreeMap::from([(
+        "kind".into(),
+        OperatorAttributeValue::String("relu_squared".into()),
+    )]));
+    assert_eq!(
+        executor
+            .execute_invocation(activation, operator, &invocation)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(
+        executor
+            .read_tensor(&TensorResourceId::new("activation.out"))
+            .unwrap()
+            .data,
+        vec![0.0, 0.25, 9.0]
+    );
+}
+
 struct Rng(u64);
 
 impl Rng {

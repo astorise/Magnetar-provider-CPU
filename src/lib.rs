@@ -113,19 +113,20 @@ use magnetar_core::{
     device::DeviceMetadata, device::DeviceType,
 };
 use magnetar_core::{
-    operator::ATTENTION_LATENT_KV_FEATURE, operator::ATTENTION_SCALE_FEATURE,
-    operator::ATTENTION_TURBOQUANT_KV_FEATURE, operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
+    operator::ACTIVATION_RELU_SQUARED_FEATURE, operator::ATTENTION_LATENT_KV_FEATURE,
+    operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_TURBOQUANT_KV_FEATURE,
+    operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
     operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
     operator::ConcatAxis, operator::EMBEDDING_SCALE_FEATURE,
     operator::KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE, operator::KV_WRITE_TURBOQUANT_FEATURE,
     operator::MOE_EXPERTS_ACTIVATION_FEATURE, operator::MOE_PER_EXPERT_SCALE_FEATURE,
-    operator::MOE_SIGMOID_ROUTING_FEATURE, operator::OperatorAttributeValue,
-    operator::OperatorFamily, operator::OperatorId, operator::OperatorSpec,
-    operator::RMSNORM_PER_HEAD_FEATURE, operator::RMSNORM_WITHOUT_WEIGHT_FEATURE,
-    operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE, operator::ROPE_PARTIAL_ROTARY_FEATURE,
-    operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE, operator::RopeBandedFrequencyScaling,
-    operator::RopeYarnFrequencyScaling, operator::TensorLayoutKind, operator::TensorRole,
-    operator::concat_axis,
+    operator::MOE_RELU_SQUARED_FEATURE, operator::MOE_SIGMOID_ROUTING_FEATURE,
+    operator::OperatorAttributeValue, operator::OperatorFamily, operator::OperatorId,
+    operator::OperatorSpec, operator::RMSNORM_PER_HEAD_FEATURE,
+    operator::RMSNORM_WITHOUT_WEIGHT_FEATURE, operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
+    operator::ROPE_PARTIAL_ROTARY_FEATURE, operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE,
+    operator::RopeBandedFrequencyScaling, operator::RopeYarnFrequencyScaling,
+    operator::TensorLayoutKind, operator::TensorRole, operator::concat_axis,
 };
 use magnetar_graph::{
     memory::MemoryAllocationClass, memory::MemoryAllocationId, memory::MemoryAllocationOwner,
@@ -1437,6 +1438,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
             MOE_EXPERTS_ACTIVATION_FEATURE,
             MOE_PER_EXPERT_SCALE_FEATURE,
             MOE_SIGMOID_ROUTING_FEATURE,
+            MOE_RELU_SQUARED_FEATURE,
         ],
     );
     let rope = with_features(
@@ -1468,7 +1470,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("softmax", OperatorFamily::Activation),
         baseline_advertisement("silu", OperatorFamily::Activation),
         baseline_advertisement("gelu", OperatorFamily::Activation),
-        baseline_advertisement("activation", OperatorFamily::Activation),
+        with_features(
+            "activation",
+            OperatorFamily::Activation,
+            &[ACTIVATION_RELU_SQUARED_FEATURE],
+        ),
         baseline_advertisement("add", OperatorFamily::Tensor),
         concat,
         // Creates and writes TurboQuant stores (`turboquant-kv-history`),
@@ -2632,8 +2638,6 @@ impl ReferenceCpuExecutor {
                 let h = self.input_tensor(invocation, 0)?;
                 let logits = self.input_tensor(invocation, 1)?;
                 let gate = self.input_tensor(invocation, 2)?;
-                let up = self.input_tensor(invocation, 3)?;
-                let down = self.input_tensor(invocation, 4)?;
                 let integer = |name: &str| {
                     Self::attribute_integer(&invocation.attributes, name)
                         .filter(|value| *value > 0)
@@ -2664,25 +2668,38 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
+                let ungated = activation == MoeExpertActivation::ReluSquared;
+                let up = if ungated {
+                    None
+                } else {
+                    Some(self.input_tensor(invocation, 3)?)
+                };
+                let down = self.input_tensor(invocation, if ungated { 3 } else { 4 })?;
                 let sigmoid = operator_semantics::sigmoid_routing_from_attributes(
                     &invocation.attributes,
                     routing.top_k,
                 )
                 .map_err(KernelError::from)?;
-                let (bias, per_expert_scale) = match (sigmoid.is_some(), invocation.inputs.len()) {
-                    (false, 5) => (None, None),
-                    (false, 6) => (None, Some(self.input_tensor(invocation, 5)?)),
-                    (true, 6) => (Some(self.input_tensor(invocation, 5)?), None),
-                    (true, 7) => (
-                        Some(self.input_tensor(invocation, 5)?),
-                        Some(self.input_tensor(invocation, 6)?),
-                    ),
-                    _ => {
-                        return Err(KernelError::KernelAttributeUnsupported {
-                            attribute: "moe-experts input count does not match routing".into(),
-                        });
-                    }
-                };
+                let (bias, per_expert_scale) =
+                    match (ungated, sigmoid.is_some(), invocation.inputs.len()) {
+                        (false, false, 5) => (None, None),
+                        (false, false, 6) => (None, Some(self.input_tensor(invocation, 5)?)),
+                        (false, true, 6) => (Some(self.input_tensor(invocation, 5)?), None),
+                        (false, true, 7) => (
+                            Some(self.input_tensor(invocation, 5)?),
+                            Some(self.input_tensor(invocation, 6)?),
+                        ),
+                        (true, true, 5) => (Some(self.input_tensor(invocation, 4)?), None),
+                        (true, true, 6) => (
+                            Some(self.input_tensor(invocation, 4)?),
+                            Some(self.input_tensor(invocation, 5)?),
+                        ),
+                        _ => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: "moe-experts input count does not match routing".into(),
+                            });
+                        }
+                    };
                 let options = MoeExpertOptions {
                     activation,
                     per_expert_scale: per_expert_scale.as_ref(),
@@ -2691,7 +2708,7 @@ impl ReferenceCpuExecutor {
                     operator_semantics::moe_experts_local_sigmoid_with(
                         &h,
                         &logits,
-                        [&gate, &up, &down],
+                        [&gate, up.as_ref().unwrap_or(&gate), &down],
                         routing,
                         first,
                         count,
@@ -2705,7 +2722,7 @@ impl ReferenceCpuExecutor {
                     operator_semantics::moe_experts_local_with(
                         &h,
                         &logits,
-                        [&gate, &up, &down],
+                        [&gate, up.as_ref().unwrap_or(&gate), &down],
                         routing,
                         first,
                         count,
@@ -3038,6 +3055,9 @@ impl ReferenceCpuExecutor {
                     "silu" => silu(&input),
                     "gelu" => gelu(&input),
                     "sigmoid" => sigmoid(&input),
+                    "relu_squared" => {
+                        operator_semantics::relu_squared(&input).map_err(KernelError::from)?
+                    }
                     "softcap" => operator_semantics::softcap(&input, float("cap")?)
                         .map_err(KernelError::from)?,
                     "scale" => operator_semantics::scale(&input, float("factor")?)

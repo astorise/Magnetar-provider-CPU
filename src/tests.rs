@@ -535,6 +535,118 @@ fn mamba3_invocation_returns_five_outputs_and_rejects_aliasing() {
 }
 
 #[test]
+fn mamba3_mixer_invocation_returns_states_and_rejects_aliasing() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|item| item.id.name == "mamba3-mixer")
+        .unwrap();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let shapes = [
+        vec![1, 1],
+        vec![2, 1],
+        vec![2, 1, 4],
+        vec![1, 2, 4],
+        vec![2, 1],
+        vec![1, 10],
+        vec![1, 9],
+        vec![2],
+        vec![4],
+        vec![4],
+        vec![1, 2, 4],
+        vec![1, 2, 4],
+        vec![1, 2, 1],
+        vec![1, 2, 1],
+        vec![1, 2, 1],
+        vec![2],
+    ];
+    let mut invocation = KernelInvocation::new(
+        KernelInvocationId::new("mamba3-mixer"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    for (index, shape) in shapes.iter().enumerate() {
+        let name = format!("input{index}");
+        let count = shape.iter().product::<u64>() as usize;
+        executor.write_tensor(
+            TensorResourceId::new(&name),
+            HostTensor::new(shape.clone(), vec![0.0; count]).unwrap(),
+        );
+        invocation = invocation.with_input(resource(&name, shape.clone()));
+    }
+    for (name, shape) in [
+        ("out", vec![1, 2]),
+        ("angle", vec![2, 1]),
+        ("ssm", vec![2, 1, 4]),
+        ("key", vec![1, 2, 4]),
+        ("input_state", vec![2, 1]),
+    ] {
+        invocation = invocation.with_output(resource(name, shape));
+    }
+    invocation = invocation.with_attributes(BTreeMap::from([
+        ("heads".into(), OperatorAttributeValue::Integer(2)),
+        ("groups".into(), OperatorAttributeValue::Integer(1)),
+        ("rank".into(), OperatorAttributeValue::Integer(1)),
+        ("head_dim".into(), OperatorAttributeValue::Integer(1)),
+        ("state_dim".into(), OperatorAttributeValue::Integer(4)),
+        ("angles".into(), OperatorAttributeValue::Integer(1)),
+        ("epsilon".into(), OperatorAttributeValue::Float(1e-6)),
+        ("decay_floor".into(), OperatorAttributeValue::Float(1e-4)),
+        (
+            "zero_centered_norm".into(),
+            OperatorAttributeValue::Boolean(true),
+        ),
+    ]));
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    assert_eq!(result.updated_resources.len(), 5);
+    for name in ["out", "angle", "ssm", "key", "input_state"] {
+        assert!(
+            executor
+                .read_tensor(&TensorResourceId::new(name))
+                .unwrap()
+                .data
+                .iter()
+                .all(|&v| v == 0.0)
+        );
+    }
+    let mut aliased = invocation.clone();
+    aliased.outputs[2] = resource("input2", shapes[2].clone());
+    assert_ne!(
+        executor
+            .execute_invocation(advertisement, operator, &aliased)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    assert!(
+        executor
+            .read_tensor(&TensorResourceId::new("input2"))
+            .unwrap()
+            .data
+            .iter()
+            .all(|&v| v == 0.0)
+    );
+}
+
+#[test]
 fn encoder_affine_exact_gelu_and_slice_execute_as_distinct_kernels() {
     use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
     let executor = ReferenceCpuExecutor::new();

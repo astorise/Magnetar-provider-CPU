@@ -353,6 +353,90 @@ fn encoder_attention_respects_bidirectional_window_and_padding() {
     );
 }
 
+#[test]
+fn mamba2_invocation_returns_three_distinct_outputs_and_rejects_aliasing() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|item| item.id.name == "mamba2-mixer")
+        .unwrap();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let mut invocation = KernelInvocation::new(
+        KernelInvocationId::new("mamba2"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    for (name, tensor) in [
+        ("x", HostTensor::new([1, 1], vec![1.0]).unwrap()),
+        ("conv_state", HostTensor::new([3, 1], vec![0.0; 3]).unwrap()),
+        ("ssm_state", HostTensor::new([1, 1, 1], vec![0.0]).unwrap()),
+        ("in_proj", HostTensor::new([1, 5], vec![1.0; 5]).unwrap()),
+        ("conv", HostTensor::new([3, 1], vec![1.0; 3]).unwrap()),
+        ("dt_bias", HostTensor::new([1], vec![0.0]).unwrap()),
+        ("a_log", HostTensor::new([1], vec![0.0]).unwrap()),
+        ("d", HostTensor::new([1], vec![1.0]).unwrap()),
+        ("norm", HostTensor::new([1], vec![1.0]).unwrap()),
+        ("out_proj", HostTensor::new([1, 1], vec![1.0]).unwrap()),
+    ] {
+        invocation = invocation.with_input(resource(name, tensor.shape.clone()));
+        executor.write_tensor(TensorResourceId::new(name), tensor);
+    }
+    invocation = invocation
+        .with_output(resource("out", vec![1, 1]))
+        .with_output(resource("next_conv", vec![3, 1]))
+        .with_output(resource("next_ssm", vec![1, 1, 1]))
+        .with_attributes(BTreeMap::from([
+            ("heads".into(), OperatorAttributeValue::Integer(1)),
+            ("head_dim".into(), OperatorAttributeValue::Integer(1)),
+            ("groups".into(), OperatorAttributeValue::Integer(1)),
+            ("state_dim".into(), OperatorAttributeValue::Integer(1)),
+            ("conv_kernel".into(), OperatorAttributeValue::Integer(1)),
+            ("epsilon".into(), OperatorAttributeValue::Float(1e-5)),
+            ("dt_min".into(), OperatorAttributeValue::Float(0.0)),
+            ("conv_bias".into(), OperatorAttributeValue::Boolean(false)),
+            ("linear_bias".into(), OperatorAttributeValue::Boolean(false)),
+        ]));
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    assert_eq!(result.updated_resources.len(), 3);
+    let read = |name| {
+        executor
+            .read_tensor(&TensorResourceId::new(name))
+            .unwrap()
+            .data
+    };
+    assert!((read("out")[0] - 0.999_993_9).abs() < 2e-6);
+    assert_eq!(read("next_conv"), vec![1.0; 3]);
+    assert!((read("next_ssm")[0] - 0.701_868_3).abs() < 2e-6);
+    let mut aliased = invocation.clone();
+    aliased.outputs[2] = resource("ssm_state", vec![1, 1, 1]);
+    assert_ne!(
+        executor
+            .execute_invocation(advertisement, operator, &aliased)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(read("ssm_state"), vec![0.0]);
+}
+
 struct Rng(u64);
 
 impl Rng {

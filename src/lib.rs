@@ -1468,6 +1468,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         rope,
         attention,
         baseline_advertisement("encoder-attention", OperatorFamily::Attention),
+        baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("softmax", OperatorFamily::Activation),
         baseline_advertisement("silu", OperatorFamily::Activation),
         baseline_advertisement("gelu", OperatorFamily::Activation),
@@ -2887,6 +2888,54 @@ impl ReferenceCpuExecutor {
                     Self::attribute_float_opt(&invocation.attributes, "partial_rotary_factor"),
                 )
                 .map_err(KernelError::from)?
+            }
+            "mamba2-mixer" => {
+                if invocation.outputs.len() != 3 {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "mamba2-mixer requires exactly three outputs".into(),
+                    });
+                }
+                let outputs = &invocation.outputs;
+                for (i, output) in outputs.iter().enumerate() {
+                    if outputs[..i]
+                        .iter()
+                        .any(|other| other.resource.id == output.resource.id)
+                        || invocation
+                            .inputs
+                            .iter()
+                            .any(|input| input.resource.id == output.resource.id)
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason:
+                                "mamba2-mixer outputs must be distinct from all inputs and outputs"
+                                    .into(),
+                        });
+                    }
+                }
+                let config =
+                    operator_semantics::mamba2_mixer_from_attributes(&invocation.attributes)
+                        .map_err(KernelError::from)?;
+                let inputs = (0..invocation.inputs.len())
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let computed =
+                    operator_semantics::mamba2_mixer(&inputs, config).map_err(KernelError::from)?;
+                if outputs.iter().zip(&computed).any(|(resource, tensor)| {
+                    resource.resource.descriptor.shape.dimensions != tensor.shape
+                }) {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "mamba2-mixer output descriptor does not match computed shape"
+                            .into(),
+                    });
+                }
+                for (index, tensor) in computed.into_iter().enumerate() {
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    result
+                        .output_readiness
+                        .insert(descriptor.id.to_string(), true);
+                    result.updated_resources.push(descriptor);
+                }
+                return Ok(result);
             }
             "encoder-attention" => {
                 let config =

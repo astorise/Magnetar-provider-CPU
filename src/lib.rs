@@ -1474,6 +1474,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
             OperatorFamily::Attention,
         ),
         baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("gated-delta-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mimo", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("token-shift", OperatorFamily::Tensor),
@@ -2910,10 +2911,10 @@ impl ReferenceCpuExecutor {
                 )
                 .map_err(KernelError::from)?
             }
-            "mamba2-mixer" => {
+            name @ ("mamba2-mixer" | "gated-delta-mixer") => {
                 if invocation.outputs.len() != 3 {
                     return Err(KernelError::KernelExecutionFailed {
-                        reason: "mamba2-mixer requires exactly three outputs".into(),
+                        reason: format!("{name} requires exactly three outputs"),
                     });
                 }
                 let outputs = &invocation.outputs;
@@ -2927,26 +2928,33 @@ impl ReferenceCpuExecutor {
                             .any(|input| input.resource.id == output.resource.id)
                     {
                         return Err(KernelError::KernelExecutionFailed {
-                            reason:
-                                "mamba2-mixer outputs must be distinct from all inputs and outputs"
-                                    .into(),
+                            reason: format!(
+                                "{name} outputs must be distinct from all inputs and outputs"
+                            ),
                         });
                     }
                 }
-                let config =
-                    operator_semantics::mamba2_mixer_from_attributes(&invocation.attributes)
-                        .map_err(KernelError::from)?;
                 let inputs = (0..invocation.inputs.len())
                     .map(|index| self.input_tensor(invocation, index))
                     .collect::<Result<Vec<_>, _>>()?;
-                let computed =
-                    operator_semantics::mamba2_mixer(&inputs, config).map_err(KernelError::from)?;
+                let computed = if name == "mamba2-mixer" {
+                    let config =
+                        operator_semantics::mamba2_mixer_from_attributes(&invocation.attributes)
+                            .map_err(KernelError::from)?;
+                    operator_semantics::mamba2_mixer(&inputs, config)
+                } else {
+                    let config = operator_semantics::gated_delta_mixer_from_attributes(
+                        &invocation.attributes,
+                    )
+                    .map_err(KernelError::from)?;
+                    operator_semantics::gated_delta_mixer(&inputs, config)
+                }
+                .map_err(KernelError::from)?;
                 if outputs.iter().zip(&computed).any(|(resource, tensor)| {
                     resource.resource.descriptor.shape.dimensions != tensor.shape
                 }) {
                     return Err(KernelError::KernelExecutionFailed {
-                        reason: "mamba2-mixer output descriptor does not match computed shape"
-                            .into(),
+                        reason: format!("{name} output descriptor does not match computed shape"),
                     });
                 }
                 for (index, tensor) in computed.into_iter().enumerate() {

@@ -12,6 +12,113 @@
 use super::*;
 
 #[test]
+fn gated_delta_mixer_invocation_checks_outputs_and_aliasing() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|item| item.id.name == "gated-delta-mixer")
+        .unwrap();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let shapes = [
+        vec![1, 1],
+        vec![3, 1],
+        vec![1, 1, 1],
+        vec![3, 1],
+        vec![1, 1],
+        vec![1, 1],
+        vec![1, 1],
+        vec![3, 1],
+        vec![1],
+        vec![1],
+        vec![1],
+        vec![1, 1],
+        vec![1],
+    ];
+    let values = [
+        vec![1.0],
+        vec![0.0; 3],
+        vec![0.0],
+        vec![1.0; 3],
+        vec![1.0],
+        vec![0.0],
+        vec![0.0],
+        vec![1.0; 3],
+        vec![0.0],
+        vec![0.0],
+        vec![1.0],
+        vec![1.0],
+        vec![1.0],
+    ];
+    let mut invocation = KernelInvocation::new(
+        KernelInvocationId::new("gated-delta-mixer"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    );
+    for (index, (shape, values)) in shapes.iter().zip(values).enumerate() {
+        let name = format!("input{index}");
+        executor.write_tensor(
+            TensorResourceId::new(&name),
+            HostTensor::new(shape.clone(), values).unwrap(),
+        );
+        invocation = invocation.with_input(resource(&name, shape.clone()));
+    }
+    for (name, shape) in [
+        ("out", vec![1, 1]),
+        ("conv", vec![3, 1]),
+        ("state", vec![1, 1, 1]),
+    ] {
+        invocation = invocation.with_output(resource(name, shape));
+    }
+    invocation = invocation.with_attributes(BTreeMap::from([
+        ("key_heads".into(), OperatorAttributeValue::Integer(1)),
+        ("value_heads".into(), OperatorAttributeValue::Integer(1)),
+        ("key_dim".into(), OperatorAttributeValue::Integer(1)),
+        ("value_dim".into(), OperatorAttributeValue::Integer(1)),
+        ("conv_kernel".into(), OperatorAttributeValue::Integer(1)),
+        ("epsilon".into(), OperatorAttributeValue::Float(1e-6)),
+    ]));
+    let result = executor.execute_invocation(advertisement, operator, &invocation);
+    assert_eq!(result.status, KernelResultStatus::Succeeded);
+    assert_eq!(result.updated_resources.len(), 3);
+    let read = |name| {
+        executor
+            .read_tensor(&TensorResourceId::new(name))
+            .unwrap()
+            .data
+    };
+    assert!((read("out")[0] - 0.731_055_86).abs() < 1e-6);
+    assert!((read("state")[0] - 0.365_528_94).abs() < 1e-6);
+    assert_eq!(read("conv"), vec![1.0; 3]);
+    let mut aliased = invocation.clone();
+    aliased.outputs[1] = resource("input1", shapes[1].clone());
+    assert_ne!(
+        executor
+            .execute_invocation(advertisement, operator, &aliased)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(read("input1"), vec![0.0; 3]);
+}
+
+#[test]
 fn geodesic_residual_provider_matches_pinned_pytorch_reference() {
     use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
     let executor = ReferenceCpuExecutor::new();

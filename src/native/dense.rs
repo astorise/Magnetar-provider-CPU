@@ -44,6 +44,37 @@ pub(crate) fn avx512() -> bool {
     })
 }
 
+/// Whether the one-row kernels read the next weight rows ahead with
+/// prefetch instructions (a diagnostic control).
+pub(crate) static SOFTWARE_PREFETCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Whether a one-row kernel reading `elements` values of `T` from each
+/// weight row it streams reads the next rows ahead: rows this short end
+/// before the hardware prefetchers catch up with them. An input-major
+/// pass reads eight rows; an output-major step sixteen (eight with AVX2),
+/// whose next rows lie further ahead, so only short ones are read ahead.
+#[inline]
+fn prefetches<T>(elements: usize, output_major: bool) -> bool {
+    let limit = if output_major { 4 << 10 } else { 16 << 10 };
+    elements * std::mem::size_of::<T>() <= limit
+        && SOFTWARE_PREFETCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Asks for the cache line holding `values[index]` ahead of its use: a
+/// hint, which reads nothing (an index past the end is harmless).
+#[inline(always)]
+fn prefetch<T>(values: &[T], index: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch accesses no memory; the pointer is only a hint.
+    unsafe {
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        _mm_prefetch::<_MM_HINT_T0>(values.as_ptr().wrapping_add(index) as *const i8);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (values, index);
+}
+
 /// The bfloat16 bits of `value`, when converting them back gives `value`.
 pub(crate) fn exact_bf16_bits(value: f32) -> Option<u16> {
     let bits = value.to_bits();
@@ -198,12 +229,22 @@ pub(in crate::native) mod avx2 {
                     // side by side, each activation vector loaded once for
                     // all of them (one short row at a time left the
                     // hardware prefetchers behind).
+                    // The next eight rows read ahead, a cache line of
+                    // each per line of these.
+                    let ahead = super::prefetches::<$element>(k, true);
+                    let line = 64 / std::mem::size_of::<$element>();
                     let mut c = 0;
                     while c + 8 <= count {
                         let row = (first + c) * k;
+                        let next = ahead && c + 16 <= count;
                         let mut acc = [_mm256_setzero_ps(); 8];
                         let mut i = 0;
                         while i < whole {
+                            if next && i % line == 0 {
+                                for j in 0..8 {
+                                    super::prefetch(weight, row + (8 + j) * k + i);
+                                }
+                            }
                             let x = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
                             for (j, acc) in acc.iter_mut().enumerate() {
                                 let w = unsafe { $load(weight, row + j * k + i) };
@@ -505,6 +546,10 @@ pub(in crate::native) mod avx2 {
                 if m == 1 {
                     // A decode step: eight weight rows per pass, so one
                     // read and write of the output block serves eight.
+                    // The next pass's rows read ahead, a cache line of
+                    // each per line of these.
+                    let ahead = super::prefetches::<$element>(count, false);
+                    let line = 64 / std::mem::size_of::<$element>();
                     while i + 8 <= rows.end {
                         let mut s = [_mm256_setzero_ps(); 8];
                         let mut w = [0_usize; 8];
@@ -512,8 +557,14 @@ pub(in crate::native) mod avx2 {
                             *s = _mm256_set1_ps(a[i + j]);
                             *w = (i + j) * n + first;
                         }
+                        let next = ahead && i + 16 <= rows.end;
                         let mut c = 0;
                         while c < whole {
+                            if next && c % line == 0 {
+                                for w in &w {
+                                    super::prefetch(weight, w + 8 * n + c);
+                                }
+                            }
                             unsafe {
                                 let at = out.as_mut_ptr().add(c);
                                 let mut acc = _mm256_loadu_ps(at);
@@ -710,12 +761,22 @@ pub(in crate::native) mod avx512 {
                 if m == 1 {
                     // Sixteen outputs at a time, as the AVX2 kernel takes
                     // eight.
+                    // The next sixteen rows read ahead, a cache line of
+                    // each per line of these.
+                    let ahead = super::prefetches::<$element>(k, true);
+                    let line = 64 / std::mem::size_of::<$element>();
                     let mut c = 0;
                     while c + 16 <= count {
                         let row = (first + c) * k;
+                        let next = ahead && c + 32 <= count;
                         let mut acc = [_mm512_setzero_ps(); 16];
                         let mut i = 0;
                         while i < whole {
+                            if next && i % line == 0 {
+                                for j in 0..16 {
+                                    super::prefetch(weight, row + (16 + j) * k + i);
+                                }
+                            }
                             let x = unsafe { _mm512_loadu_ps(a.as_ptr().add(i)) };
                             for (j, acc) in acc.iter_mut().enumerate() {
                                 let w = unsafe { $load(weight, row + j * k + i) };
@@ -1017,6 +1078,10 @@ pub(in crate::native) mod avx512 {
                 if m == 1 {
                     // A decode step: eight weight rows per pass, so one
                     // read and write of the output block serves eight.
+                    // The next pass's rows read ahead, a cache line of
+                    // each per line of these.
+                    let ahead = super::prefetches::<$element>(count, false);
+                    let line = 64 / std::mem::size_of::<$element>();
                     while i + 8 <= rows.end {
                         let mut s = [_mm512_setzero_ps(); 8];
                         let mut w = [0_usize; 8];
@@ -1024,8 +1089,14 @@ pub(in crate::native) mod avx512 {
                             *s = _mm512_set1_ps(a[i + j]);
                             *w = (i + j) * n + first;
                         }
+                        let next = ahead && i + 16 <= rows.end;
                         let mut c = 0;
                         while c < whole {
+                            if next && c % line == 0 {
+                                for w in &w {
+                                    super::prefetch(weight, w + 8 * n + c);
+                                }
+                            }
                             unsafe {
                                 let at = out.as_mut_ptr().add(c);
                                 let mut acc = _mm512_loadu_ps(at);

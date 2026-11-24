@@ -993,6 +993,295 @@ fn pool_and_streamed_matmul_costs() {
     }
 }
 
+/// Diagnostic: the matmuls of a Qwen2.5-0.5B decode step in their order,
+/// on distinct bfloat16 weights in their stored layouts (24 layers and a
+/// tied LM head, about 1 GB), so each reads its weight from memory as in a
+/// real step: one product at a time (the gated MLP's two then their
+/// activation), against the query, key and value projections in one pool
+/// run and the gated MLP's two products in another, without and with the
+/// one-row kernels reading the next rows ahead, alternating step by step.
+/// Prints each class's time and the steps' totals.
+#[test]
+#[ignore = "diagnostic: allocates about 1 GB"]
+fn decode_step_matmul_costs() {
+    let threads = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let state = state(false, threads);
+    let mut seed = 0x9e37_79b9_u32;
+    let mut weight = |rows: usize, cols: usize| -> CompactWeight {
+        let bits = (0..rows * cols)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                // A bfloat16 of magnitude below 2, either sign.
+                0x3c00 | (seed as u16 & 0x83ff)
+            })
+            .collect();
+        // Stored as `CompactWeight::of` stores it: transposed when it has
+        // more rows than columns.
+        CompactWeight {
+            rows,
+            cols,
+            transposed: rows > cols,
+            bits,
+        }
+    };
+    struct Layer {
+        q: CompactWeight,
+        k: CompactWeight,
+        v: CompactWeight,
+        o: CompactWeight,
+        gate: CompactWeight,
+        up: CompactWeight,
+        down: CompactWeight,
+    }
+    // Logical `[k, n]` weights.
+    let layers: Vec<Layer> = (0..24)
+        .map(|_| Layer {
+            q: weight(896, 896),
+            k: weight(896, 128),
+            v: weight(896, 128),
+            o: weight(896, 896),
+            gate: weight(896, 4864),
+            up: weight(896, 4864),
+            down: weight(4864, 896),
+        })
+        .collect();
+    let head = weight(896, 151936);
+    let narrow = activations(1, 896, 301);
+    let wide = activations(1, 4864, 302);
+    fn plan<'w>(state: &NativeState, a: &HostTensor, w: &'w CompactWeight) -> DenseProduct<'w> {
+        state
+            .dense_plan(
+                a,
+                dense::Values::Bf16(&w.bits),
+                w.stored_shape(),
+                w.transposed,
+            )
+            .unwrap()
+    }
+    let plan = |a: &HostTensor, w| plan(&state, a, w);
+    let product = |a: &HostTensor, w: &CompactWeight| {
+        state
+            .dense_product(
+                a,
+                dense::Values::Bf16(&w.bits),
+                w.stored_shape(),
+                w.transposed,
+            )
+            .unwrap()
+            .unwrap()
+    };
+    let mut totals: BTreeMap<String, f64> = BTreeMap::new();
+    let mut add = |key: String, begin: std::time::Instant, measured: bool| {
+        if measured {
+            *totals.entry(key).or_default() += begin.elapsed().as_secs_f64();
+        }
+    };
+    let steps = 16;
+    for step in 0..steps {
+        for (variant, grouped, ahead) in [
+            ("apart", false, false),
+            ("grouped", true, false),
+            ("grouped+prefetch", true, true),
+        ] {
+            dense::SOFTWARE_PREFETCH.store(ahead, std::sync::atomic::Ordering::Relaxed);
+            let measured = step >= 2;
+            let start = std::time::Instant::now();
+            for layer in &layers {
+                let begin = std::time::Instant::now();
+                if grouped {
+                    let products = [
+                        plan(&narrow, &layer.q),
+                        plan(&narrow, &layer.k),
+                        plan(&narrow, &layer.v),
+                    ];
+                    let computed = state.run_products(&narrow.data, &products);
+                    for (computed, product) in computed.into_iter().zip(&products) {
+                        std::hint::black_box(computed.into_sum(product.m * product.n));
+                    }
+                } else {
+                    for w in [&layer.q, &layer.k, &layer.v] {
+                        std::hint::black_box(product(&narrow, w));
+                    }
+                }
+                add(format!("{variant} qkv"), begin, measured);
+                let begin = std::time::Instant::now();
+                std::hint::black_box(product(&narrow, &layer.o));
+                add(format!("{variant} o"), begin, measured);
+                let begin = std::time::Instant::now();
+                if grouped {
+                    let products = [plan(&narrow, &layer.gate), plan(&narrow, &layer.up)];
+                    let computed = state.run_products(&narrow.data, &products);
+                    let len = products[0].n;
+                    let out: Vec<f32> = (0..len)
+                        .map(|i| silu_times_value(computed[0].get(len, i), computed[1].get(len, i)))
+                        .collect();
+                    std::hint::black_box(out);
+                } else {
+                    let gate = product(&narrow, &layer.gate);
+                    let up = product(&narrow, &layer.up);
+                    std::hint::black_box(silu_times(gate, &up).unwrap());
+                }
+                add(format!("{variant} gate-up"), begin, measured);
+                let begin = std::time::Instant::now();
+                std::hint::black_box(product(&wide, &layer.down));
+                add(format!("{variant} down"), begin, measured);
+            }
+            let begin = std::time::Instant::now();
+            std::hint::black_box(product(&narrow, &head));
+            add(format!("{variant} lm-head"), begin, measured);
+            add(format!("{variant} step"), start, measured);
+        }
+    }
+    dense::SOFTWARE_PREFETCH.store(true, std::sync::atomic::Ordering::Relaxed);
+    let measured = (steps - 2) as f64;
+    for (key, seconds) in &totals {
+        println!(
+            "decode step {key}: {:.3} ms per step",
+            seconds / measured * 1e3
+        );
+    }
+}
+
+/// A replayed step runs dense products of one input (a layer's query,
+/// key and value projections) in one pool run, moving a later one ahead
+/// of invocations that neither write what it reads nor read or write what
+/// it writes: each output is the one running the invocations one by one
+/// gives, bit for bit, and a product writing what the group reads runs
+/// after it.
+#[test]
+fn replayed_product_groups_match_products_run_one_by_one() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    use magnetar_provider_api::StepCaptureRequest;
+    let advertisements = native_cpu_kernel_advertisements();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let find = |name: &str| {
+        advertisements
+            .iter()
+            .find(|advertisement| advertisement.id.name == name)
+            .unwrap()
+            .clone()
+    };
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let id = |name: &str| TensorResourceId::new(name);
+    // Every weight past `COMPACT_WEIGHT_MIN_ELEMENTS`.
+    let k = 1024_u64;
+    for m in [1_u64, 3] {
+        // (kernel, output, input, input width, outputs, third input): a
+        // query projection held input-major, a key projection held
+        // transposed (more rows than columns), a product of the query
+        // (another input), a value projection that moves ahead of it, then
+        // a product that overwrites the shared input.
+        let steps = [
+            ("matmul-bias", "q", "x", k, 1280_u64, Some("q_bias")),
+            ("matmul-bias", "k", "x", k, 64, Some("k_bias")),
+            ("matmul", "qq", "q", 1280, 64, None),
+            ("matmul", "v", "x", k, 64, None),
+            ("matmul-residual", "x", "x", k, k, Some("x")),
+        ];
+        let invocations: Vec<KernelInvocation> = steps
+            .iter()
+            .map(|&(kernel, output, input, width, n, third)| {
+                let advertisement = find(kernel);
+                let mut invocation = KernelInvocation::new(
+                    KernelInvocationId::new(output),
+                    advertisement.implemented_operator.clone(),
+                    advertisement.id.clone(),
+                    ProviderBinding::new(NATIVE_CPU_PROVIDER_NAME),
+                    ResourceAffinity::new(FallbackClass::Transparent),
+                )
+                .with_input(resource(input, vec![m, width]))
+                .with_input(resource(&format!("w_{output}"), vec![width, n]));
+                if let Some(third) = third {
+                    invocation = invocation
+                        .with_input(resource(third, vec![if third == "x" { m } else { 1 }, n]));
+                }
+                invocation.with_output(resource(output, vec![m, n]))
+            })
+            .collect();
+        let setup = |executor: &NativeCpuExecutor, x: &HostTensor| {
+            for (seed, &(_, output, _, width, n, third)) in steps.iter().enumerate() {
+                let weight = id(&format!("w_{output}"));
+                executor
+                    .write_weight_tensor(weight.clone(), bf16_values(width, n, 140 + seed as u32))
+                    .unwrap();
+                assert!(executor.is_compact(&weight));
+                if let Some(third) = third.filter(|third| *third != "x") {
+                    executor
+                        .write_tensor(id(third), activations(1, n, 150 + seed as u32))
+                        .unwrap();
+                }
+            }
+            executor.write_tensor(id("x"), x.clone()).unwrap();
+        };
+        let run = |executor: &NativeCpuExecutor| {
+            let mut memory = MemoryManager::default();
+            for invocation in &invocations {
+                let advertisement = find(&invocation.kernel.name);
+                let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+                let handle = executor
+                    .submit_kernel(&advertisement, operator, invocation, &mut memory)
+                    .unwrap();
+                assert_eq!(
+                    executor.complete_kernel(&handle).unwrap().status,
+                    KernelResultStatus::Succeeded
+                );
+            }
+        };
+        let (x0, x1) = (activations(m, k, 160), activations(m, k, 161));
+        let replayed = NativeCpuExecutor::with_settings(true, true, 3);
+        setup(&replayed, &x0);
+        let references: Vec<&KernelInvocation> = invocations.iter().collect();
+        let schedule: Vec<Vec<usize>> = replayed
+            .state
+            .schedule(&references)
+            .into_iter()
+            .map(|step| step.invocations)
+            .collect();
+        assert_eq!(schedule, [vec![0, 1, 3], vec![2], vec![4]]);
+        replayed
+            .begin_step_capture(&StepCaptureRequest {
+                advancing_attributes: Vec::new(),
+            })
+            .unwrap();
+        run(&replayed);
+        let capture = replayed.end_step_capture().unwrap();
+        replayed
+            .replay_step(&capture, 0, vec![(id("x"), x1.clone())])
+            .unwrap();
+        let one_by_one = NativeCpuExecutor::with_settings(true, true, 3);
+        setup(&one_by_one, &x1);
+        run(&one_by_one);
+        for output in ["q", "k", "qq", "v", "x"] {
+            let (got, want) = (
+                replayed.read_tensor(&id(output)).unwrap(),
+                one_by_one.read_tensor(&id(output)).unwrap(),
+            );
+            assert_eq!(got.shape, want.shape, "{output}, {m} row(s)");
+            assert!(
+                got.data
+                    .iter()
+                    .zip(&want.data)
+                    .all(|(x, y)| x.to_bits() == y.to_bits()),
+                "{output}, {m} row(s): the grouped replay's values differ"
+            );
+        }
+    }
+}
+
 /// `capture-cpu-steps`: a captured step ran as it was captured, and a
 /// replay writes its inputs and runs its invocations again with every
 /// advancing attribute increased by the offset; an offset off a store
@@ -1364,9 +1653,19 @@ fn gated_matmuls_match_the_reference_cpu() {
             .iter()
             .any(|advertisement| advertisement.id.name == "gated-matmul")
     );
-    let (k, n) = (256_u64, 640_u64);
-    for m in [1_u64, 5] {
-        for kind in ["compact", "f32", "packed"] {
+    // An input-major weight (shared out by row blocks), then one held
+    // transposed (by column blocks).
+    for (k, n, m, kind) in [(256_u64, 640_u64), (640, 256)]
+        .into_iter()
+        .flat_map(|(k, n)| {
+            [1_u64, 5].into_iter().flat_map(move |m| {
+                ["compact", "f32", "packed"]
+                    .into_iter()
+                    .map(move |kind| (k, n, m, kind))
+            })
+        })
+    {
+        {
             let executor = NativeCpuExecutor::with_settings(true, false, 2);
             let ids = ["a", "gate", "up", "out"].map(TensorResourceId::new);
             let (gate, up) = match kind {
@@ -1414,7 +1713,96 @@ fn gated_matmuls_match_the_reference_cpu() {
                 .run(executor.reference(), &invocation)
                 .expect("handled natively")
                 .unwrap();
-            assert_close(&actual, &expected, &format!("{kind}, {m} row(s)"));
+            assert_close(
+                &actual,
+                &expected,
+                &format!("{kind}, {m} row(s), [{k}, {n}]"),
+            );
+            if kind == "compact" {
+                // One pool run for both products: the values of the two
+                // products run apart, then `silu_times`, bit for bit.
+                let product = |weight: &TensorResourceId| {
+                    let invocation = invocation_writing(
+                        invocation_reading("matmul", &[&ids[0], weight]),
+                        &ids[3],
+                    );
+                    executor
+                        .state
+                        .run(executor.reference(), &invocation)
+                        .unwrap()
+                        .unwrap()
+                };
+                let apart = silu_times(product(&ids[1]), &product(&ids[2])).unwrap();
+                assert_eq!(actual.shape, apart.shape);
+                assert!(
+                    actual
+                        .data
+                        .iter()
+                        .zip(&apart.data)
+                        .all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "{m} row(s), [{k}, {n}]: the fused run's values differ"
+                );
+            }
         }
     }
+}
+
+/// The greedy column scan picks what a one-by-one scan keeping the first
+/// strictly higher score picks: ties, non-finite scores, excluded ranges
+/// (overlapping, unsorted, past the end), temperatures that overflow.
+#[test]
+fn greedy_columns_match_a_one_by_one_scan() {
+    fn one_by_one(
+        scores: &[f32],
+        excluded: &[std::ops::Range<u64>],
+        temperature: f32,
+    ) -> Option<u64> {
+        let mut best: Option<(f32, u64)> = None;
+        for (column, &score) in scores.iter().enumerate() {
+            let column = column as u64;
+            if !score.is_finite() || excluded.iter().any(|range| range.contains(&column)) {
+                continue;
+            }
+            let score = if temperature == 0.0 {
+                score
+            } else {
+                score / temperature
+            };
+            if best.is_none_or(|(value, _)| score > value) {
+                best = Some((score, column));
+            }
+        }
+        best.map(|(_, column)| column)
+    }
+    let mut rng = Rng(77);
+    for case in 0..400 {
+        let len = 1 + (rng.next() % 3000) as usize;
+        let levels = 1 + rng.next() % 50;
+        let scores: Vec<f32> = (0..len)
+            .map(|_| match rng.next() % 40 {
+                0 => f32::NAN,
+                1 => f32::INFINITY,
+                2 => f32::NEG_INFINITY,
+                3 => f32::MAX,
+                4 => -f32::MAX,
+                _ => (rng.next() % levels) as f32 - 20.0,
+            })
+            .collect();
+        let excluded: Vec<std::ops::Range<u64>> = (0..rng.next() % 4)
+            .map(|_| {
+                let start = u64::from(rng.next()) % (len as u64 + 10);
+                start..start + u64::from(rng.next()) % 700
+            })
+            .collect();
+        for temperature in [0.0_f32, 0.7, 1.0, 1e-38, -1.0, f32::NAN] {
+            assert_eq!(
+                greedy_column(&scores, &excluded, temperature),
+                one_by_one(&scores, &excluded, temperature),
+                "case {case}, temperature {temperature}"
+            );
+        }
+    }
+    assert_eq!(greedy_column(&[1.0, 2.0], &[0..1, 1..5], 0.0), None);
+    assert_eq!(greedy_column(&[], &[], 0.0), None);
+    assert_eq!(greedy_column(&[f32::NAN, f32::INFINITY], &[], 0.0), None);
 }

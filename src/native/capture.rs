@@ -19,6 +19,15 @@ pub(super) struct Recording {
     pub(super) invocations: Vec<KernelInvocation>,
     /// Why the capture cannot be replayed, if something made it so.
     pub(super) failure: Option<String>,
+    /// How a replay runs the invocations, worked out at the first replay.
+    pub(super) schedule: std::sync::OnceLock<Vec<Scheduled>>,
+}
+
+/// One step of a replay: recorded invocations by index, run in this
+/// order; several when they are dense products of one input run in one
+/// pool run (`NativeState::schedule`).
+pub(super) struct Scheduled {
+    pub(super) invocations: Vec<usize>,
 }
 
 #[derive(Default)]
@@ -40,16 +49,24 @@ impl CaptureState {
 }
 
 /// `invocation` with every integer attribute named in `advancing`
-/// increased by `offset`.
-pub(super) fn advanced(
-    invocation: &KernelInvocation,
+/// increased by `offset`: borrowed when it has none to increase (a step's
+/// matmuls), so a replay copies only the invocations it changes.
+pub(super) fn advanced<'a>(
+    invocation: &'a KernelInvocation,
     advancing: &[String],
     offset: u64,
-) -> Result<KernelInvocation, StepReplayError> {
-    let mut invocation = invocation.clone();
-    if offset == 0 {
-        return Ok(invocation);
+) -> Result<std::borrow::Cow<'a, KernelInvocation>, StepReplayError> {
+    let changes = offset != 0
+        && advancing.iter().any(|name| {
+            matches!(
+                invocation.attributes.get(name),
+                Some(OperatorAttributeValue::Integer(_))
+            )
+        });
+    if !changes {
+        return Ok(std::borrow::Cow::Borrowed(invocation));
     }
+    let mut invocation = invocation.clone();
     let offset = i64::try_from(offset).map_err(|_| StepReplayError::Invalidated {
         reason: format!("replay offset {offset} does not fit an attribute"),
     })?;
@@ -62,7 +79,7 @@ pub(super) fn advanced(
                 })?;
         }
     }
-    Ok(invocation)
+    Ok(std::borrow::Cow::Owned(invocation))
 }
 
 /// A replay failure, as the Provider reports it.

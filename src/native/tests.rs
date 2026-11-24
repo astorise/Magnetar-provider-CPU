@@ -1867,3 +1867,24 @@ fn one_row_kernels_run_on_the_decode_pool() {
         assert_close(&gated, &expected, &format!("gated-matmul, {m} row(s)"));
     }
 }
+
+#[test]
+fn cpu_lists_parse_as_linux_writes_them() {
+    let list =
+        |text| super::topology::cpu_list(text).map(|cpus| cpus.into_iter().collect::<Vec<_>>());
+    assert_eq!(list("0-3"), Some(vec![0, 1, 2, 3]));
+    assert_eq!(list("0,2"), Some(vec![0, 2]));
+    assert_eq!(list("0-1,4,6-7"), Some(vec![0, 1, 4, 6, 7]));
+    assert_eq!(list(""), Some(vec![]));
+    assert_eq!(list("3-1"), None);
+    assert_eq!(list("a"), None);
+}
+
+/// One thread per physical core: at least one, never more than the
+/// logical CPUs.
+#[test]
+fn one_thread_per_core_never_exceeds_the_logical_cpus() {
+    let logical = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let threads = super::topology::one_per_core();
+    assert!((1..=logical).contains(&threads), "{threads} of {logical}");
+}

@@ -10,7 +10,7 @@
 //! - [`INT8_ACTIVATIONS_ENV`] `=0` keeps f32 activations;
 //! - [`THREADS_ENV`] bounds the worker pool;
 //! - [`DECODE_THREADS_ENV`] runs one-row Kernels (a decode step) on a pool
-//!   of their own, of that many threads;
+//!   of their own, of that many threads (`cores`: one per physical core);
 //! - [`SIMD_ENV`] `=scalar` disables the vector kernels;
 //! - [`COMPACT_WEIGHTS_ENV`] `=0` keeps every dense weight f32 instead of
 //!   storing an exact bfloat16 one as its bfloat16 bits ([`dense`]);
@@ -20,6 +20,7 @@ mod capture;
 mod dense;
 mod pool;
 pub mod quant;
+mod topology;
 
 use super::*;
 use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightWrite};
@@ -33,9 +34,10 @@ pub const PACKED_WEIGHTS_ENV: &str = "MAGNETAR_CPU_PACKED_WEIGHTS";
 pub const INT8_ACTIVATIONS_ENV: &str = "MAGNETAR_CPU_INT8_ACTIVATIONS";
 pub const THREADS_ENV: &str = "MAGNETAR_CPU_THREADS";
 /// A positive count runs one-row Kernels (a decode step, memory-bound) on
-/// a pool of their own of that many threads, while Kernels of several rows
-/// (a prefill, compute-bound) keep [`THREADS_ENV`]'s pool: a core's second
-/// hardware thread helps a prefill and can slow a decode step.
+/// a pool of their own of that many threads, `cores` on one thread per
+/// physical core ([`topology`]), while Kernels of several rows (a prefill,
+/// compute-bound) keep [`THREADS_ENV`]'s pool: a core's second hardware
+/// thread helps a prefill and can slow a decode step.
 pub const DECODE_THREADS_ENV: &str = "MAGNETAR_CPU_DECODE_THREADS";
 pub const SIMD_ENV: &str = "MAGNETAR_CPU_SIMD";
 pub const COMPACT_WEIGHTS_ENV: &str = "MAGNETAR_CPU_COMPACT_WEIGHTS";
@@ -1502,7 +1504,10 @@ impl NativeCpuExecutor {
             });
         let decode_threads = std::env::var(DECODE_THREADS_ENV)
             .ok()
-            .and_then(|value| value.parse::<usize>().ok())
+            .and_then(|value| match value.as_str() {
+                "cores" => Some(topology::one_per_core()),
+                _ => value.parse::<usize>().ok(),
+            })
             .filter(|&decode| decode > 0 && decode != threads);
         let mut executor = Self::with_pools(
             std::env::var(PACKED_WEIGHTS_ENV).as_deref() != Ok("0"),

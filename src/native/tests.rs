@@ -994,6 +994,103 @@ fn pool_and_streamed_matmul_costs() {
     }
 }
 
+/// Diagnostic: llama.cpp's pattern for a one-row product, beside
+/// `pool_and_streamed_matmul_costs`: every weight stored output-major,
+/// each task a contiguous range of output rows, one dot product at a time
+/// (each row read in order). Run on 4 and 2 tasks (ggml's default thread
+/// count is the physical cores), so each runner's CPU says whether this
+/// pattern streams faster than the kernels the Provider uses.
+#[test]
+#[ignore = "diagnostic: streams about 400 MB per shape"]
+fn row_streamed_matmul_costs() {
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn dot_rows(
+        a: &[f32],
+        bits: &[u16],
+        k: usize,
+        rows: std::ops::Range<usize>,
+        out: &mut [f32],
+    ) {
+        use std::arch::x86_64::*;
+        for (value, row) in out.iter_mut().zip(rows) {
+            let w = &bits[row * k..(row + 1) * k];
+            let mut acc = [_mm256_setzero_ps(); 4];
+            let mut i = 0;
+            unsafe {
+                while i + 32 <= k {
+                    for (j, acc) in acc.iter_mut().enumerate() {
+                        let half = _mm_loadu_si128(w.as_ptr().add(i + 8 * j) as *const __m128i);
+                        let weights = _mm256_castsi256_ps(_mm256_slli_epi32::<16>(
+                            _mm256_cvtepu16_epi32(half),
+                        ));
+                        let x = _mm256_loadu_ps(a.as_ptr().add(i + 8 * j));
+                        *acc = _mm256_fmadd_ps(x, weights, *acc);
+                    }
+                    i += 32;
+                }
+                let sum =
+                    _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
+                let mut lanes = [0.0_f32; 8];
+                _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+                let mut total: f32 = lanes.iter().sum();
+                for t in i..k {
+                    total += a[t] * f32::from_bits(u32::from(w[t]) << 16);
+                }
+                *value = total;
+            }
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let threads = std::thread::available_parallelism().map_or(1, |count| count.get());
+        let state = state(false, threads);
+        for (k, n) in [(896_usize, 4864_usize), (4864, 896), (896, 896), (896, 128)] {
+            let a = activations(1, k as u64, 121);
+            let count = (400_000_000 / (n * k * 2)).clamp(4, 256);
+            let weights: Vec<Vec<u16>> = (0..count)
+                .map(|seed| {
+                    bf16_values(n as u64, k as u64, 122 + seed as u32)
+                        .data
+                        .iter()
+                        .map(|v| (v.to_bits() >> 16) as u16)
+                        .collect()
+                })
+                .collect();
+            for tasks in [threads, 2.min(threads)] {
+                let mut out = vec![0.0_f32; n];
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let start = std::time::Instant::now();
+                    for bits in &weights {
+                        let shared = SharedOut(out.as_mut_ptr());
+                        let shared = &shared;
+                        state.pool.run(tasks, &|task| {
+                            let rows = task * n / tasks..(task + 1) * n / tasks;
+                            // SAFETY: rows `rows` of the output belong to this task only.
+                            let slice = unsafe {
+                                std::slice::from_raw_parts_mut(shared.0.add(rows.start), rows.len())
+                            };
+                            // SAFETY: AVX2 and FMA were detected above.
+                            unsafe { dot_rows(&a.data, bits, k, rows, slice) };
+                        });
+                    }
+                    best = best.min(start.elapsed().as_secs_f64() / count as f64);
+                }
+                std::hint::black_box(&out);
+                println!(
+                    "streamed bf16 [1, {k}] x [{k}, {n}] row-at-a-time, {tasks} tasks: {:.3} ms ({:.1} GB/s)",
+                    best * 1e3,
+                    (n * k * 2) as f64 / best / 1e9
+                );
+            }
+        }
+    }
+}
+
 /// Diagnostic: the matmuls of a Qwen2.5-0.5B decode step in their order,
 /// on distinct bfloat16 weights in their stored layouts (24 layers and a
 /// tied LM head, about 1 GB), so each reads its weight from memory as in a

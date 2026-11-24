@@ -123,9 +123,10 @@ use magnetar_core::{
     operator::MOE_RELU_SQUARED_FEATURE, operator::MOE_SIGMOID_ROUTING_FEATURE,
     operator::OperatorAttributeValue, operator::OperatorFamily, operator::OperatorId,
     operator::OperatorSpec, operator::RMSNORM_PER_HEAD_FEATURE,
-    operator::RMSNORM_WITHOUT_WEIGHT_FEATURE, operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
-    operator::ROPE_PARTIAL_ROTARY_FEATURE, operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE,
-    operator::RopeBandedFrequencyScaling, operator::RopeYarnFrequencyScaling,
+    operator::RMSNORM_WEIGHT_OFFSET_FEATURE, operator::RMSNORM_WITHOUT_WEIGHT_FEATURE,
+    operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE, operator::ROPE_PARTIAL_ROTARY_FEATURE,
+    operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE, operator::RopeBandedFrequencyScaling,
+    operator::RopeYarnFrequencyScaling, operator::SPLIT_PER_HEAD_FEATURE,
     operator::TensorLayoutKind, operator::TensorRole, operator::concat_axis,
 };
 use magnetar_graph::{
@@ -347,6 +348,38 @@ pub fn embedding_lookup(
 }
 
 /// Correctness-first RMSNorm with `f32` accumulation.
+/// The two halves of each of `head_count` equal blocks of the last
+/// dimension: the first halves in order, then the second halves.
+fn split_heads_in_half(
+    input: &HostTensor,
+    head_count: u64,
+) -> Result<[HostTensor; 2], KernelError> {
+    let invalid = |reason: String| KernelError::KernelExecutionFailed { reason };
+    let Some((&width, outer)) = input.shape.split_last() else {
+        return Err(invalid("split needs at least one dimension".into()));
+    };
+    if head_count == 0 || width == 0 || !width.is_multiple_of(2 * head_count) {
+        return Err(invalid(format!(
+            "split of width {width} across {head_count} head(s) needs a multiple of {}",
+            2 * head_count
+        )));
+    }
+    let block = (width / head_count) as usize;
+    let half = block / 2;
+    let mut left = Vec::with_capacity(input.data.len() / 2);
+    let mut right = Vec::with_capacity(input.data.len() / 2);
+    for chunk in input.data.chunks_exact(block) {
+        left.extend_from_slice(&chunk[..half]);
+        right.extend_from_slice(&chunk[half..]);
+    }
+    let mut shape = outer.to_vec();
+    shape.push(width / 2);
+    let tensor = |data: Vec<f32>| {
+        HostTensor::new(shape.clone(), data).map_err(|error| invalid(error.to_string()))
+    };
+    Ok([tensor(left)?, tensor(right)?])
+}
+
 pub fn rmsnorm(
     input: &HostTensor,
     weight: &HostTensor,
@@ -1435,7 +1468,11 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
     let rmsnorm = with_features(
         "rmsnorm",
         OperatorFamily::Normalization,
-        &[RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE],
+        &[
+            RMSNORM_PER_HEAD_FEATURE,
+            RMSNORM_WITHOUT_WEIGHT_FEATURE,
+            RMSNORM_WEIGHT_OFFSET_FEATURE,
+        ],
     );
     let moe_experts = with_features(
         "moe-experts",
@@ -1482,6 +1519,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         ),
         baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("gated-delta-mixer", OperatorFamily::LinearAlgebra),
+        with_features("split", OperatorFamily::Tensor, &[SPLIT_PER_HEAD_FEATURE]),
         baseline_advertisement("mamba3-mimo", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("token-shift", OperatorFamily::Tensor),
@@ -2923,10 +2961,47 @@ impl ReferenceCpuExecutor {
                         ),
                     });
                 }
+                // Zero-centered norms scale by `weight_offset + weight`
+                // (`support-qwen38-flash-next`).
+                let offset = match invocation.attributes.get("weight_offset") {
+                    None => None,
+                    Some(OperatorAttributeValue::Float(offset)) if offset.is_finite() => {
+                        Some(*offset as f32)
+                    }
+                    Some(other) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("rmsnorm weight_offset {other:?}"),
+                        });
+                    }
+                };
+                if offset.is_some() && !weighted {
+                    return Err(KernelError::KernelAttributeUnsupported {
+                        attribute: "rmsnorm weight_offset needs a weight".into(),
+                    });
+                }
                 // The input and weight read where they are stored.
                 let indices: &[usize] = if weighted { &[0, 1] } else { &[0] };
                 self.with_inputs(invocation, indices, |inputs| {
-                    let (input, weight) = (inputs[0], inputs.get(1).copied());
+                    let shifted;
+                    let (input, weight) = match (inputs.get(1).copied(), offset) {
+                        (Some(weight), Some(offset)) => {
+                            shifted = HostTensor::new(
+                                weight.shape.clone(),
+                                weight
+                                    .data
+                                    .iter()
+                                    .map(|value| value + offset)
+                                    .collect::<Vec<_>>(),
+                            )
+                            .map_err(|error| {
+                                KernelError::KernelExecutionFailed {
+                                    reason: error.to_string(),
+                                }
+                            })?;
+                            (inputs[0], Some(&shifted))
+                        }
+                        (weight, _) => (inputs[0], weight),
+                    };
                     match (weight, heads) {
                         // Today's form keeps its own weight shapes.
                         (Some(weight), None) => {
@@ -3031,6 +3106,49 @@ impl ReferenceCpuExecutor {
                     )
                     .map_err(KernelError::from)
                 })?
+            }
+            // Each of `head_count` (default 1) blocks of the last dimension
+            // splits in half (`split-per-head`, `support-qwen38-flash-next`).
+            "split" => {
+                if invocation.outputs.len() != 2 {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "split requires exactly two outputs".into(),
+                    });
+                }
+                let head_count = match invocation.attributes.get("head_count") {
+                    None => 1,
+                    Some(OperatorAttributeValue::Integer(value)) if *value > 0 => *value as u64,
+                    Some(other) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("split head_count {other:?}"),
+                        });
+                    }
+                };
+                let input = self.input_tensor(invocation, 0)?;
+                for (index, tensor) in split_heads_in_half(&input, head_count)?
+                    .into_iter()
+                    .enumerate()
+                {
+                    if invocation.outputs[index]
+                        .resource
+                        .descriptor
+                        .shape
+                        .dimensions
+                        != tensor.shape
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason: "split output descriptor does not match computed shape".into(),
+                        });
+                    }
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    if record {
+                        result
+                            .output_readiness
+                            .insert(descriptor.id.to_string(), true);
+                        result.updated_resources.push(descriptor.clone());
+                    }
+                }
+                return Ok(result);
             }
             name @ ("mamba2-mixer" | "gated-delta-mixer") => {
                 if invocation.outputs.len() != 3 {

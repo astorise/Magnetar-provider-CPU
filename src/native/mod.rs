@@ -8,8 +8,7 @@
 //! Controls (read once per Provider):
 //! - [`PACKED_WEIGHTS_ENV`] `=0` declines packed weights (f32 at load);
 //! - [`INT8_ACTIVATIONS_ENV`] `=0` keeps f32 activations;
-//! - [`THREADS_ENV`] sets the worker pool's thread count (one per
-//!   physical core by default, [`topology`]);
+//! - [`THREADS_ENV`] bounds the worker pool;
 //! - [`SIMD_ENV`] `=scalar` disables the vector kernels;
 //! - [`COMPACT_WEIGHTS_ENV`] `=0` keeps every dense weight f32 instead of
 //!   storing an exact bfloat16 one as its bfloat16 bits ([`dense`]);
@@ -19,7 +18,6 @@ mod capture;
 mod dense;
 mod pool;
 pub mod quant;
-mod topology;
 
 use super::*;
 use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightWrite};
@@ -897,7 +895,15 @@ impl NativeCpuExecutor {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&threads| threads > 0)
-            .unwrap_or_else(topology::default_threads);
+            .unwrap_or_else(|| {
+                // Every logical CPU: on the 2-core, 4-thread benchmark
+                // runners one thread per physical core was slower (TTFT
+                // 81.3 against 71.5 ms, TPOT 35.8 against 34.8 ms, run
+                // 45343428878).
+                std::thread::available_parallelism()
+                    .map(|count| count.get())
+                    .unwrap_or(1)
+            });
         let mut executor = Self::with_settings(
             std::env::var(PACKED_WEIGHTS_ENV).as_deref() != Ok("0"),
             std::env::var(INT8_ACTIVATIONS_ENV).as_deref() != Ok("0"),

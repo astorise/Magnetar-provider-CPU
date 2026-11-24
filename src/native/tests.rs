@@ -1250,22 +1250,3 @@ fn both_vector_widths_match_the_reference_cpu() {
         }
     }
 }
-
-#[test]
-fn cpu_lists_parse_as_linux_writes_them() {
-    let list =
-        |text| super::topology::cpu_list(text).map(|cpus| cpus.into_iter().collect::<Vec<_>>());
-    assert_eq!(list("0-3"), Some(vec![0, 1, 2, 3]));
-    assert_eq!(list("0,2"), Some(vec![0, 2]));
-    assert_eq!(list("0-1,4,6-7"), Some(vec![0, 1, 4, 6, 7]));
-    assert_eq!(list(""), Some(vec![]));
-    assert_eq!(list("3-1"), None);
-    assert_eq!(list("a"), None);
-}
-
-#[test]
-fn the_default_pool_never_exceeds_the_logical_cpus() {
-    let logical = std::thread::available_parallelism().map_or(1, |count| count.get());
-    let threads = super::topology::default_threads();
-    assert!((1..=logical).contains(&threads), "{threads} of {logical}");
-}

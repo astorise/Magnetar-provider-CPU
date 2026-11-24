@@ -686,7 +686,14 @@ fn bf16_values(rows: u64, cols: u64, seed: u32) -> HostTensor {
 fn dense_matmuls_match_the_reference_cpu() {
     for threads in [1, 3] {
         let state = state(false, threads);
-        for (m, k, n) in [(1, 64, 37), (3, 70, 200), (8, 96, 33), (5, 9, 8)] {
+        for (m, k, n) in [
+            (1, 64, 37),
+            (1, 37, 41),
+            (1, 300, 70),
+            (3, 70, 200),
+            (8, 96, 33),
+            (5, 9, 8),
+        ] {
             for transpose_b in [false, true] {
                 let a = activations(m, k, 81 + m as u32);
                 let shape = if transpose_b { [n, k] } else { [k, n] };
@@ -797,63 +804,87 @@ fn exact_bfloat16_weights_are_stored_compact() {
 }
 
 /// The matmul family and the embedding lookup read compact weights in
-/// place, with the Reference CPU kernels' results.
+/// place, with the Reference CPU kernels' results: a weight with more rows
+/// than columns (held transposed) and one with fewer, each used transposed
+/// and not.
 #[test]
 fn matmul_kernels_and_lookups_read_compact_weights() {
     use magnetar_core::operator::OperatorAttributeValue as Value;
-    let executor = NativeCpuExecutor::with_settings(true, true, 2);
-    let (m, k, n) = (3_u64, 128_u64, 640_u64);
-    let weight = bf16_values(n, k, 101);
-    let ids = ["a", "w", "bias", "residual", "ids"].map(TensorResourceId::new);
-    executor
-        .write_weight_tensor(ids[1].clone(), weight.clone())
-        .unwrap();
-    assert!(executor.is_compact(&ids[1]));
-    let a = activations(m, k, 102);
-    let bias = activations(1, n, 103);
-    let bias = HostTensor::new([n], bias.data).unwrap();
-    let residual = activations(m, n, 104);
-    for (id, tensor) in [(&ids[0], &a), (&ids[2], &bias), (&ids[3], &residual)] {
+    for (rows, cols) in [(640_u64, 128_u64), (128, 640)] {
+        for transpose_b in [true, false] {
+            for m in [1_u64, 3] {
+                compact_weight_reads(rows, cols, transpose_b, m);
+            }
+        }
+    }
+
+    fn compact_weight_reads(rows: u64, cols: u64, transpose_b: bool, m: u64) {
+        let what = format!("[{rows}, {cols}], transposed {transpose_b}, {m} row(s)");
+        let executor = NativeCpuExecutor::with_settings(true, true, 2);
+        let (k, n) = if transpose_b {
+            (cols, rows)
+        } else {
+            (rows, cols)
+        };
+        let weight = bf16_values(rows, cols, 101);
+        let ids = ["a", "w", "bias", "residual", "ids"].map(TensorResourceId::new);
+        executor
+            .write_weight_tensor(ids[1].clone(), weight.clone())
+            .unwrap();
+        assert!(executor.is_compact(&ids[1]));
+        assert_eq!(executor.read_tensor(&ids[1]).unwrap(), weight, "{what}");
+        assert_eq!(executor.resident_shape(&ids[1]).unwrap(), vec![rows, cols]);
+        let a = activations(m, k, 102);
+        let bias = activations(1, n, 103);
+        let bias = HostTensor::new([n], bias.data).unwrap();
+        let residual = activations(m, n, 104);
+        for (id, tensor) in [(&ids[0], &a), (&ids[2], &bias), (&ids[3], &residual)] {
+            executor
+                .reference()
+                .write_tensor(id.clone(), tensor.clone());
+        }
+        let mut attributes = BTreeMap::new();
+        attributes.insert("transpose_b".into(), Value::Boolean(transpose_b));
+        let product = matmul(&a, &weight, false, transpose_b).unwrap();
+        for (kernel, extra, expected) in [
+            ("matmul", None, product.clone()),
+            ("matmul-bias", Some(&ids[2]), add(&product, &bias).unwrap()),
+            (
+                "matmul-residual",
+                Some(&ids[3]),
+                residual_add(&residual, &product).unwrap(),
+            ),
+        ] {
+            let mut inputs = vec![&ids[0], &ids[1]];
+            inputs.extend(extra);
+            let invocation =
+                invocation_reading(kernel, &inputs).with_attributes(attributes.clone());
+            let actual = executor
+                .state
+                .run(executor.reference(), &invocation)
+                .expect("handled natively")
+                .unwrap();
+            assert_close(&actual, &expected, &format!("{kernel}, {what}"));
+        }
+        // The weight as an embedding table: rows gathered exactly.
+        let tokens = HostTensor::new([3], vec![5.0, 0.0, (rows - 1) as f32]).unwrap();
         executor
             .reference()
-            .write_tensor(id.clone(), tensor.clone());
-    }
-    let mut attributes = BTreeMap::new();
-    attributes.insert("transpose_b".into(), Value::Boolean(true));
-    let product = matmul(&a, &weight, false, true).unwrap();
-    for (kernel, extra, expected) in [
-        ("matmul", None, product.clone()),
-        ("matmul-bias", Some(&ids[2]), add(&product, &bias).unwrap()),
-        (
-            "matmul-residual",
-            Some(&ids[3]),
-            residual_add(&residual, &product).unwrap(),
-        ),
-    ] {
-        let mut inputs = vec![&ids[0], &ids[1]];
-        inputs.extend(extra);
-        let invocation = invocation_reading(kernel, &inputs).with_attributes(attributes.clone());
+            .write_tensor(ids[4].clone(), tokens.clone());
+        let invocation = invocation_reading("embedding", &[&ids[1], &ids[4]]);
         let actual = executor
             .state
             .run(executor.reference(), &invocation)
             .expect("handled natively")
             .unwrap();
-        assert_close(&actual, &expected, kernel);
+        assert_eq!(
+            actual,
+            embedding_lookup(&weight, &tokens).unwrap(),
+            "{what}"
+        );
+        // Nothing but the read-back above was expanded to f32.
+        assert_eq!(executor.state.materialized.lock().unwrap().0, 1, "{what}");
     }
-    // The weight as an embedding table: rows gathered exactly.
-    let tokens = HostTensor::new([3], vec![5.0, 0.0, 639.0]).unwrap();
-    executor
-        .reference()
-        .write_tensor(ids[4].clone(), tokens.clone());
-    let invocation = invocation_reading("embedding", &[&ids[1], &ids[4]]);
-    let actual = executor
-        .state
-        .run(executor.reference(), &invocation)
-        .expect("handled natively")
-        .unwrap();
-    assert_eq!(actual, embedding_lookup(&weight, &tokens).unwrap());
-    // Nothing was expanded to f32 along the way.
-    assert_eq!(executor.state.materialized.lock().unwrap().0, 0);
 }
 
 /// Diagnostic: a decode-step dense matmul's time and weight bandwidth,
@@ -915,35 +946,46 @@ fn pool_and_streamed_matmul_costs() {
         threads * 4,
         start.elapsed().as_secs_f64() / f64::from(repeats) * 1e6
     );
-    // 48 distinct 4864 x 896 bfloat16 weights (418 MB): each read once per
-    // pass, as a decode step reads its layers'.
-    let (k, n) = (896_u64, 4864_u64);
-    let a = activations(1, k, 121);
-    let weights: Vec<Vec<u16>> = (0..48)
-        .map(|seed| {
-            bf16_values(n, k, 122 + seed)
-                .data
-                .iter()
-                .map(|v| (v.to_bits() >> 16) as u16)
-                .collect()
-        })
-        .collect();
-    for pass in 0..3 {
-        let start = std::time::Instant::now();
-        for bits in &weights {
-            state.dense_product(
-                &a,
-                dense::Values::Bf16(bits),
-                [n as usize, k as usize],
-                true,
+    // Distinct bfloat16 weights of each decode shape of a Qwen2.5-0.5B
+    // layer (about 400 MB of each): each read once per pass, as a decode
+    // step reads its layers', in both stored layouts.
+    for (k, n) in [(896_u64, 4864_u64), (4864, 896), (896, 896), (896, 128)] {
+        let a = activations(1, k, 121);
+        let count = (400_000_000 / (n * k * 2)).clamp(4, 256);
+        let weights: Vec<Vec<u16>> = (0..count)
+            .map(|seed| {
+                bf16_values(n, k, 122 + seed as u32)
+                    .data
+                    .iter()
+                    .map(|v| (v.to_bits() >> 16) as u16)
+                    .collect()
+            })
+            .collect();
+        for transpose_b in [true, false] {
+            let shape = if transpose_b {
+                [n as usize, k as usize]
+            } else {
+                [k as usize, n as usize]
+            };
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let start = std::time::Instant::now();
+                for bits in &weights {
+                    state.dense_product(&a, dense::Values::Bf16(bits), shape, transpose_b);
+                }
+                best = best.min(start.elapsed().as_secs_f64() / count as f64);
+            }
+            println!(
+                "streamed bf16 [1, {k}] x [{k}, {n}] {}: {:.3} ms ({:.1} GB/s)",
+                if transpose_b {
+                    "output-major"
+                } else {
+                    "input-major"
+                },
+                best * 1e3,
+                (n * k * 2) as f64 / best / 1e9
             );
         }
-        let seconds = start.elapsed().as_secs_f64() / 48.0;
-        println!(
-            "pass {pass}: streamed bf16 [1, {k}] x [{k}, {n}]: {:.3} ms ({:.1} GB/s)",
-            seconds * 1e3,
-            (n * k * 2) as f64 / seconds / 1e9
-        );
     }
 }
 
@@ -1148,6 +1190,8 @@ fn both_vector_widths_match_the_reference_cpu() {
     for (m, k, n) in [
         (1, 64, 48),
         (1, 200, 37),
+        (1, 37, 41),
+        (1, 300, 70),
         (3, 70, 200),
         (8, 136, 40),
         (5, 9, 17),
@@ -1205,4 +1249,23 @@ fn both_vector_widths_match_the_reference_cpu() {
             }
         }
     }
+}
+
+#[test]
+fn cpu_lists_parse_as_linux_writes_them() {
+    let list =
+        |text| super::topology::cpu_list(text).map(|cpus| cpus.into_iter().collect::<Vec<_>>());
+    assert_eq!(list("0-3"), Some(vec![0, 1, 2, 3]));
+    assert_eq!(list("0,2"), Some(vec![0, 2]));
+    assert_eq!(list("0-1,4,6-7"), Some(vec![0, 1, 4, 6, 7]));
+    assert_eq!(list(""), Some(vec![]));
+    assert_eq!(list("3-1"), None);
+    assert_eq!(list("a"), None);
+}
+
+#[test]
+fn the_default_pool_never_exceeds_the_logical_cpus() {
+    let logical = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let threads = super::topology::default_threads();
+    assert!((1..=logical).contains(&threads), "{threads} of {logical}");
 }

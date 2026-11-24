@@ -8,7 +8,8 @@
 //! Controls (read once per Provider):
 //! - [`PACKED_WEIGHTS_ENV`] `=0` declines packed weights (f32 at load);
 //! - [`INT8_ACTIVATIONS_ENV`] `=0` keeps f32 activations;
-//! - [`THREADS_ENV`] bounds the worker pool;
+//! - [`THREADS_ENV`] sets the worker pool's thread count (one per
+//!   physical core by default, [`topology`]);
 //! - [`SIMD_ENV`] `=scalar` disables the vector kernels;
 //! - [`COMPACT_WEIGHTS_ENV`] `=0` keeps every dense weight f32 instead of
 //!   storing an exact bfloat16 one as its bfloat16 bits ([`dense`]);
@@ -18,6 +19,7 @@ mod capture;
 mod dense;
 mod pool;
 pub mod quant;
+mod topology;
 
 use super::*;
 use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightWrite};
@@ -90,9 +92,20 @@ pub(crate) trait PackedWeights: Send + Sync {
 /// A dense weight whose every value is exactly a bfloat16 value, held as
 /// those values' bfloat16 bits (`speed-up-dense-cpu-matmuls`): half the
 /// bytes of f32, every value unchanged.
+///
+/// A weight with more rows than columns is held transposed, so its stored
+/// rows are its longer dimension: a decode step's matmul streams a few
+/// stored rows side by side, and rows of a few kilobytes (a `[4864, 896]`
+/// down projection, a `[151936, 896]` embedding table a tied LM head reads
+/// transposed) kept the hardware prefetchers from reaching the bandwidth
+/// longer rows reach (locally 21 against 43 GB/s for the down projection,
+/// 25 against 46 for such an LM head).
 struct CompactWeight {
+    /// The logical shape.
     rows: usize,
     cols: usize,
+    /// Whether `bits` holds the transpose: `cols` rows of `rows` values.
+    transposed: bool,
     bits: Vec<u16>,
 }
 
@@ -109,22 +122,70 @@ impl CompactWeight {
             .iter()
             .map(|&value| dense::exact_bf16_bits(value))
             .collect::<Option<Vec<u16>>>()?;
+        let (rows, cols) = (rows as usize, cols as usize);
+        let transposed = rows > cols;
+        let bits = if transposed {
+            transpose(&bits, rows, cols)
+        } else {
+            bits
+        };
         Some(Self {
-            rows: rows as usize,
-            cols: cols as usize,
+            rows,
+            cols,
+            transposed,
             bits,
         })
     }
 
+    /// The stored shape: the logical one, or its transpose.
+    fn stored_shape(&self) -> [usize; 2] {
+        if self.transposed {
+            [self.cols, self.rows]
+        } else {
+            [self.rows, self.cols]
+        }
+    }
+
+    /// The logical value at `[row, col]`.
+    fn get(&self, row: usize, col: usize) -> f32 {
+        let index = if self.transposed {
+            col * self.rows + row
+        } else {
+            row * self.cols + col
+        };
+        f32::from_bits(u32::from(self.bits[index]) << 16)
+    }
+
     fn expand(&self) -> HostTensor {
-        let values: Vec<f32> = self
-            .bits
+        let bits = if self.transposed {
+            transpose(&self.bits, self.cols, self.rows)
+        } else {
+            self.bits.clone()
+        };
+        let values: Vec<f32> = bits
             .iter()
             .map(|&bits| f32::from_bits(u32::from(bits) << 16))
             .collect();
         HostTensor::new([self.rows as u64, self.cols as u64], values)
             .expect("a compact weight's shape holds its values")
     }
+}
+
+/// The transpose of the row-major `rows x cols` matrix `values`, by tiles
+/// that keep both sides' reads and writes within a few cache lines.
+fn transpose(values: &[u16], rows: usize, cols: usize) -> Vec<u16> {
+    const TILE: usize = 64;
+    let mut out = vec![0_u16; values.len()];
+    for r0 in (0..rows).step_by(TILE) {
+        for c0 in (0..cols).step_by(TILE) {
+            for r in r0..(r0 + TILE).min(rows) {
+                for c in c0..(c0 + TILE).min(cols) {
+                    out[c * rows + r] = values[r * cols + c];
+                }
+            }
+        }
+    }
+    out
 }
 
 struct NativeState {
@@ -238,11 +299,12 @@ impl NativeState {
         let rows = *a.shape.first()?;
         let a = self.live_rows(&a).unwrap_or(a);
         let product = match self.compact(id) {
+            // A weight held transposed is used the other way round.
             Some(weight) => self.dense_product(
                 &a,
                 dense::Values::Bf16(&weight.bits),
-                [weight.rows, weight.cols],
-                transpose_b,
+                weight.stored_shape(),
+                transpose_b != weight.transposed,
             )?,
             None => {
                 let storage = executor.storage.lock().unwrap();
@@ -293,12 +355,19 @@ impl NativeState {
         let level = simd_level();
         let threads = self.pool.threads();
         let mut out = vec![0.0_f32; m * n];
-        // An input-major weight narrower than `INPUT_MAJOR_COLUMNS` per
-        // thread is shared out by blocks of whole rows (contiguous reads),
-        // each task summing its block into a partial product: a block of a
-        // few hundred columns per row would read short strided runs.
+        // An input-major weight narrower than twice `INPUT_MAJOR_COLUMNS`
+        // per thread is shared out by blocks of whole rows (contiguous
+        // reads), each task summing its block into a partial product (of
+        // at most a few megabytes): a block of a few hundred columns per
+        // row would read short strided runs, and one of a few thousand
+        // left a thread with a smaller share than another (three column
+        // blocks of a 4864-column weight across two threads).
         const INPUT_MAJOR_COLUMNS: usize = 2048;
-        if !transpose_b && n < threads * INPUT_MAJOR_COLUMNS && threads > 1 {
+        if !transpose_b
+            && threads > 1
+            && n < 2 * threads * INPUT_MAJOR_COLUMNS
+            && m * n * threads <= 1 << 20
+        {
             let tasks = threads.min(k.div_ceil(64)).max(1);
             let block = k.div_ceil(tasks);
             let mut partials = vec![0.0_f32; tasks * m * n];
@@ -320,12 +389,24 @@ impl NativeState {
             }
             return Some(HostTensor::new([m as u64, n as u64], out).map_err(KernelError::from));
         }
+        // Output-major: about eight tasks per thread, of whole groups of
+        // sixteen outputs (the decode kernels take them sixteen at a time).
+        // Input-major: one wide column block per thread, two when they stay
+        // wider than `WIDE_COLUMNS`: a task reads each row's run of its
+        // columns, and runs of a few thousand columns (a 151936-column LM
+        // head in 2000-column blocks) left the prefetchers behind (locally
+        // 27 against 47 GB/s).
+        const WIDE_COLUMNS: usize = 16384;
         let chunk = if transpose_b {
-            n.div_ceil(threads * 4).max(16)
+            n.div_ceil(16).div_ceil(threads * 8) * 16
         } else {
-            n.div_ceil(threads * 2).max(INPUT_MAJOR_COLUMNS)
-        }
-        .next_multiple_of(8);
+            let blocks = if n >= 2 * threads * WIDE_COLUMNS {
+                2 * threads
+            } else {
+                threads
+            };
+            n.div_ceil(blocks).next_multiple_of(16)
+        };
         let tasks = n.div_ceil(chunk);
         let shared = SharedOut(out.as_mut_ptr());
         let shared = &shared;
@@ -375,12 +456,20 @@ impl NativeState {
                     reason: format!("token id {raw_id} is not below the vocabulary size {vocab}"),
                 });
             }
-            let start = raw_id as usize * dim;
-            out.extend(
-                table.bits[start..start + dim]
-                    .iter()
-                    .map(|&bits| f32::from_bits(u32::from(bits) << 16)),
-            );
+            let token = raw_id as usize;
+            if table.transposed {
+                // A table held transposed (a vocabulary is taller than
+                // wide): the token's values are a column, one per stored
+                // row.
+                out.extend((0..dim).map(|col| table.get(token, col)));
+            } else {
+                let start = token * dim;
+                out.extend(
+                    table.bits[start..start + dim]
+                        .iter()
+                        .map(|&bits| f32::from_bits(u32::from(bits) << 16)),
+                );
+            }
         }
         HostTensor::new([ids.data.len() as u64, dim as u64], out).map_err(KernelError::from)
     }
@@ -808,11 +897,7 @@ impl NativeCpuExecutor {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&threads| threads > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|count| count.get())
-                    .unwrap_or(1)
-            });
+            .unwrap_or_else(topology::default_threads);
         let mut executor = Self::with_settings(
             std::env::var(PACKED_WEIGHTS_ENV).as_deref() != Ok("0"),
             std::env::var(INT8_ACTIVATIONS_ENV).as_deref() != Ok("0"),

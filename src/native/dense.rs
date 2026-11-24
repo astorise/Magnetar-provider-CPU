@@ -29,12 +29,12 @@ impl Values<'_> {
     }
 }
 
-/// Whether the dense kernels of several rows (a prefill, compute-bound)
-/// use AVX-512F (sixteen lanes) where the host has it, rather than the
-/// AVX2 baseline; `MAGNETAR_CPU_SIMD=avx2` keeps them on AVX2. A single
-/// row (a decode step) is bound by memory bandwidth and stays on AVX2:
-/// locally, the wider kernel was slower there (8.2 against 6.7 ms for the
-/// LM head) and faster with 8 rows (12.2 against 21.1 ms).
+/// Whether the dense kernels use AVX-512F (sixteen lanes) where the host
+/// has it, rather than the AVX2 baseline; `MAGNETAR_CPU_SIMD=avx2` keeps
+/// them on AVX2. Locally the wider kernels were faster with several rows
+/// (a prefill: 12.2 against 21.1 ms for the LM head with 8 rows) and, once
+/// a decode step's kernels streamed eight weight rows or sixteen outputs
+/// at a time, with one row too.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn avx512() -> bool {
     static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -69,7 +69,7 @@ pub(crate) fn output_major(
         // SAFETY: `SimdLevel::Avx2` is only reported when AVX2 and FMA are
         // available, and `avx512` only when AVX-512F is.
         unsafe {
-            if m > 1 && avx512() {
+            if avx512() {
                 avx512::output_major(a, m, k, weight, first, count, out);
             } else {
                 avx2::output_major(a, m, k, weight, first, count, out);
@@ -122,7 +122,7 @@ pub(crate) fn input_major(
     if level == SimdLevel::Avx2 {
         // SAFETY: as in `output_major`.
         unsafe {
-            if m > 1 && avx512() {
+            if avx512() {
                 avx512::input_major(a, m, k, rows, weight, n, first, count, out);
             } else {
                 avx2::input_major(a, m, k, rows, weight, n, first, count, out);
@@ -194,8 +194,34 @@ pub(in crate::native) mod avx2 {
                 let get = $get;
                 let whole = k - k % 8;
                 if m == 1 {
+                    // Eight outputs at a time: eight weight rows streamed
+                    // side by side, each activation vector loaded once for
+                    // all of them (one short row at a time left the
+                    // hardware prefetchers behind).
+                    let mut c = 0;
+                    while c + 8 <= count {
+                        let row = (first + c) * k;
+                        let mut acc = [_mm256_setzero_ps(); 8];
+                        let mut i = 0;
+                        while i < whole {
+                            let x = unsafe { _mm256_loadu_ps(a.as_ptr().add(i)) };
+                            for (j, acc) in acc.iter_mut().enumerate() {
+                                let w = unsafe { $load(weight, row + j * k + i) };
+                                *acc = _mm256_fmadd_ps(x, w, *acc);
+                            }
+                            i += 8;
+                        }
+                        for (j, acc) in acc.iter().enumerate() {
+                            let mut sum = sum8(*acc);
+                            for t in whole..k {
+                                sum = a[t].mul_add(get(weight, row + j * k + t), sum);
+                            }
+                            out[c + j] = sum;
+                        }
+                        c += 8;
+                    }
                     let wide = k - k % 32;
-                    for c in 0..count {
+                    for c in c..count {
                         let row = (first + c) * k;
                         let mut acc = [_mm256_setzero_ps(); 4];
                         let mut i = 0;
@@ -272,9 +298,41 @@ pub(in crate::native) mod avx2 {
             ) {
                 let get = $get;
                 let whole = count - count % 8;
+                let mut i = rows.start;
+                if m == 1 {
+                    // A decode step: eight weight rows per pass, so one
+                    // read and write of the output block serves eight.
+                    while i + 8 <= rows.end {
+                        let mut s = [_mm256_setzero_ps(); 8];
+                        let mut w = [0_usize; 8];
+                        for (j, (s, w)) in s.iter_mut().zip(&mut w).enumerate() {
+                            *s = _mm256_set1_ps(a[i + j]);
+                            *w = (i + j) * n + first;
+                        }
+                        let mut c = 0;
+                        while c < whole {
+                            unsafe {
+                                let at = out.as_mut_ptr().add(c);
+                                let mut acc = _mm256_loadu_ps(at);
+                                for (s, w) in s.iter().zip(&w) {
+                                    acc = _mm256_fmadd_ps(*s, $load(weight, w + c), acc);
+                                }
+                                _mm256_storeu_ps(at, acc);
+                            }
+                            c += 8;
+                        }
+                        for c in whole..count {
+                            let mut value = out[c];
+                            for (j, w) in w.iter().enumerate() {
+                                value = a[i + j].mul_add(get(weight, w + c), value);
+                            }
+                            out[c] = value;
+                        }
+                        i += 8;
+                    }
+                }
                 // Rows four at a time: one read and write of the output
                 // block serves four weight rows.
-                let mut i = rows.start;
                 while i + 4 <= rows.end {
                     let w = [
                         i * n + first,
@@ -478,8 +536,32 @@ pub(in crate::native) mod avx512 {
                 let get = $get;
                 let whole = k - k % 16;
                 if m == 1 {
+                    // Sixteen outputs at a time, as the AVX2 kernel takes
+                    // eight.
+                    let mut c = 0;
+                    while c + 16 <= count {
+                        let row = (first + c) * k;
+                        let mut acc = [_mm512_setzero_ps(); 16];
+                        let mut i = 0;
+                        while i < whole {
+                            let x = unsafe { _mm512_loadu_ps(a.as_ptr().add(i)) };
+                            for (j, acc) in acc.iter_mut().enumerate() {
+                                let w = unsafe { $load(weight, row + j * k + i) };
+                                *acc = _mm512_fmadd_ps(x, w, *acc);
+                            }
+                            i += 16;
+                        }
+                        for (j, acc) in acc.iter().enumerate() {
+                            let mut sum = sum16(*acc);
+                            for t in whole..k {
+                                sum = a[t].mul_add(get(weight, row + j * k + t), sum);
+                            }
+                            out[c + j] = sum;
+                        }
+                        c += 16;
+                    }
                     let wide = k - k % 64;
-                    for c in 0..count {
+                    for c in c..count {
                         let row = (first + c) * k;
                         let mut acc = [_mm512_setzero_ps(); 4];
                         let mut i = 0;
@@ -556,9 +638,41 @@ pub(in crate::native) mod avx512 {
             ) {
                 let get = $get;
                 let whole = count - count % 16;
+                let mut i = rows.start;
+                if m == 1 {
+                    // A decode step: eight weight rows per pass, so one
+                    // read and write of the output block serves eight.
+                    while i + 8 <= rows.end {
+                        let mut s = [_mm512_setzero_ps(); 8];
+                        let mut w = [0_usize; 8];
+                        for (j, (s, w)) in s.iter_mut().zip(&mut w).enumerate() {
+                            *s = _mm512_set1_ps(a[i + j]);
+                            *w = (i + j) * n + first;
+                        }
+                        let mut c = 0;
+                        while c < whole {
+                            unsafe {
+                                let at = out.as_mut_ptr().add(c);
+                                let mut acc = _mm512_loadu_ps(at);
+                                for (s, w) in s.iter().zip(&w) {
+                                    acc = _mm512_fmadd_ps(*s, $load(weight, w + c), acc);
+                                }
+                                _mm512_storeu_ps(at, acc);
+                            }
+                            c += 16;
+                        }
+                        for c in whole..count {
+                            let mut value = out[c];
+                            for (j, w) in w.iter().enumerate() {
+                                value = a[i + j].mul_add(get(weight, w + c), value);
+                            }
+                            out[c] = value;
+                        }
+                        i += 8;
+                    }
+                }
                 // Rows four at a time: one read and write of the output
                 // block serves four weight rows.
-                let mut i = rows.start;
                 while i + 4 <= rows.end {
                     let w = [
                         i * n + first,

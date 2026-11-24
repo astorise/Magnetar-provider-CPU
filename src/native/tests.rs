@@ -1250,3 +1250,167 @@ fn both_vector_widths_match_the_reference_cpu() {
         }
     }
 }
+
+/// Diagnostic: what one invocation of a decode step's small Kernels costs
+/// through the executor (input reads, the Kernel, the output write), next
+/// to the same Kernel's arithmetic alone.
+#[test]
+#[ignore = "timing diagnostic"]
+fn small_kernel_invocation_costs() {
+    use magnetar_core::operator::OperatorAttributeValue as Value;
+    let executor = NativeCpuExecutor::new();
+    let ids = ["gate", "up", "x", "norm", "w", "bias", "out"].map(TensorResourceId::new);
+    let gate = activations(1, 4864, 201);
+    let up = activations(1, 4864, 202);
+    let x = activations(1, 896, 203);
+    let norm = activations(1, 896, 204);
+    let norm = HostTensor::new([896], norm.data).unwrap();
+    let bias = HostTensor::new([128], activations(1, 128, 206).data).unwrap();
+    for (id, tensor) in [
+        (&ids[0], &gate),
+        (&ids[1], &up),
+        (&ids[2], &x),
+        (&ids[3], &norm),
+        (&ids[5], &bias),
+    ] {
+        executor
+            .reference()
+            .write_tensor(id.clone(), tensor.clone());
+    }
+    executor
+        .write_weight_tensor(ids[4].clone(), bf16_values(896, 128, 205))
+        .unwrap();
+    let time = |what: &str, invocation: &KernelInvocation| {
+        for _ in 0..200 {
+            executor.reference().run_invocation(invocation).unwrap();
+        }
+        let repeats = 5000;
+        let start = std::time::Instant::now();
+        for _ in 0..repeats {
+            executor.reference().run_invocation(invocation).unwrap();
+        }
+        println!(
+            "{what}: {:.1} us per invocation",
+            start.elapsed().as_secs_f64() / f64::from(repeats) * 1e6
+        );
+    };
+    let with_output = |invocation: KernelInvocation| invocation_writing(invocation, &ids[6]);
+    time(
+        "silu-mul [1, 4864]",
+        &with_output(invocation_reading("silu-mul", &[&ids[0], &ids[1]])),
+    );
+    let mut attributes = BTreeMap::new();
+    attributes.insert("epsilon".into(), Value::Float(1e-6));
+    time(
+        "rmsnorm [1, 896]",
+        &with_output(
+            invocation_reading("rmsnorm", &[&ids[2], &ids[3]]).with_attributes(attributes),
+        ),
+    );
+    time(
+        "matmul-bias [1, 896] x [896, 128]",
+        &with_output(invocation_reading(
+            "matmul-bias",
+            &[&ids[2], &ids[4], &ids[5]],
+        )),
+    );
+    // The arithmetic alone.
+    let repeats = 5000;
+    let start = std::time::Instant::now();
+    for _ in 0..repeats {
+        std::hint::black_box(crate::mul(&crate::silu(&gate), &up).unwrap());
+    }
+    println!(
+        "silu then mul alone: {:.1} us",
+        start.elapsed().as_secs_f64() / f64::from(repeats) * 1e6
+    );
+    let start = std::time::Instant::now();
+    for _ in 0..repeats {
+        std::hint::black_box(executor.reference().read_tensor(&ids[0]).unwrap());
+    }
+    println!(
+        "one [1, 4864] read: {:.1} us",
+        start.elapsed().as_secs_f64() / f64::from(repeats) * 1e6
+    );
+}
+
+/// `invocation` writing its output to `id`.
+fn invocation_writing(invocation: KernelInvocation, id: &TensorResourceId) -> KernelInvocation {
+    use magnetar_kernel::kernel::KernelResource;
+    invocation.with_output(KernelResource::new(
+        TensorResourceDescriptor::new(
+            id.clone(),
+            TensorDescriptor::materialized(
+                ShapeDescriptor::new(vec![1]),
+                DTypeDescriptor::portable(ComputeDType::Float32),
+            ),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        ),
+        KernelMemoryClass::Host,
+    ))
+}
+
+/// `gated-matmul` against compact, f32 and packed weights, for one and
+/// several rows, is the Reference CPU `silu(a x gate) * (a x up)`, and the
+/// optimized CPU Provider advertises it, so the Runtime fuses it there.
+#[test]
+fn gated_matmuls_match_the_reference_cpu() {
+    assert!(
+        native_cpu_kernel_advertisements()
+            .iter()
+            .any(|advertisement| advertisement.id.name == "gated-matmul")
+    );
+    let (k, n) = (256_u64, 640_u64);
+    for m in [1_u64, 5] {
+        for kind in ["compact", "f32", "packed"] {
+            let executor = NativeCpuExecutor::with_settings(true, false, 2);
+            let ids = ["a", "gate", "up", "out"].map(TensorResourceId::new);
+            let (gate, up) = match kind {
+                "packed" => {
+                    let gate = packed(PackedWeightFormat::Q8_0, n, k, true, 301);
+                    let up = packed(PackedWeightFormat::Q8_0, n, k, true, 302);
+                    let dense = (gate.dequantize(), up.dequantize());
+                    executor
+                        .write_packed_weight_tensor(ids[1].clone(), gate)
+                        .unwrap();
+                    executor
+                        .write_packed_weight_tensor(ids[2].clone(), up)
+                        .unwrap();
+                    dense
+                }
+                _ => {
+                    let (gate, up) = if kind == "compact" {
+                        (bf16_values(k, n, 303), bf16_values(k, n, 304))
+                    } else {
+                        (activations(k, n, 303), activations(k, n, 304))
+                    };
+                    executor
+                        .write_weight_tensor(ids[1].clone(), gate.clone())
+                        .unwrap();
+                    executor
+                        .write_weight_tensor(ids[2].clone(), up.clone())
+                        .unwrap();
+                    assert_eq!(executor.is_compact(&ids[1]), kind == "compact");
+                    (gate, up)
+                }
+            };
+            let a = activations(m, k, 305);
+            executor.reference().write_tensor(ids[0].clone(), a.clone());
+            let expected = crate::mul(
+                &crate::silu(&matmul(&a, &gate, false, false).unwrap()),
+                &matmul(&a, &up, false, false).unwrap(),
+            )
+            .unwrap();
+            let invocation = invocation_writing(
+                invocation_reading("gated-matmul", &[&ids[0], &ids[1], &ids[2]]),
+                &ids[3],
+            );
+            let actual = executor
+                .state
+                .run(executor.reference(), &invocation)
+                .expect("handled natively")
+                .unwrap();
+            assert_close(&actual, &expected, &format!("{kind}, {m} row(s)"));
+        }
+    }
+}

@@ -782,6 +782,39 @@ impl NativeState {
     }
 }
 
+/// `silu(gate) * up`, elementwise, into `gate`'s values: the Reference CPU
+/// `silu` then `mul`, value for value.
+fn silu_times(mut gate: HostTensor, up: &HostTensor) -> Result<HostTensor, KernelError> {
+    if gate.shape != up.shape {
+        return Err(KernelError::KernelExecutionFailed {
+            reason: format!(
+                "gated-matmul products differ in shape: {:?} and {:?}",
+                gate.shape, up.shape
+            ),
+        });
+    }
+    for (g, &u) in gate.data.iter_mut().zip(&up.data) {
+        *g = *g * (1.0 / (1.0 + (-*g).exp())) * u;
+    }
+    Ok(gate)
+}
+
+impl NativeState {
+    /// `a x W` for a matmul-family invocation whose weight is `id`: packed,
+    /// compact or f32; `None` for a form only the Reference CPU kernel takes.
+    fn weight_product(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+        id: &TensorResourceId,
+    ) -> Option<Result<HostTensor, KernelError>> {
+        match self.weight(id) {
+            Some(weight) => Some(self.matmul(executor, invocation, &weight)),
+            None => self.dense_matmul(executor, invocation, id),
+        }
+    }
+}
+
 impl PackedWeights for NativeState {
     fn run(
         &self,
@@ -790,11 +823,23 @@ impl PackedWeights for NativeState {
     ) -> Option<Result<HostTensor, KernelError>> {
         match invocation.kernel.name.as_str() {
             "matmul" | "matmul-bias" | "matmul-residual" => {
-                let id = &invocation.inputs.get(1)?.resource.id;
-                match self.weight(id) {
-                    Some(weight) => Some(self.matmul(executor, invocation, &weight)),
-                    None => self.dense_matmul(executor, invocation, id),
-                }
+                self.weight_product(executor, invocation, &invocation.inputs.get(1)?.resource.id)
+            }
+            // `silu(a x gate) * (a x up)`: both products as the matmul
+            // family computes them, then the activation in place, with no
+            // intermediate resource and no separate `silu-mul` Kernel.
+            "gated-matmul" => {
+                let gate = self.weight_product(
+                    executor,
+                    invocation,
+                    &invocation.inputs.get(1)?.resource.id,
+                )?;
+                let up = self.weight_product(
+                    executor,
+                    invocation,
+                    &invocation.inputs.get(2)?.resource.id,
+                )?;
+                Some(gate.and_then(|gate| up.and_then(|up| silu_times(gate, &up))))
             }
             "attention" => self.attention(executor, invocation),
             "embedding" => {

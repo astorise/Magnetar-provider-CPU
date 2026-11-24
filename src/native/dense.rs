@@ -256,30 +256,95 @@ pub(in crate::native) mod avx2 {
                     }
                     return;
                 }
-                for c in 0..count {
-                    let row = (first + c) * k;
-                    let mut r = 0;
-                    while r < m {
-                        let rows = (m - r).min(4);
-                        let mut acc = [_mm256_setzero_ps(); 4];
-                        let mut i = 0;
-                        while i < whole {
-                            let w = unsafe { $load(weight, row + i) };
-                            for (j, acc) in acc.iter_mut().enumerate().take(rows) {
-                                let x = unsafe { _mm256_loadu_ps(a.as_ptr().add((r + j) * k + i)) };
-                                *acc = _mm256_fmadd_ps(x, w, *acc);
-                            }
-                            i += 8;
+                // Several rows (a prefill): tiles of up to six rows of `a` by
+                // 2 outputs, accumulated in registers over the whole inner
+                // dimension; each weight vector loaded once serves every row
+                // of the tile.
+                #[inline]
+                #[target_feature(enable = "avx2,fma")]
+                #[allow(clippy::too_many_arguments)]
+                unsafe fn tile<const R: usize, const O: usize>(
+                    a: &[f32],
+                    k: usize,
+                    r0: usize,
+                    weight: &[$element],
+                    row: usize,
+                    whole: usize,
+                    out: &mut [f32],
+                    count: usize,
+                    c: usize,
+                ) {
+                    let get = $get;
+                    let mut acc = [[_mm256_setzero_ps(); O]; R];
+                    let mut i = 0;
+                    while i < whole {
+                        let mut w = [_mm256_setzero_ps(); O];
+                        for (o, w) in w.iter_mut().enumerate() {
+                            *w = unsafe { $load(weight, row + o * k + i) };
                         }
-                        for (j, acc) in acc.iter().enumerate().take(rows) {
+                        for (r, acc) in acc.iter_mut().enumerate() {
+                            let x = unsafe { _mm256_loadu_ps(a.as_ptr().add((r0 + r) * k + i)) };
+                            for (acc, w) in acc.iter_mut().zip(&w) {
+                                *acc = _mm256_fmadd_ps(x, *w, *acc);
+                            }
+                        }
+                        i += 8;
+                    }
+                    for (r, acc) in acc.iter().enumerate() {
+                        for (o, acc) in acc.iter().enumerate() {
                             let mut sum = sum8(*acc);
                             for t in whole..k {
-                                sum = a[(r + j) * k + t].mul_add(get(weight, row + t), sum);
+                                sum =
+                                    a[(r0 + r) * k + t].mul_add(get(weight, row + o * k + t), sum);
                             }
-                            out[(r + j) * count + c] = sum;
+                            out[(r0 + r) * count + c + o] = sum;
                         }
-                        r += rows;
                     }
+                }
+                #[inline]
+                #[target_feature(enable = "avx2,fma")]
+                #[allow(clippy::too_many_arguments)]
+                unsafe fn tiles<const O: usize>(
+                    rows: usize,
+                    a: &[f32],
+                    k: usize,
+                    r0: usize,
+                    weight: &[$element],
+                    row: usize,
+                    whole: usize,
+                    out: &mut [f32],
+                    count: usize,
+                    c: usize,
+                ) {
+                    unsafe {
+                        match rows {
+                            1 => tile::<1, O>(a, k, r0, weight, row, whole, out, count, c),
+                            2 => tile::<2, O>(a, k, r0, weight, row, whole, out, count, c),
+                            3 => tile::<3, O>(a, k, r0, weight, row, whole, out, count, c),
+                            4 => tile::<4, O>(a, k, r0, weight, row, whole, out, count, c),
+                            5 => tile::<5, O>(a, k, r0, weight, row, whole, out, count, c),
+                            _ => tile::<6, O>(a, k, r0, weight, row, whole, out, count, c),
+                        }
+                    }
+                }
+                let mut r0 = 0;
+                while r0 < m {
+                    let rows = (m - r0).min(6);
+                    let mut c = 0;
+                    while c < count {
+                        let row = (first + c) * k;
+                        // SAFETY: as for this function.
+                        unsafe {
+                            if c + 2 <= count {
+                                tiles::<2>(rows, a, k, r0, weight, row, whole, out, count, c);
+                                c += 2;
+                            } else {
+                                tiles::<1>(rows, a, k, r0, weight, row, whole, out, count, c);
+                                c += 1;
+                            }
+                        }
+                    }
+                    r0 += rows;
                 }
             }
 
@@ -298,6 +363,141 @@ pub(in crate::native) mod avx2 {
             ) {
                 let get = $get;
                 let whole = count - count % 8;
+                if m > 1 {
+                    // Several rows (a prefill): tiles of up to six rows of
+                    // `a` by 2 vectors of output columns, accumulated in
+                    // registers across the whole row range; each weight vector
+                    // loaded once serves every row of the tile.
+                    #[inline]
+                    #[target_feature(enable = "avx2,fma")]
+                    #[allow(clippy::too_many_arguments)]
+                    unsafe fn tile<const R: usize, const V: usize>(
+                        a: &[f32],
+                        k: usize,
+                        r0: usize,
+                        rows: std::ops::Range<usize>,
+                        weight: &[$element],
+                        n: usize,
+                        col: usize,
+                        out: &mut [f32],
+                        at: usize,
+                        count: usize,
+                    ) {
+                        let mut acc = [[_mm256_setzero_ps(); V]; R];
+                        for i in rows {
+                            let mut w = [_mm256_setzero_ps(); V];
+                            for (v, w) in w.iter_mut().enumerate() {
+                                *w = unsafe { $load(weight, i * n + col + 8 * v) };
+                            }
+                            for (r, acc) in acc.iter_mut().enumerate() {
+                                let s =
+                                    _mm256_set1_ps(unsafe { *a.as_ptr().add((r0 + r) * k + i) });
+                                for (acc, w) in acc.iter_mut().zip(&w) {
+                                    *acc = _mm256_fmadd_ps(s, *w, *acc);
+                                }
+                            }
+                        }
+                        for (r, acc) in acc.iter().enumerate() {
+                            for (v, acc) in acc.iter().enumerate() {
+                                let offset = (r0 + r) * count + at + 8 * v;
+                                assert!(offset + 8 <= out.len());
+                                unsafe {
+                                    let p = out.as_mut_ptr().add(offset);
+                                    _mm256_storeu_ps(p, _mm256_add_ps(_mm256_loadu_ps(p), *acc));
+                                }
+                            }
+                        }
+                    }
+                    #[inline]
+                    #[target_feature(enable = "avx2,fma")]
+                    #[allow(clippy::too_many_arguments)]
+                    unsafe fn tiles<const V: usize>(
+                        tile_rows: usize,
+                        a: &[f32],
+                        k: usize,
+                        r0: usize,
+                        rows: std::ops::Range<usize>,
+                        weight: &[$element],
+                        n: usize,
+                        col: usize,
+                        out: &mut [f32],
+                        at: usize,
+                        count: usize,
+                    ) {
+                        unsafe {
+                            match tile_rows {
+                                1 => tile::<1, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                                2 => tile::<2, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                                3 => tile::<3, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                                4 => tile::<4, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                                5 => tile::<5, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                                _ => tile::<6, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                            }
+                        }
+                    }
+                    let mut r0 = 0;
+                    while r0 < m {
+                        let tile_rows = (m - r0).min(6);
+                        // Blocks of 32 weight rows: a tile reads each row of
+                        // its block at a stride of a whole weight row, so a
+                        // block bounds the pages and streams one tile touches
+                        // (unblocked, a wide weight read one page per load).
+                        let mut start = rows.start;
+                        while start < rows.end {
+                            let block = start..(start + 32).min(rows.end);
+                            let mut c = 0;
+                            // SAFETY: as for this function.
+                            unsafe {
+                                while c + 16 <= whole {
+                                    tiles::<2>(
+                                        tile_rows,
+                                        a,
+                                        k,
+                                        r0,
+                                        block.clone(),
+                                        weight,
+                                        n,
+                                        first + c,
+                                        out,
+                                        c,
+                                        count,
+                                    );
+                                    c += 16;
+                                }
+                                while c < whole {
+                                    tiles::<1>(
+                                        tile_rows,
+                                        a,
+                                        k,
+                                        r0,
+                                        block.clone(),
+                                        weight,
+                                        n,
+                                        first + c,
+                                        out,
+                                        c,
+                                        count,
+                                    );
+                                    c += 8;
+                                }
+                            }
+                            start = block.end;
+                        }
+                        for r in r0..r0 + tile_rows {
+                            for i in rows.clone() {
+                                let scale = a[r * k + i];
+                                for c in whole..count {
+                                    out[r * count + c] = scale.mul_add(
+                                        get(weight, i * n + first + c),
+                                        out[r * count + c],
+                                    );
+                                }
+                            }
+                        }
+                        r0 += tile_rows;
+                    }
+                    return;
+                }
                 let mut i = rows.start;
                 if m == 1 {
                     // A decode step: eight weight rows per pass, so one
@@ -340,7 +540,7 @@ pub(in crate::native) mod avx2 {
                         (i + 2) * n + first,
                         (i + 3) * n + first,
                     ];
-                    if m == 1 {
+                    {
                         // One row (a decode step): its four scales once, then
                         // each block of eight columns read and written once.
                         let x = &a[i..i + 4];
@@ -359,37 +559,6 @@ pub(in crate::native) mod avx2 {
                                     acc = _mm256_fmadd_ps(s[j], $load(weight, w[j] + c), acc);
                                 }
                                 _mm256_storeu_ps(at, acc);
-                            }
-                            c += 8;
-                        }
-                    } else {
-                        // Several rows (a prefill): each block of eight
-                        // columns of the four weight rows is loaded (and
-                        // widened) once and serves every row of `a`.
-                        let mut c = 0;
-                        while c < whole {
-                            let wv = unsafe {
-                                [
-                                    $load(weight, w[0] + c),
-                                    $load(weight, w[1] + c),
-                                    $load(weight, w[2] + c),
-                                    $load(weight, w[3] + c),
-                                ]
-                            };
-                            for r in 0..m {
-                                unsafe {
-                                    let x = a.as_ptr().add(r * k + i);
-                                    let at = out.as_mut_ptr().add(r * count + c);
-                                    let mut acc = _mm256_loadu_ps(at);
-                                    for j in 0..4 {
-                                        acc = _mm256_fmadd_ps(
-                                            _mm256_broadcast_ss(&*x.add(j)),
-                                            wv[j],
-                                            acc,
-                                        );
-                                    }
-                                    _mm256_storeu_ps(at, acc);
-                                }
                             }
                             c += 8;
                         }
@@ -596,30 +765,95 @@ pub(in crate::native) mod avx512 {
                     }
                     return;
                 }
-                for c in 0..count {
-                    let row = (first + c) * k;
-                    let mut r = 0;
-                    while r < m {
-                        let rows = (m - r).min(4);
-                        let mut acc = [_mm512_setzero_ps(); 4];
-                        let mut i = 0;
-                        while i < whole {
-                            let w = unsafe { $load(weight, row + i) };
-                            for (j, acc) in acc.iter_mut().enumerate().take(rows) {
-                                let x = unsafe { _mm512_loadu_ps(a.as_ptr().add((r + j) * k + i)) };
-                                *acc = _mm512_fmadd_ps(x, w, *acc);
-                            }
-                            i += 16;
+                // Several rows (a prefill): tiles of up to six rows of `a` by
+                // 4 outputs, accumulated in registers over the whole inner
+                // dimension; each weight vector loaded once serves every row
+                // of the tile.
+                #[inline]
+                #[target_feature(enable = "avx512f")]
+                #[allow(clippy::too_many_arguments)]
+                unsafe fn tile<const R: usize, const O: usize>(
+                    a: &[f32],
+                    k: usize,
+                    r0: usize,
+                    weight: &[$element],
+                    row: usize,
+                    whole: usize,
+                    out: &mut [f32],
+                    count: usize,
+                    c: usize,
+                ) {
+                    let get = $get;
+                    let mut acc = [[_mm512_setzero_ps(); O]; R];
+                    let mut i = 0;
+                    while i < whole {
+                        let mut w = [_mm512_setzero_ps(); O];
+                        for (o, w) in w.iter_mut().enumerate() {
+                            *w = unsafe { $load(weight, row + o * k + i) };
                         }
-                        for (j, acc) in acc.iter().enumerate().take(rows) {
+                        for (r, acc) in acc.iter_mut().enumerate() {
+                            let x = unsafe { _mm512_loadu_ps(a.as_ptr().add((r0 + r) * k + i)) };
+                            for (acc, w) in acc.iter_mut().zip(&w) {
+                                *acc = _mm512_fmadd_ps(x, *w, *acc);
+                            }
+                        }
+                        i += 16;
+                    }
+                    for (r, acc) in acc.iter().enumerate() {
+                        for (o, acc) in acc.iter().enumerate() {
                             let mut sum = sum16(*acc);
                             for t in whole..k {
-                                sum = a[(r + j) * k + t].mul_add(get(weight, row + t), sum);
+                                sum =
+                                    a[(r0 + r) * k + t].mul_add(get(weight, row + o * k + t), sum);
                             }
-                            out[(r + j) * count + c] = sum;
+                            out[(r0 + r) * count + c + o] = sum;
                         }
-                        r += rows;
                     }
+                }
+                #[inline]
+                #[target_feature(enable = "avx512f")]
+                #[allow(clippy::too_many_arguments)]
+                unsafe fn tiles<const O: usize>(
+                    rows: usize,
+                    a: &[f32],
+                    k: usize,
+                    r0: usize,
+                    weight: &[$element],
+                    row: usize,
+                    whole: usize,
+                    out: &mut [f32],
+                    count: usize,
+                    c: usize,
+                ) {
+                    unsafe {
+                        match rows {
+                            1 => tile::<1, O>(a, k, r0, weight, row, whole, out, count, c),
+                            2 => tile::<2, O>(a, k, r0, weight, row, whole, out, count, c),
+                            3 => tile::<3, O>(a, k, r0, weight, row, whole, out, count, c),
+                            4 => tile::<4, O>(a, k, r0, weight, row, whole, out, count, c),
+                            5 => tile::<5, O>(a, k, r0, weight, row, whole, out, count, c),
+                            _ => tile::<6, O>(a, k, r0, weight, row, whole, out, count, c),
+                        }
+                    }
+                }
+                let mut r0 = 0;
+                while r0 < m {
+                    let rows = (m - r0).min(6);
+                    let mut c = 0;
+                    while c < count {
+                        let row = (first + c) * k;
+                        // SAFETY: as for this function.
+                        unsafe {
+                            if c + 4 <= count {
+                                tiles::<4>(rows, a, k, r0, weight, row, whole, out, count, c);
+                                c += 4;
+                            } else {
+                                tiles::<1>(rows, a, k, r0, weight, row, whole, out, count, c);
+                                c += 1;
+                            }
+                        }
+                    }
+                    r0 += rows;
                 }
             }
 
@@ -638,6 +872,141 @@ pub(in crate::native) mod avx512 {
             ) {
                 let get = $get;
                 let whole = count - count % 16;
+                if m > 1 {
+                    // Several rows (a prefill): tiles of up to six rows of
+                    // `a` by 4 vectors of output columns, accumulated in
+                    // registers across the whole row range; each weight vector
+                    // loaded once serves every row of the tile.
+                    #[inline]
+                    #[target_feature(enable = "avx512f")]
+                    #[allow(clippy::too_many_arguments)]
+                    unsafe fn tile<const R: usize, const V: usize>(
+                        a: &[f32],
+                        k: usize,
+                        r0: usize,
+                        rows: std::ops::Range<usize>,
+                        weight: &[$element],
+                        n: usize,
+                        col: usize,
+                        out: &mut [f32],
+                        at: usize,
+                        count: usize,
+                    ) {
+                        let mut acc = [[_mm512_setzero_ps(); V]; R];
+                        for i in rows {
+                            let mut w = [_mm512_setzero_ps(); V];
+                            for (v, w) in w.iter_mut().enumerate() {
+                                *w = unsafe { $load(weight, i * n + col + 16 * v) };
+                            }
+                            for (r, acc) in acc.iter_mut().enumerate() {
+                                let s =
+                                    _mm512_set1_ps(unsafe { *a.as_ptr().add((r0 + r) * k + i) });
+                                for (acc, w) in acc.iter_mut().zip(&w) {
+                                    *acc = _mm512_fmadd_ps(s, *w, *acc);
+                                }
+                            }
+                        }
+                        for (r, acc) in acc.iter().enumerate() {
+                            for (v, acc) in acc.iter().enumerate() {
+                                let offset = (r0 + r) * count + at + 16 * v;
+                                assert!(offset + 16 <= out.len());
+                                unsafe {
+                                    let p = out.as_mut_ptr().add(offset);
+                                    _mm512_storeu_ps(p, _mm512_add_ps(_mm512_loadu_ps(p), *acc));
+                                }
+                            }
+                        }
+                    }
+                    #[inline]
+                    #[target_feature(enable = "avx512f")]
+                    #[allow(clippy::too_many_arguments)]
+                    unsafe fn tiles<const V: usize>(
+                        tile_rows: usize,
+                        a: &[f32],
+                        k: usize,
+                        r0: usize,
+                        rows: std::ops::Range<usize>,
+                        weight: &[$element],
+                        n: usize,
+                        col: usize,
+                        out: &mut [f32],
+                        at: usize,
+                        count: usize,
+                    ) {
+                        unsafe {
+                            match tile_rows {
+                                1 => tile::<1, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                                2 => tile::<2, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                                3 => tile::<3, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                                4 => tile::<4, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                                5 => tile::<5, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                                _ => tile::<6, V>(a, k, r0, rows, weight, n, col, out, at, count),
+                            }
+                        }
+                    }
+                    let mut r0 = 0;
+                    while r0 < m {
+                        let tile_rows = (m - r0).min(6);
+                        // Blocks of 32 weight rows: a tile reads each row of
+                        // its block at a stride of a whole weight row, so a
+                        // block bounds the pages and streams one tile touches
+                        // (unblocked, a wide weight read one page per load).
+                        let mut start = rows.start;
+                        while start < rows.end {
+                            let block = start..(start + 32).min(rows.end);
+                            let mut c = 0;
+                            // SAFETY: as for this function.
+                            unsafe {
+                                while c + 64 <= whole {
+                                    tiles::<4>(
+                                        tile_rows,
+                                        a,
+                                        k,
+                                        r0,
+                                        block.clone(),
+                                        weight,
+                                        n,
+                                        first + c,
+                                        out,
+                                        c,
+                                        count,
+                                    );
+                                    c += 64;
+                                }
+                                while c < whole {
+                                    tiles::<1>(
+                                        tile_rows,
+                                        a,
+                                        k,
+                                        r0,
+                                        block.clone(),
+                                        weight,
+                                        n,
+                                        first + c,
+                                        out,
+                                        c,
+                                        count,
+                                    );
+                                    c += 16;
+                                }
+                            }
+                            start = block.end;
+                        }
+                        for r in r0..r0 + tile_rows {
+                            for i in rows.clone() {
+                                let scale = a[r * k + i];
+                                for c in whole..count {
+                                    out[r * count + c] = scale.mul_add(
+                                        get(weight, i * n + first + c),
+                                        out[r * count + c],
+                                    );
+                                }
+                            }
+                        }
+                        r0 += tile_rows;
+                    }
+                    return;
+                }
                 let mut i = rows.start;
                 if m == 1 {
                     // A decode step: eight weight rows per pass, so one
@@ -680,7 +1049,7 @@ pub(in crate::native) mod avx512 {
                         (i + 2) * n + first,
                         (i + 3) * n + first,
                     ];
-                    if m == 1 {
+                    {
                         // One row (a decode step): its four scales once, then
                         // each block of sixteen columns read and written once.
                         let x = &a[i..i + 4];
@@ -699,34 +1068,6 @@ pub(in crate::native) mod avx512 {
                                     acc = _mm512_fmadd_ps(s[j], $load(weight, w[j] + c), acc);
                                 }
                                 _mm512_storeu_ps(at, acc);
-                            }
-                            c += 16;
-                        }
-                    } else {
-                        // Several rows (a prefill): each block of sixteen
-                        // columns of the four weight rows is loaded (and
-                        // widened) once and serves every row of `a`.
-                        let mut c = 0;
-                        while c < whole {
-                            let wv = unsafe {
-                                [
-                                    $load(weight, w[0] + c),
-                                    $load(weight, w[1] + c),
-                                    $load(weight, w[2] + c),
-                                    $load(weight, w[3] + c),
-                                ]
-                            };
-                            for r in 0..m {
-                                unsafe {
-                                    let x = a.as_ptr().add(r * k + i);
-                                    let at = out.as_mut_ptr().add(r * count + c);
-                                    let mut acc = _mm512_loadu_ps(at);
-                                    for j in 0..4 {
-                                        acc =
-                                            _mm512_fmadd_ps(_mm512_set1_ps(*x.add(j)), wv[j], acc);
-                                    }
-                                    _mm512_storeu_ps(at, acc);
-                                }
                             }
                             c += 16;
                         }

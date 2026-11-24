@@ -9,6 +9,8 @@
 //! - [`PACKED_WEIGHTS_ENV`] `=0` declines packed weights (f32 at load);
 //! - [`INT8_ACTIVATIONS_ENV`] `=0` keeps f32 activations;
 //! - [`THREADS_ENV`] bounds the worker pool;
+//! - [`DECODE_THREADS_ENV`] runs one-row Kernels (a decode step) on a pool
+//!   of their own, of that many threads;
 //! - [`SIMD_ENV`] `=scalar` disables the vector kernels;
 //! - [`COMPACT_WEIGHTS_ENV`] `=0` keeps every dense weight f32 instead of
 //!   storing an exact bfloat16 one as its bfloat16 bits ([`dense`]);
@@ -30,6 +32,11 @@ pub const NATIVE_CPU_PROVIDER_VERSION: &str = "0.1.0";
 pub const PACKED_WEIGHTS_ENV: &str = "MAGNETAR_CPU_PACKED_WEIGHTS";
 pub const INT8_ACTIVATIONS_ENV: &str = "MAGNETAR_CPU_INT8_ACTIVATIONS";
 pub const THREADS_ENV: &str = "MAGNETAR_CPU_THREADS";
+/// A positive count runs one-row Kernels (a decode step, memory-bound) on
+/// a pool of their own of that many threads, while Kernels of several rows
+/// (a prefill, compute-bound) keep [`THREADS_ENV`]'s pool: a core's second
+/// hardware thread helps a prefill and can slow a decode step.
+pub const DECODE_THREADS_ENV: &str = "MAGNETAR_CPU_DECODE_THREADS";
 pub const SIMD_ENV: &str = "MAGNETAR_CPU_SIMD";
 pub const COMPACT_WEIGHTS_ENV: &str = "MAGNETAR_CPU_COMPACT_WEIGHTS";
 pub const STEP_CAPTURE_ENV: &str = "MAGNETAR_CPU_STEP_CAPTURE";
@@ -194,6 +201,9 @@ struct NativeState {
     /// are the only ones read (`capture-cpu-steps`).
     padding_rows: std::sync::atomic::AtomicUsize,
     pool: pool::Pool,
+    /// The pool one-row Kernels run on, when it is not `pool`
+    /// ([`DECODE_THREADS_ENV`]).
+    decode_pool: Option<pool::Pool>,
     int8_activations: bool,
     /// Packed weights expanded to f32 for a caller or Kernel without a
     /// packed path: count and seconds (reported with [`PROFILE_ENV`]).
@@ -292,6 +302,14 @@ impl Computed {
 }
 
 impl NativeState {
+    /// The pool a Kernel over `rows` rows of activations runs on.
+    fn pool_for(&self, rows: usize) -> &pool::Pool {
+        match &self.decode_pool {
+            Some(pool) if rows == 1 => pool,
+            _ => &self.pool,
+        }
+    }
+
     fn weight(&self, id: &TensorResourceId) -> Option<Arc<PackedWeight>> {
         self.packed.lock().unwrap().get(id).cloned()
     }
@@ -479,7 +497,7 @@ impl NativeState {
         if inner != k || m == 0 || n == 0 || k == 0 {
             return None;
         }
-        let threads = self.pool.threads();
+        let threads = self.pool_for(m).threads();
         // An input-major weight narrower than twice `INPUT_MAJOR_COLUMNS`
         // per thread is shared out by blocks of whole rows (contiguous
         // reads), each task summing its block into a partial product (of
@@ -547,7 +565,8 @@ impl NativeState {
             .collect();
         let shared = &shared;
         let total = products.iter().map(|product| product.split.tasks()).sum();
-        self.pool.run(total, &|mut task| {
+        let rows = products.first().map_or(1, |product| product.m);
+        self.pool_for(rows).run(total, &|mut task| {
             let mut index = 0;
             while task >= products[index].split.tasks() {
                 task -= products[index].split.tasks();
@@ -682,11 +701,12 @@ impl NativeState {
             k,
         };
         let mut out = vec![0.0_f32; m * n];
-        let chunk = n.div_ceil(self.pool.threads() * 4).max(8);
+        let pool = self.pool_for(m);
+        let chunk = n.div_ceil(pool.threads() * 4).max(8);
         let tasks = n.div_ceil(chunk);
         let shared = SharedOut(out.as_mut_ptr());
         let shared = &shared;
-        self.pool.run(tasks, &|task| {
+        pool.run(tasks, &|task| {
             let first = task * chunk;
             let count = chunk.min(n - first);
             let mut local = vec![0.0_f32; m * count];
@@ -720,12 +740,13 @@ impl NativeState {
         }
         let reader = quant::RunReader::new(weight);
         let runs = n / quant::RUN;
-        let chunk = runs.div_ceil(self.pool.threads() * 4).max(1);
+        let pool = self.pool_for(m);
+        let chunk = runs.div_ceil(pool.threads() * 4).max(1);
         let tasks = runs.div_ceil(chunk);
         let mut out = vec![0.0_f32; m * n];
         let shared = SharedOut(out.as_mut_ptr());
         let shared = &shared;
-        self.pool.run(tasks, &|task| {
+        pool.run(tasks, &|task| {
             let first_run = task * chunk;
             let run_count = chunk.min(runs - first_run);
             let width = run_count * quant::RUN;
@@ -888,11 +909,12 @@ impl NativeState {
         let offset = kv_len - seq_len;
         let pairs = head_count as usize * seq_len;
         let mut out = vec![0.0_f32; seq_len * q_width];
-        let chunk = pairs.div_ceil(self.pool.threads() * 4).max(1);
+        let pool = self.pool_for(seq_len);
+        let chunk = pairs.div_ceil(pool.threads() * 4).max(1);
         let shared = SharedOut(out.as_mut_ptr());
         let shared = &shared;
         let (q, k, v) = (&q.data, &k.data, &v.data);
-        self.pool.run(pairs.div_ceil(chunk), &|task| {
+        pool.run(pairs.div_ceil(chunk), &|task| {
             let mut weights = Vec::with_capacity(kv_len);
             let mut row = vec![0.0_f32; dim];
             for pair in task * chunk..((task + 1) * chunk).min(pairs) {
@@ -1307,10 +1329,11 @@ impl NativeState {
         let (gate, up) = (&computed[0], &computed[1]);
         let len = m * n;
         let mut out = vec![0.0_f32; len];
-        let chunk = len.div_ceil(self.pool.threads()).next_multiple_of(64);
+        let pool = self.pool_for(m);
+        let chunk = len.div_ceil(pool.threads()).next_multiple_of(64);
         let shared = SharedOut(out.as_mut_ptr());
         let shared = &shared;
-        self.pool.run(len.div_ceil(chunk), &|task| {
+        pool.run(len.div_ceil(chunk), &|task| {
             for index in task * chunk..((task + 1) * chunk).min(len) {
                 let g = gate.get(len, index);
                 let u = up.get(len, index);
@@ -1477,10 +1500,15 @@ impl NativeCpuExecutor {
                     .map(|count| count.get())
                     .unwrap_or(1)
             });
-        let mut executor = Self::with_settings(
+        let decode_threads = std::env::var(DECODE_THREADS_ENV)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&decode| decode > 0 && decode != threads);
+        let mut executor = Self::with_pools(
             std::env::var(PACKED_WEIGHTS_ENV).as_deref() != Ok("0"),
             std::env::var(INT8_ACTIVATIONS_ENV).as_deref() != Ok("0"),
             threads,
+            decode_threads,
         );
         executor.compact_weights = std::env::var(COMPACT_WEIGHTS_ENV).as_deref() != Ok("0");
         executor.step_capture = std::env::var(STEP_CAPTURE_ENV).as_deref() != Ok("0");
@@ -1489,11 +1517,24 @@ impl NativeCpuExecutor {
 
     /// An executor with explicit controls (tests, embedders).
     pub fn with_settings(packed_weights: bool, int8_activations: bool, threads: usize) -> Self {
+        Self::with_pools(packed_weights, int8_activations, threads, None)
+    }
+
+    /// [`Self::with_settings`], one-row Kernels running on a pool of
+    /// `decode_threads` threads of their own when it is given
+    /// ([`DECODE_THREADS_ENV`]).
+    pub fn with_pools(
+        packed_weights: bool,
+        int8_activations: bool,
+        threads: usize,
+        decode_threads: Option<usize>,
+    ) -> Self {
         let state = Arc::new(NativeState {
             packed: Mutex::new(BTreeMap::new()),
             compact: Mutex::new(BTreeMap::new()),
             padding_rows: std::sync::atomic::AtomicUsize::new(0),
             pool: pool::Pool::new(threads),
+            decode_pool: decode_threads.map(pool::Pool::new),
             int8_activations,
             materialized: Mutex::new((0, 0.0)),
         });

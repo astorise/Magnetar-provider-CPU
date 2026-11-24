@@ -108,6 +108,7 @@ fn state(int8: bool, threads: usize) -> NativeState {
         compact: Mutex::new(BTreeMap::new()),
         padding_rows: std::sync::atomic::AtomicUsize::new(0),
         pool: pool::Pool::new(threads),
+        decode_pool: None,
         int8_activations: int8,
         materialized: Mutex::new((0, 0.0)),
     }
@@ -1805,4 +1806,64 @@ fn greedy_columns_match_a_one_by_one_scan() {
     assert_eq!(greedy_column(&[1.0, 2.0], &[0..1, 1..5], 0.0), None);
     assert_eq!(greedy_column(&[], &[], 0.0), None);
     assert_eq!(greedy_column(&[f32::NAN, f32::INFINITY], &[], 0.0), None);
+}
+
+/// `MAGNETAR_CPU_DECODE_THREADS`: one-row Kernels run on the decode pool,
+/// Kernels of several rows on the main pool, both with the Reference
+/// values.
+#[test]
+fn one_row_kernels_run_on_the_decode_pool() {
+    let executor = NativeCpuExecutor::with_pools(true, false, 4, Some(2));
+    assert_eq!(executor.state.pool_for(1).threads(), 2);
+    assert_eq!(executor.state.pool_for(3).threads(), 4);
+    assert_eq!(
+        NativeCpuExecutor::with_settings(true, false, 4)
+            .state
+            .pool_for(1)
+            .threads(),
+        4
+    );
+    let (k, n) = (256_u64, 640_u64);
+    let ids = ["a", "gate", "up", "out"].map(TensorResourceId::new);
+    let (gate, up) = (bf16_values(k, n, 311), bf16_values(k, n, 312));
+    executor
+        .write_weight_tensor(ids[1].clone(), gate.clone())
+        .unwrap();
+    executor
+        .write_weight_tensor(ids[2].clone(), up.clone())
+        .unwrap();
+    for m in [1_u64, 3] {
+        let a = activations(m, k, 313);
+        executor.reference().write_tensor(ids[0].clone(), a.clone());
+        let product = executor
+            .state
+            .run(
+                executor.reference(),
+                &invocation_writing(invocation_reading("matmul", &[&ids[0], &ids[1]]), &ids[3]),
+            )
+            .expect("handled natively")
+            .unwrap();
+        assert_close(
+            &product,
+            &matmul(&a, &gate, false, false).unwrap(),
+            &format!("matmul, {m} row(s)"),
+        );
+        let gated = executor
+            .state
+            .run(
+                executor.reference(),
+                &invocation_writing(
+                    invocation_reading("gated-matmul", &[&ids[0], &ids[1], &ids[2]]),
+                    &ids[3],
+                ),
+            )
+            .expect("handled natively")
+            .unwrap();
+        let expected = crate::mul(
+            &crate::silu(&matmul(&a, &gate, false, false).unwrap()),
+            &matmul(&a, &up, false, false).unwrap(),
+        )
+        .unwrap();
+        assert_close(&gated, &expected, &format!("gated-matmul, {m} row(s)"));
+    }
 }

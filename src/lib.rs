@@ -113,12 +113,14 @@ use magnetar_core::{
     device::DeviceMetadata, device::DeviceType,
 };
 use magnetar_core::{
-    operator::ATTENTION_LATENT_KV_FEATURE, operator::ATTENTION_SCALE_FEATURE,
-    operator::ATTENTION_TURBOQUANT_KV_FEATURE, operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
+    operator::ACTIVATION_RELU_SQUARED_FEATURE, operator::ATTENTION_LATENT_KV_FEATURE,
+    operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_TURBOQUANT_KV_FEATURE,
+    operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
     operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
     operator::ConcatAxis, operator::EMBEDDING_SCALE_FEATURE,
     operator::KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE, operator::KV_WRITE_TURBOQUANT_FEATURE,
     operator::MOE_EXPERTS_ACTIVATION_FEATURE, operator::MOE_PER_EXPERT_SCALE_FEATURE,
+    operator::MOE_RELU_SQUARED_FEATURE, operator::MOE_SIGMOID_ROUTING_FEATURE,
     operator::OperatorAttributeValue, operator::OperatorFamily, operator::OperatorId,
     operator::OperatorSpec, operator::RMSNORM_PER_HEAD_FEATURE,
     operator::RMSNORM_WITHOUT_WEIGHT_FEATURE, operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
@@ -1432,7 +1434,12 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
     let moe_experts = with_features(
         "moe-experts",
         OperatorFamily::LinearAlgebra,
-        &[MOE_EXPERTS_ACTIVATION_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE],
+        &[
+            MOE_EXPERTS_ACTIVATION_FEATURE,
+            MOE_PER_EXPERT_SCALE_FEATURE,
+            MOE_SIGMOID_ROUTING_FEATURE,
+            MOE_RELU_SQUARED_FEATURE,
+        ],
     );
     let rope = with_features(
         "rope",
@@ -1460,10 +1467,28 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         rmsnorm,
         rope,
         attention,
+        baseline_advertisement("encoder-attention", OperatorFamily::Attention),
+        baseline_advertisement("differential-attention", OperatorFamily::Attention),
+        baseline_advertisement(
+            "projected-differential-attention",
+            OperatorFamily::Attention,
+        ),
+        baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("gated-delta-mixer", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("mamba3-mimo", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("mamba3-mixer", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("token-shift", OperatorFamily::Tensor),
+        baseline_advertisement("affine-layernorm", OperatorFamily::Normalization),
+        baseline_advertisement("gelu-exact", OperatorFamily::Activation),
+        baseline_advertisement("slice-last", OperatorFamily::Tensor),
         baseline_advertisement("softmax", OperatorFamily::Activation),
         baseline_advertisement("silu", OperatorFamily::Activation),
         baseline_advertisement("gelu", OperatorFamily::Activation),
-        baseline_advertisement("activation", OperatorFamily::Activation),
+        with_features(
+            "activation",
+            OperatorFamily::Activation,
+            &[ACTIVATION_RELU_SQUARED_FEATURE],
+        ),
         baseline_advertisement("add", OperatorFamily::Tensor),
         concat,
         // Creates and writes TurboQuant stores (`turboquant-kv-history`),
@@ -1478,6 +1503,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         ),
         baseline_advertisement("mul", OperatorFamily::Tensor),
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
+        baseline_advertisement("geodesic-residual", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
         baseline_advertisement("layout-conversion", OperatorFamily::Layout),
     ]
@@ -2527,6 +2553,16 @@ impl ReferenceCpuExecutor {
 
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
+        if matches!(name, "affine-layernorm" | "gelu-exact" | "slice-last")
+            && invocation.outputs.iter().any(|output| {
+                invocation
+                    .inputs
+                    .iter()
+                    .any(|input| input.resource.id == output.resource.id)
+            })
+        {
+            return Err(KernelError::KernelAliasingUnsupported);
+        }
         let mut result = KernelResult::success(invocation.id.clone());
         if name == "kv-write" {
             let descriptor = self.run_kv_write(invocation)?;
@@ -2594,6 +2630,22 @@ impl ReferenceCpuExecutor {
                 let up = self.input_tensor(invocation, 1)?;
                 mul(&silu(&gate), &up).map_err(KernelError::from)?
             }
+            "geodesic-residual" => {
+                let layer_index = Self::attribute_integer(&invocation.attributes, "layer_index")
+                    .and_then(|index| u32::try_from(index).ok())
+                    .filter(|index| *index != u32::MAX)
+                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                        attribute: "layer_index".into(),
+                    })?;
+                magnetar_provider_api::operator_semantics::geodesic_residual(
+                    &self.input_tensor(invocation, 0)?,
+                    &self.input_tensor(invocation, 1)?,
+                    &self.input_tensor(invocation, 2)?,
+                    &self.input_tensor(invocation, 3)?,
+                    layer_index,
+                )
+                .map_err(KernelError::from)?
+            }
             "batched-matmul" => {
                 let a = self.input_tensor(invocation, 0)?;
                 let b = self.input_tensor(invocation, 1)?;
@@ -2610,8 +2662,6 @@ impl ReferenceCpuExecutor {
                 let h = self.input_tensor(invocation, 0)?;
                 let logits = self.input_tensor(invocation, 1)?;
                 let gate = self.input_tensor(invocation, 2)?;
-                let up = self.input_tensor(invocation, 3)?;
-                let down = self.input_tensor(invocation, 4)?;
                 let integer = |name: &str| {
                     Self::attribute_integer(&invocation.attributes, name)
                         .filter(|value| *value > 0)
@@ -2642,23 +2692,68 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
-                let per_expert_scale = match invocation.inputs.len() {
-                    6 => Some(self.input_tensor(invocation, 5)?),
-                    _ => None,
+                let ungated = activation == MoeExpertActivation::ReluSquared;
+                let up = if ungated {
+                    None
+                } else {
+                    Some(self.input_tensor(invocation, 3)?)
                 };
-                operator_semantics::moe_experts_local_with(
-                    &h,
-                    &logits,
-                    [&gate, &up, &down],
-                    routing,
-                    first,
-                    count,
-                    MoeExpertOptions {
-                        activation,
-                        per_expert_scale: per_expert_scale.as_ref(),
-                    },
+                let down = self.input_tensor(invocation, if ungated { 3 } else { 4 })?;
+                let sigmoid = operator_semantics::sigmoid_routing_from_attributes(
+                    &invocation.attributes,
+                    routing.top_k,
                 )
-                .map_err(KernelError::from)?
+                .map_err(KernelError::from)?;
+                let (bias, per_expert_scale) =
+                    match (ungated, sigmoid.is_some(), invocation.inputs.len()) {
+                        (false, false, 5) => (None, None),
+                        (false, false, 6) => (None, Some(self.input_tensor(invocation, 5)?)),
+                        (false, true, 6) => (Some(self.input_tensor(invocation, 5)?), None),
+                        (false, true, 7) => (
+                            Some(self.input_tensor(invocation, 5)?),
+                            Some(self.input_tensor(invocation, 6)?),
+                        ),
+                        (true, true, 5) => (Some(self.input_tensor(invocation, 4)?), None),
+                        (true, true, 6) => (
+                            Some(self.input_tensor(invocation, 4)?),
+                            Some(self.input_tensor(invocation, 5)?),
+                        ),
+                        _ => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: "moe-experts input count does not match routing".into(),
+                            });
+                        }
+                    };
+                let options = MoeExpertOptions {
+                    activation,
+                    per_expert_scale: per_expert_scale.as_ref(),
+                };
+                let output = if let (Some(sigmoid), Some(bias)) = (sigmoid, bias.as_ref()) {
+                    operator_semantics::moe_experts_local_sigmoid_with(
+                        &h,
+                        &logits,
+                        [&gate, up.as_ref().unwrap_or(&gate), &down],
+                        routing,
+                        first,
+                        count,
+                        operator_semantics::MoeSigmoidExpertOptions {
+                            experts: options,
+                            routing: sigmoid,
+                            selection_bias: bias,
+                        },
+                    )
+                } else {
+                    operator_semantics::moe_experts_local_with(
+                        &h,
+                        &logits,
+                        [&gate, up.as_ref().unwrap_or(&gate), &down],
+                        routing,
+                        first,
+                        count,
+                        options,
+                    )
+                };
+                output.map_err(KernelError::from)?
             }
             "row-scale" => {
                 let x = self.input_tensor(invocation, 0)?;
@@ -2813,6 +2908,230 @@ impl ReferenceCpuExecutor {
                     pairing,
                     frequencies,
                     Self::attribute_float_opt(&invocation.attributes, "partial_rotary_factor"),
+                )
+                .map_err(KernelError::from)?
+            }
+            name @ ("mamba2-mixer" | "gated-delta-mixer") => {
+                if invocation.outputs.len() != 3 {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: format!("{name} requires exactly three outputs"),
+                    });
+                }
+                let outputs = &invocation.outputs;
+                for (i, output) in outputs.iter().enumerate() {
+                    if outputs[..i]
+                        .iter()
+                        .any(|other| other.resource.id == output.resource.id)
+                        || invocation
+                            .inputs
+                            .iter()
+                            .any(|input| input.resource.id == output.resource.id)
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason: format!(
+                                "{name} outputs must be distinct from all inputs and outputs"
+                            ),
+                        });
+                    }
+                }
+                let inputs = (0..invocation.inputs.len())
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let computed = if name == "mamba2-mixer" {
+                    let config =
+                        operator_semantics::mamba2_mixer_from_attributes(&invocation.attributes)
+                            .map_err(KernelError::from)?;
+                    operator_semantics::mamba2_mixer(&inputs, config)
+                } else {
+                    let config = operator_semantics::gated_delta_mixer_from_attributes(
+                        &invocation.attributes,
+                    )
+                    .map_err(KernelError::from)?;
+                    operator_semantics::gated_delta_mixer(&inputs, config)
+                }
+                .map_err(KernelError::from)?;
+                if outputs.iter().zip(&computed).any(|(resource, tensor)| {
+                    resource.resource.descriptor.shape.dimensions != tensor.shape
+                }) {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: format!("{name} output descriptor does not match computed shape"),
+                    });
+                }
+                for (index, tensor) in computed.into_iter().enumerate() {
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    result
+                        .output_readiness
+                        .insert(descriptor.id.to_string(), true);
+                    result.updated_resources.push(descriptor);
+                }
+                return Ok(result);
+            }
+            name @ ("mamba3-mimo" | "mamba3-mixer" | "projected-differential-attention") => {
+                if invocation.outputs.len() != 5 {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: format!("{name} requires exactly five outputs"),
+                    });
+                }
+                let outputs = &invocation.outputs;
+                for (index, output) in outputs.iter().enumerate() {
+                    if outputs[..index]
+                        .iter()
+                        .any(|other| other.resource.id == output.resource.id)
+                        || invocation
+                            .inputs
+                            .iter()
+                            .any(|input| input.resource.id == output.resource.id)
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason: format!(
+                                "{name} outputs must be distinct from all inputs and outputs"
+                            ),
+                        });
+                    }
+                }
+                let inputs = (0..invocation.inputs.len())
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let computed = if name == "mamba3-mimo" {
+                    let config =
+                        operator_semantics::mamba3_mimo_from_attributes(&invocation.attributes)
+                            .map_err(KernelError::from)?;
+                    operator_semantics::mamba3_mimo(&inputs, config)
+                } else if name == "mamba3-mixer" {
+                    let config =
+                        operator_semantics::mamba3_mixer_from_attributes(&invocation.attributes)
+                            .map_err(KernelError::from)?;
+                    operator_semantics::mamba3_mixer(&inputs, config)
+                } else {
+                    let config =
+                        operator_semantics::projected_differential_attention_from_attributes(
+                            &invocation.attributes,
+                        )
+                        .map_err(KernelError::from)?;
+                    operator_semantics::projected_differential_attention(&inputs, config)
+                }
+                .map_err(KernelError::from)?;
+                if outputs.iter().zip(&computed).any(|(resource, tensor)| {
+                    resource.resource.descriptor.shape.dimensions != tensor.shape
+                }) {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: format!("{name} output descriptor does not match computed shape"),
+                    });
+                }
+                for (index, tensor) in computed.into_iter().enumerate() {
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    result
+                        .output_readiness
+                        .insert(descriptor.id.to_string(), true);
+                    result.updated_resources.push(descriptor);
+                }
+                return Ok(result);
+            }
+            "token-shift" => {
+                if invocation.inputs.len() != 4 || invocation.outputs.len() != 2 {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "token-shift requires four inputs and two outputs".into(),
+                    });
+                }
+                let outputs = &invocation.outputs;
+                for (index, output) in outputs.iter().enumerate() {
+                    if outputs[..index]
+                        .iter()
+                        .any(|other| other.resource.id == output.resource.id)
+                        || invocation
+                            .inputs
+                            .iter()
+                            .any(|input| input.resource.id == output.resource.id)
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason:
+                                "token-shift outputs must be distinct from all inputs and outputs"
+                                    .into(),
+                        });
+                    }
+                }
+                let inputs = (0..invocation.inputs.len())
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let computed =
+                    operator_semantics::token_shift(&inputs).map_err(KernelError::from)?;
+                if outputs.iter().zip(&computed).any(|(resource, tensor)| {
+                    resource.resource.descriptor.shape.dimensions != tensor.shape
+                }) {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "token-shift output descriptor does not match computed shape"
+                            .into(),
+                    });
+                }
+                for (index, tensor) in computed.into_iter().enumerate() {
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    result
+                        .output_readiness
+                        .insert(descriptor.id.to_string(), true);
+                    result.updated_resources.push(descriptor);
+                }
+                return Ok(result);
+            }
+            "affine-layernorm" => {
+                if !(2..=3).contains(&invocation.inputs.len()) {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "affine-layernorm expects scale and optional bias".into(),
+                    });
+                }
+                let epsilon = operator_semantics::affine_layernorm_epsilon(&invocation.attributes)
+                    .map_err(KernelError::from)?;
+                let input = self.input_tensor(invocation, 0)?;
+                let scale = self.input_tensor(invocation, 1)?;
+                let bias = if invocation.inputs.len() == 3 {
+                    Some(self.input_tensor(invocation, 2)?)
+                } else {
+                    None
+                };
+                operator_semantics::affine_layernorm(&input, &scale, bias.as_ref(), epsilon)
+                    .map_err(KernelError::from)?
+            }
+            "gelu-exact" => operator_semantics::gelu_exact(&self.input_tensor(invocation, 0)?)
+                .map_err(KernelError::from)?,
+            "slice-last" => {
+                let (start, width) =
+                    operator_semantics::slice_last_attributes(&invocation.attributes)
+                        .map_err(KernelError::from)?;
+                operator_semantics::slice_last(&self.input_tensor(invocation, 0)?, start, width)
+                    .map_err(KernelError::from)?
+            }
+            "differential-attention" => {
+                if invocation.inputs.len() != 4
+                    || invocation.outputs.len() != 1
+                    || invocation
+                        .inputs
+                        .iter()
+                        .any(|input| input.resource.id == invocation.outputs[0].resource.id)
+                {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "differential-attention needs four inputs and a distinct output"
+                            .into(),
+                    });
+                }
+                let config = operator_semantics::differential_attention_from_attributes(
+                    &invocation.attributes,
+                )
+                .map_err(KernelError::from)?;
+                let inputs = (0..4)
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                operator_semantics::differential_attention(&inputs, config)
+                    .map_err(KernelError::from)?
+            }
+            "encoder-attention" => {
+                let config =
+                    operator_semantics::encoder_attention_from_attributes(&invocation.attributes)
+                        .map_err(KernelError::from)?;
+                operator_semantics::encoder_attention(
+                    &self.input_tensor(invocation, 0)?,
+                    &self.input_tensor(invocation, 1)?,
+                    &self.input_tensor(invocation, 2)?,
+                    &self.input_tensor(invocation, 3)?,
+                    config,
                 )
                 .map_err(KernelError::from)?
             }
@@ -2984,6 +3303,9 @@ impl ReferenceCpuExecutor {
                     "silu" => silu(&input),
                     "gelu" => gelu(&input),
                     "sigmoid" => sigmoid(&input),
+                    "relu_squared" => {
+                        operator_semantics::relu_squared(&input).map_err(KernelError::from)?
+                    }
                     "softcap" => operator_semantics::softcap(&input, float("cap")?)
                         .map_err(KernelError::from)?,
                     "scale" => operator_semantics::scale(&input, float("factor")?)
@@ -3056,6 +3378,18 @@ impl ReferenceCpuExecutor {
                 });
             }
         };
+        if matches!(
+            name,
+            "affine-layernorm" | "gelu-exact" | "slice-last" | "differential-attention"
+        ) && invocation
+            .outputs
+            .first()
+            .is_none_or(|resource| resource.resource.descriptor.shape.dimensions != output.shape)
+        {
+            return Err(KernelError::KernelExecutionFailed {
+                reason: format!("{name} output descriptor does not match computed shape"),
+            });
+        }
         let descriptor = self.store_output(invocation, 0, output)?;
         result
             .output_readiness

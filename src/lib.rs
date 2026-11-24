@@ -665,15 +665,21 @@ pub fn rope_scaled(
     let head_width = head_width as usize;
     let table = frequencies.table(base, dimension, rotated_pairs.min(half));
     let amplitude = frequencies.amplitude();
+    // A row's rotations depend on its position and the pair, not the head:
+    // computed once per row for every head.
+    let mut rotations = Vec::with_capacity(table.len());
     for row in 0..rows as usize {
         let position = ((position_offset as usize + row) as f32) * scale;
         let row_start = row * cols as usize;
+        rotations.clear();
+        rotations.extend(table.iter().map(|&frequency| {
+            let angle = position * frequency;
+            let (sin, cos) = angle.sin_cos();
+            (sin * amplitude, cos * amplitude)
+        }));
         for head in 0..head_count as usize {
             let col_base = row_start + head * head_width;
-            for (pair, &frequency) in table.iter().enumerate() {
-                let angle = position * frequency;
-                let (sin, cos) = angle.sin_cos();
-                let (sin, cos) = (sin * amplitude, cos * amplitude);
+            for (pair, &(sin, cos)) in rotations.iter().enumerate() {
                 let (first, second) = match pairing {
                     RopePairing::Interleaved => (col_base + 2 * pair, col_base + 2 * pair + 1),
                     RopePairing::HalfSplit => (col_base + pair, col_base + pair + half),
@@ -1639,6 +1645,18 @@ impl ReferenceCpuExecutor {
         self.storage.lock().unwrap().insert(id, tensor);
     }
 
+    /// [`Self::write_tensor`] under a borrowed id: a Kernel's output slot,
+    /// rewritten every step, keeps its key instead of a copy of it.
+    fn write_tensor_at(&self, id: &TensorResourceId, tensor: HostTensor) {
+        let mut storage = self.storage.lock().unwrap();
+        match storage.get_mut(id) {
+            Some(slot) => *slot = tensor,
+            None => {
+                storage.insert(id.clone(), tensor);
+            }
+        }
+    }
+
     pub fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
         if let Some(tensor) = self.storage.lock().unwrap().get(id) {
             return Some(tensor.clone());
@@ -2450,12 +2468,12 @@ impl ReferenceCpuExecutor {
             })
     }
 
-    fn store_output(
+    fn store_output<'a>(
         &self,
-        invocation: &KernelInvocation,
+        invocation: &'a KernelInvocation,
         index: usize,
         tensor: HostTensor,
-    ) -> Result<TensorResourceDescriptor, KernelError> {
+    ) -> Result<&'a TensorResourceDescriptor, KernelError> {
         let resource =
             invocation
                 .outputs
@@ -2463,8 +2481,68 @@ impl ReferenceCpuExecutor {
                 .ok_or_else(|| KernelError::KernelExecutionFailed {
                     reason: format!("missing output at index {index}"),
                 })?;
-        self.write_tensor(resource.resource.id.clone(), tensor);
-        Ok(resource.resource.clone())
+        self.write_tensor_at(&resource.resource.id, tensor);
+        Ok(&resource.resource)
+    }
+
+    /// Calls `run` with input `index` of `invocation`, borrowed where it
+    /// is stored (no copy), or materialized when it is a packed weight.
+    fn with_input<R>(
+        &self,
+        invocation: &KernelInvocation,
+        index: usize,
+        run: impl FnOnce(&HostTensor) -> Result<R, KernelError>,
+    ) -> Result<R, KernelError> {
+        self.with_inputs(invocation, &[index], |inputs| run(inputs[0]))
+    }
+
+    /// Calls `run` with the `indices` inputs of `invocation`, each borrowed
+    /// where it is stored or materialized when it is a packed weight: the
+    /// values [`Self::input_tensor`] reads, without copying stored ones.
+    /// `run` holds the storage lock, so it must not read or write storage.
+    fn with_inputs<R>(
+        &self,
+        invocation: &KernelInvocation,
+        indices: &[usize],
+        run: impl FnOnce(&[&HostTensor]) -> Result<R, KernelError>,
+    ) -> Result<R, KernelError> {
+        let storage = self.storage.lock().unwrap();
+        let mut materialized = Vec::new();
+        for &index in indices {
+            let id = &invocation
+                .inputs
+                .get(index)
+                .ok_or_else(|| KernelError::KernelExecutionFailed {
+                    reason: format!("missing input at index {index}"),
+                })?
+                .resource
+                .id;
+            if storage.contains_key(id) {
+                continue;
+            }
+            let tensor = self
+                .packed
+                .as_ref()
+                .and_then(|packed| packed.materialize(id))
+                .ok_or_else(|| KernelError::KernelExecutionFailed {
+                    reason: format!("no materialized data for input resource {id}"),
+                })?;
+            materialized.push((index, tensor));
+        }
+        let inputs: Vec<&HostTensor> = indices
+            .iter()
+            .map(|&index| {
+                let id = &invocation.inputs[index].resource.id;
+                storage.get(id).unwrap_or_else(|| {
+                    &materialized
+                        .iter()
+                        .find(|(at, _)| *at == index)
+                        .expect("materialized above")
+                        .1
+                })
+            })
+            .collect();
+        run(&inputs)
     }
 
     /// `matmul` and `matmul-bias` accumulate in f32 only; any other
@@ -2553,6 +2631,25 @@ impl ReferenceCpuExecutor {
     }
 
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
+        self.run_invocation_recording(invocation, true)
+    }
+
+    /// Runs `invocation` without building its [`KernelResult`]: a replayed
+    /// step's invocations, whose results nothing reads.
+    pub(crate) fn run_invocation_unrecorded(
+        &self,
+        invocation: &KernelInvocation,
+    ) -> Result<(), KernelError> {
+        self.run_invocation_recording(invocation, false).map(|_| ())
+    }
+
+    /// [`Self::run_invocation`]; with `record` false, the result lists no
+    /// output (no copies of the output descriptors and ids).
+    fn run_invocation_recording(
+        &self,
+        invocation: &KernelInvocation,
+        record: bool,
+    ) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
         if matches!(name, "affine-layernorm" | "gelu-exact" | "slice-last")
             && invocation.outputs.iter().any(|output| {
@@ -2567,20 +2664,24 @@ impl ReferenceCpuExecutor {
         let mut result = KernelResult::success(invocation.id.clone());
         if name == "kv-write" {
             let descriptor = self.run_kv_write(invocation)?;
-            result
-                .output_readiness
-                .insert(descriptor.id.to_string(), true);
-            result.updated_resources.push(descriptor);
+            if record {
+                result
+                    .output_readiness
+                    .insert(descriptor.id.to_string(), true);
+                result.updated_resources.push(descriptor);
+            }
             return Ok(result);
         }
         if let Some(packed) = &self.packed
             && let Some(output) = packed.run(self, invocation)
         {
             let descriptor = self.store_output(invocation, 0, output?)?;
-            result
-                .output_readiness
-                .insert(descriptor.id.to_string(), true);
-            result.updated_resources.push(descriptor);
+            if record {
+                result
+                    .output_readiness
+                    .insert(descriptor.id.to_string(), true);
+                result.updated_resources.push(descriptor.clone());
+            }
             return Ok(result);
         }
         let output = match name {
@@ -2789,7 +2890,6 @@ impl ReferenceCpuExecutor {
                 }
             }
             "rmsnorm" => {
-                let input = self.input_tensor(invocation, 0)?;
                 let epsilon = Self::attribute_float(&invocation.attributes, "epsilon", 1e-6);
                 // Present head attributes must both be positive integers:
                 // a malformed one is refused, never read as absent.
@@ -2811,13 +2911,10 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
-                let weight = match invocation.inputs.len() {
-                    1 => None,
-                    _ => Some(self.input_tensor(invocation, 1)?),
-                };
+                let weighted = invocation.inputs.len() != 1;
                 if let Some(OperatorAttributeValue::Boolean(with_scale)) =
                     invocation.attributes.get("with_scale")
-                    && *with_scale != weight.is_some()
+                    && *with_scale != weighted
                 {
                     return Err(KernelError::KernelAttributeUnsupported {
                         attribute: format!(
@@ -2826,19 +2923,21 @@ impl ReferenceCpuExecutor {
                         ),
                     });
                 }
-                match (&weight, heads) {
-                    // Today's form keeps its own weight shapes.
-                    (Some(weight), None) => {
-                        rmsnorm(&input, weight, epsilon).map_err(KernelError::from)?
+                // The input and weight read where they are stored.
+                let indices: &[usize] = if weighted { &[0, 1] } else { &[0] };
+                self.with_inputs(invocation, indices, |inputs| {
+                    let (input, weight) = (inputs[0], inputs.get(1).copied());
+                    match (weight, heads) {
+                        // Today's form keeps its own weight shapes.
+                        (Some(weight), None) => {
+                            rmsnorm(input, weight, epsilon).map_err(KernelError::from)
+                        }
+                        _ => operator_semantics::rmsnorm_blocks(input, weight, epsilon, heads)
+                            .map_err(KernelError::from),
                     }
-                    _ => {
-                        operator_semantics::rmsnorm_blocks(&input, weight.as_ref(), epsilon, heads)
-                            .map_err(KernelError::from)?
-                    }
-                }
+                })?
             }
             "rope" => {
-                let input = self.input_tensor(invocation, 0)?;
                 let base = Self::attribute_float(&invocation.attributes, "base", 10000.0);
                 let scale = Self::attribute_float(&invocation.attributes, "scale", 1.0);
                 let dimension = Self::attribute_integer(&invocation.attributes, "dimension")
@@ -2915,18 +3014,23 @@ impl ReferenceCpuExecutor {
                     (Some(yarn), _) => RopeFrequencies::Yarn(yarn),
                     (None, banded) => RopeFrequencies::from_banded(banded.as_ref()),
                 };
-                rope_scaled(
-                    &input,
-                    base,
-                    scale,
-                    dimension,
-                    position_offset,
-                    head_count,
-                    pairing,
-                    frequencies,
-                    Self::attribute_float_opt(&invocation.attributes, "partial_rotary_factor"),
-                )
-                .map_err(KernelError::from)?
+                let partial_rotary_factor =
+                    Self::attribute_float_opt(&invocation.attributes, "partial_rotary_factor");
+                // The input read where it is stored.
+                self.with_input(invocation, 0, |input| {
+                    rope_scaled(
+                        input,
+                        base,
+                        scale,
+                        dimension,
+                        position_offset,
+                        head_count,
+                        pairing,
+                        frequencies,
+                        partial_rotary_factor,
+                    )
+                    .map_err(KernelError::from)
+                })?
             }
             name @ ("mamba2-mixer" | "gated-delta-mixer") => {
                 if invocation.outputs.len() != 3 {
@@ -2976,10 +3080,12 @@ impl ReferenceCpuExecutor {
                 }
                 for (index, tensor) in computed.into_iter().enumerate() {
                     let descriptor = self.store_output(invocation, index, tensor)?;
-                    result
-                        .output_readiness
-                        .insert(descriptor.id.to_string(), true);
-                    result.updated_resources.push(descriptor);
+                    if record {
+                        result
+                            .output_readiness
+                            .insert(descriptor.id.to_string(), true);
+                        result.updated_resources.push(descriptor.clone());
+                    }
                 }
                 return Ok(result);
             }
@@ -3037,10 +3143,12 @@ impl ReferenceCpuExecutor {
                 }
                 for (index, tensor) in computed.into_iter().enumerate() {
                     let descriptor = self.store_output(invocation, index, tensor)?;
-                    result
-                        .output_readiness
-                        .insert(descriptor.id.to_string(), true);
-                    result.updated_resources.push(descriptor);
+                    if record {
+                        result
+                            .output_readiness
+                            .insert(descriptor.id.to_string(), true);
+                        result.updated_resources.push(descriptor.clone());
+                    }
                 }
                 return Ok(result);
             }
@@ -3082,10 +3190,12 @@ impl ReferenceCpuExecutor {
                 }
                 for (index, tensor) in computed.into_iter().enumerate() {
                     let descriptor = self.store_output(invocation, index, tensor)?;
-                    result
-                        .output_readiness
-                        .insert(descriptor.id.to_string(), true);
-                    result.updated_resources.push(descriptor);
+                    if record {
+                        result
+                            .output_readiness
+                            .insert(descriptor.id.to_string(), true);
+                        result.updated_resources.push(descriptor.clone());
+                    }
                 }
                 return Ok(result);
             }
@@ -3408,10 +3518,12 @@ impl ReferenceCpuExecutor {
             });
         }
         let descriptor = self.store_output(invocation, 0, output)?;
-        result
-            .output_readiness
-            .insert(descriptor.id.to_string(), true);
-        result.updated_resources.push(descriptor);
+        if record {
+            result
+                .output_readiness
+                .insert(descriptor.id.to_string(), true);
+            result.updated_resources.push(descriptor.clone());
+        }
         Ok(result)
     }
 }

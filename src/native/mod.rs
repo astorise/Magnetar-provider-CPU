@@ -1274,7 +1274,7 @@ impl NativeState {
                 .map_err(KernelError::from)
                 .and_then(|product| Self::with_padding_rows(product, rows))
                 .and_then(|product| Self::finish_matmul(executor, invocation, product))
-                .and_then(|output| executor.store_output(invocation, 0, output));
+                .and_then(|output| executor.store_output(invocation, 0, output).map(|_| ()));
             if let Err(error) = stored {
                 return Some(Err(error));
             }
@@ -1607,7 +1607,7 @@ impl NativeCpuExecutor {
             }
             for invocation in members {
                 let started = self.profile.as_ref().map(|_| std::time::Instant::now());
-                let ran = self.inner.run_invocation(invocation);
+                let ran = self.inner.run_invocation_unrecorded(invocation);
                 self.profile(&invocation.kernel.name, started);
                 if let Err(error) = ran {
                     return Err(capture::replay_failed(format!(

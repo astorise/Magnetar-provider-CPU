@@ -438,13 +438,16 @@ pub(in crate::native) mod avx2 {
                     let mut r0 = 0;
                     while r0 < m {
                         let tile_rows = (m - r0).min(6);
-                        // Blocks of 32 weight rows: a tile reads each row of
+                        // Blocks of 8 weight rows: a tile reads each row of
                         // its block at a stride of a whole weight row, so a
                         // block bounds the pages and streams one tile touches
                         // (unblocked, a wide weight read one page per load).
+                        // Eight streams, as a one-row step reads, were the
+                        // fastest from memory: 0.36 ms for a 5-row gate
+                        // projection against 0.45 ms with 32.
                         let mut start = rows.start;
                         while start < rows.end {
-                            let block = start..(start + 32).min(rows.end);
+                            let block = start..(start + 8).min(rows.end);
                             let mut c = 0;
                             // SAFETY: as for this function.
                             unsafe {
@@ -947,13 +950,16 @@ pub(in crate::native) mod avx512 {
                     let mut r0 = 0;
                     while r0 < m {
                         let tile_rows = (m - r0).min(6);
-                        // Blocks of 32 weight rows: a tile reads each row of
+                        // Blocks of 8 weight rows: a tile reads each row of
                         // its block at a stride of a whole weight row, so a
                         // block bounds the pages and streams one tile touches
                         // (unblocked, a wide weight read one page per load).
+                        // Eight streams, as a one-row step reads, were the
+                        // fastest from memory: 0.36 ms for a 5-row gate
+                        // projection against 0.45 ms with 32.
                         let mut start = rows.start;
                         while start < rows.end {
-                            let block = start..(start + 32).min(rows.end);
+                            let block = start..(start + 8).min(rows.end);
                             let mut c = 0;
                             // SAFETY: as for this function.
                             unsafe {

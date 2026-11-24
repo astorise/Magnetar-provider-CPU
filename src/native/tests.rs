@@ -949,8 +949,12 @@ fn pool_and_streamed_matmul_costs() {
     // Distinct bfloat16 weights of each decode shape of a Qwen2.5-0.5B
     // layer (about 400 MB of each): each read once per pass, as a decode
     // step reads its layers', in both stored layouts.
+    let rows = std::env::var("MAGNETAR_CPU_BENCH_ROWS")
+        .ok()
+        .and_then(|rows| rows.parse::<u64>().ok())
+        .unwrap_or(1);
     for (k, n) in [(896_u64, 4864_u64), (4864, 896), (896, 896), (896, 128)] {
-        let a = activations(1, k, 121);
+        let a = activations(rows, k, 121);
         let count = (400_000_000 / (n * k * 2)).clamp(4, 256);
         let weights: Vec<Vec<u16>> = (0..count)
             .map(|seed| {
@@ -976,7 +980,7 @@ fn pool_and_streamed_matmul_costs() {
                 best = best.min(start.elapsed().as_secs_f64() / count as f64);
             }
             println!(
-                "streamed bf16 [1, {k}] x [{k}, {n}] {}: {:.3} ms ({:.1} GB/s)",
+                "streamed bf16 [{rows}, {k}] x [{k}, {n}] {}: {:.3} ms ({:.1} GB/s)",
                 if transpose_b {
                     "output-major"
                 } else {

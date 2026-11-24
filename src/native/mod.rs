@@ -1070,20 +1070,44 @@ fn greedy_column(
 }
 
 /// The highest `scale(score)` of `values`' finite scores (negative
-/// infinity when none is higher), and whether any score is finite.
+/// infinity when none is higher), and whether any score is finite. Kept
+/// in sixteen independent lanes, which compilers turn into vector code (a
+/// single running maximum, an ordered reduction, they do not), then
+/// combined: the same highest value, whichever lane holds it.
 #[inline(always)]
 fn block_high(values: &[f32], scale: impl Fn(f32) -> f32) -> (f32, bool) {
+    const LANES: usize = 16;
+    let mut highs = [f32::NEG_INFINITY; LANES];
+    let mut finites = [0_u32; LANES];
+    let (chunks, rest) = values.as_chunks::<LANES>();
+    for chunk in chunks {
+        for lane in 0..LANES {
+            let score = chunk[lane];
+            let is_finite = score.is_finite();
+            let value = scale(score);
+            finites[lane] |= u32::from(is_finite);
+            highs[lane] = if is_finite && value > highs[lane] {
+                value
+            } else {
+                highs[lane]
+            };
+        }
+    }
     let mut high = f32::NEG_INFINITY;
     let mut finite = false;
-    for &score in values {
+    for lane in 0..LANES {
+        finite |= finites[lane] != 0;
+        if highs[lane] > high {
+            high = highs[lane];
+        }
+    }
+    for &score in rest {
         let is_finite = score.is_finite();
         let value = scale(score);
         finite |= is_finite;
-        high = if is_finite && value > high {
-            value
-        } else {
-            high
-        };
+        if is_finite && value > high {
+            high = value;
+        }
     }
     (high, finite)
 }

@@ -9,10 +9,18 @@
 //! - [`PACKED_WEIGHTS_ENV`] `=0` declines packed weights (f32 at load);
 //! - [`INT8_ACTIVATIONS_ENV`] `=0` keeps f32 activations;
 //! - [`THREADS_ENV`] bounds the worker pool;
-//! - [`SIMD_ENV`] `=scalar` disables the vector kernels.
+//! - [`DECODE_THREADS_ENV`] runs one-row Kernels (a decode step) on a pool
+//!   of their own, of that many threads (`cores`: one per physical core);
+//! - [`SIMD_ENV`] `=scalar` disables the vector kernels;
+//! - [`COMPACT_WEIGHTS_ENV`] `=0` keeps every dense weight f32 instead of
+//!   storing an exact bfloat16 one as its bfloat16 bits ([`dense`]);
+//! - [`STEP_CAPTURE_ENV`] `=0` declines step capture ([`capture`]).
 
+mod capture;
+mod dense;
 mod pool;
 pub mod quant;
+mod topology;
 
 use super::*;
 use magnetar_provider_api::{packed_weight::PackedWeight, packed_weight::PackedWeightWrite};
@@ -25,7 +33,23 @@ pub const NATIVE_CPU_PROVIDER_VERSION: &str = "0.1.0";
 pub const PACKED_WEIGHTS_ENV: &str = "MAGNETAR_CPU_PACKED_WEIGHTS";
 pub const INT8_ACTIVATIONS_ENV: &str = "MAGNETAR_CPU_INT8_ACTIVATIONS";
 pub const THREADS_ENV: &str = "MAGNETAR_CPU_THREADS";
+/// A positive count runs one-row Kernels (a decode step, memory-bound) on
+/// a pool of their own of that many threads, `cores` on one thread per
+/// physical core ([`topology`]), while Kernels of several rows (a prefill,
+/// compute-bound) keep [`THREADS_ENV`]'s pool: a core's second hardware
+/// thread helps a prefill and can slow a decode step.
+pub const DECODE_THREADS_ENV: &str = "MAGNETAR_CPU_DECODE_THREADS";
 pub const SIMD_ENV: &str = "MAGNETAR_CPU_SIMD";
+pub const COMPACT_WEIGHTS_ENV: &str = "MAGNETAR_CPU_COMPACT_WEIGHTS";
+pub const STEP_CAPTURE_ENV: &str = "MAGNETAR_CPU_STEP_CAPTURE";
+/// The capture attribute a replayed bucketed prefill advances by its
+/// padding row count (`replay-bucketed-prefill`), as the Runtime and the
+/// CUDA Provider name it: row matmuls skip that many trailing rows.
+pub const PADDING_ROWS_ATTRIBUTE: &str = "padding_rows";
+/// Dense weights at least this large are stored compact when every value
+/// is exactly a bfloat16 value; smaller ones (biases, norm weights) stay
+/// f32, as on the CUDA Provider.
+pub const COMPACT_WEIGHT_MIN_ELEMENTS: usize = 1 << 16;
 /// Set to `1` to time every Kernel by name and print the totals when the
 /// executor drops (a diagnostic).
 pub const PROFILE_ENV: &str = "MAGNETAR_CPU_PROFILE";
@@ -67,14 +91,132 @@ pub(crate) trait PackedWeights: Send + Sync {
         executor: &ReferenceCpuExecutor,
         invocation: &KernelInvocation,
     ) -> Option<Result<HostTensor, KernelError>>;
+    /// Runs `invocation` when it has several outputs this Provider
+    /// computes itself (the gated-delta mixer), returning them in order;
+    /// `None` lets the Reference CPU kernel run.
+    fn run_multi(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+    ) -> Option<Result<Vec<HostTensor>, KernelError>> {
+        let _ = (executor, invocation);
+        None
+    }
     /// A packed weight's logical values, for a kernel without a packed path.
     fn materialize(&self, id: &TensorResourceId) -> Option<HostTensor>;
     fn shape(&self, id: &TensorResourceId) -> Option<Vec<u64>>;
 }
 
+/// A dense weight whose every value is exactly a bfloat16 value, held as
+/// those values' bfloat16 bits (`speed-up-dense-cpu-matmuls`): half the
+/// bytes of f32, every value unchanged.
+///
+/// A weight with more rows than columns is held transposed, so its stored
+/// rows are its longer dimension: a decode step's matmul streams a few
+/// stored rows side by side, and rows of a few kilobytes (a `[4864, 896]`
+/// down projection, a `[151936, 896]` embedding table a tied LM head reads
+/// transposed) kept the hardware prefetchers from reaching the bandwidth
+/// longer rows reach (locally 21 against 43 GB/s for the down projection,
+/// 25 against 46 for such an LM head).
+struct CompactWeight {
+    /// The logical shape.
+    rows: usize,
+    cols: usize,
+    /// Whether `bits` holds the transpose: `cols` rows of `rows` values.
+    transposed: bool,
+    bits: Vec<u16>,
+}
+
+impl CompactWeight {
+    /// `tensor` compact, when it is a matrix of at least
+    /// [`COMPACT_WEIGHT_MIN_ELEMENTS`] exact bfloat16 values.
+    fn of(tensor: &HostTensor) -> Option<Self> {
+        let (rows, cols) = tensor.rows_cols().ok()?;
+        if tensor.shape.len() != 2 || tensor.data.len() < COMPACT_WEIGHT_MIN_ELEMENTS {
+            return None;
+        }
+        let bits = tensor
+            .data
+            .iter()
+            .map(|&value| dense::exact_bf16_bits(value))
+            .collect::<Option<Vec<u16>>>()?;
+        let (rows, cols) = (rows as usize, cols as usize);
+        let transposed = rows > cols;
+        let bits = if transposed {
+            transpose(&bits, rows, cols)
+        } else {
+            bits
+        };
+        Some(Self {
+            rows,
+            cols,
+            transposed,
+            bits,
+        })
+    }
+
+    /// The stored shape: the logical one, or its transpose.
+    fn stored_shape(&self) -> [usize; 2] {
+        if self.transposed {
+            [self.cols, self.rows]
+        } else {
+            [self.rows, self.cols]
+        }
+    }
+
+    /// The logical value at `[row, col]`.
+    fn get(&self, row: usize, col: usize) -> f32 {
+        let index = if self.transposed {
+            col * self.rows + row
+        } else {
+            row * self.cols + col
+        };
+        f32::from_bits(u32::from(self.bits[index]) << 16)
+    }
+
+    fn expand(&self) -> HostTensor {
+        let bits = if self.transposed {
+            transpose(&self.bits, self.cols, self.rows)
+        } else {
+            self.bits.clone()
+        };
+        let values: Vec<f32> = bits
+            .iter()
+            .map(|&bits| f32::from_bits(u32::from(bits) << 16))
+            .collect();
+        HostTensor::new([self.rows as u64, self.cols as u64], values)
+            .expect("a compact weight's shape holds its values")
+    }
+}
+
+/// The transpose of the row-major `rows x cols` matrix `values`, by tiles
+/// that keep both sides' reads and writes within a few cache lines.
+fn transpose(values: &[u16], rows: usize, cols: usize) -> Vec<u16> {
+    const TILE: usize = 64;
+    let mut out = vec![0_u16; values.len()];
+    for r0 in (0..rows).step_by(TILE) {
+        for c0 in (0..cols).step_by(TILE) {
+            for r in r0..(r0 + TILE).min(rows) {
+                for c in c0..(c0 + TILE).min(cols) {
+                    out[c * rows + r] = values[r * cols + c];
+                }
+            }
+        }
+    }
+    out
+}
+
 struct NativeState {
     packed: Mutex<BTreeMap<TensorResourceId, Arc<PackedWeight>>>,
+    compact: Mutex<BTreeMap<TensorResourceId, Arc<CompactWeight>>>,
+    /// While a bucketed prefill replays, its padding row count: row
+    /// matmuls of more rows compute only the leading ones, whose results
+    /// are the only ones read (`capture-cpu-steps`).
+    padding_rows: std::sync::atomic::AtomicUsize,
     pool: pool::Pool,
+    /// The pool one-row Kernels run on, when it is not `pool`
+    /// ([`DECODE_THREADS_ENV`]).
+    decode_pool: Option<pool::Pool>,
     int8_activations: bool,
     /// Packed weights expanded to f32 for a caller or Kernel without a
     /// packed path: count and seconds (reported with [`PROFILE_ENV`]).
@@ -101,9 +243,449 @@ struct SharedOut(*mut f32);
 // SAFETY: every task writes a disjoint set of output elements.
 unsafe impl Sync for SharedOut {}
 
+/// How the pool shares out a dense product.
+#[derive(Clone, Copy)]
+enum Split {
+    /// `tasks` blocks of `block` whole rows of an input-major weight, each
+    /// summed by its task into its own partial product.
+    Rows { tasks: usize, block: usize },
+    /// `tasks` blocks of `chunk` output columns.
+    Columns { tasks: usize, chunk: usize },
+}
+
+impl Split {
+    fn tasks(self) -> usize {
+        match self {
+            Split::Rows { tasks, .. } | Split::Columns { tasks, .. } => tasks,
+        }
+    }
+
+    /// The partial products a task run leaves to sum: one per row block.
+    fn tasks_summed(self) -> usize {
+        match self {
+            Split::Rows { tasks, .. } => tasks,
+            Split::Columns { .. } => 1,
+        }
+    }
+}
+
+/// A dense product `a x W` of `m x k` activations by a weight of `n`
+/// outputs, as the pool runs it.
+#[derive(Clone, Copy)]
+struct DenseProduct<'w> {
+    values: dense::Values<'w>,
+    m: usize,
+    k: usize,
+    n: usize,
+    /// Whether the weight is stored output-major.
+    transpose_b: bool,
+    split: Split,
+}
+
+/// A dense product after its pool run: `parts` partial products of
+/// `m x n` values each, summed in order.
+struct Computed {
+    values: Vec<f32>,
+    parts: usize,
+}
+
+impl Computed {
+    /// Element `index` of the product, its partial products summed in
+    /// order.
+    #[inline]
+    fn get(&self, len: usize, index: usize) -> f32 {
+        let mut sum = self.values[index];
+        for part in 1..self.parts {
+            sum += self.values[part * len + index];
+        }
+        sum
+    }
+
+    /// The product: its `len` values, its partial products summed in order.
+    fn into_sum(mut self, len: usize) -> Vec<f32> {
+        let (first, rest) = self.values.split_at_mut(len);
+        for partial in rest.chunks_exact(len).take(self.parts - 1) {
+            for (out, &value) in first.iter_mut().zip(partial) {
+                *out += value;
+            }
+        }
+        self.values.truncate(len);
+        self.values
+    }
+}
+
 impl NativeState {
+    /// The pool a Kernel over `rows` rows of activations runs on.
+    fn pool_for(&self, rows: usize) -> &pool::Pool {
+        match &self.decode_pool {
+            Some(pool) if rows == 1 => pool,
+            _ => &self.pool,
+        }
+    }
+
     fn weight(&self, id: &TensorResourceId) -> Option<Arc<PackedWeight>> {
         self.packed.lock().unwrap().get(id).cloned()
+    }
+
+    fn compact(&self, id: &TensorResourceId) -> Option<Arc<CompactWeight>> {
+        self.compact.lock().unwrap().get(id).cloned()
+    }
+
+    /// `a`'s rows a row matmul computes, when not all of them: all but a
+    /// replayed prefill's padding rows. Every row of a one-row product (a
+    /// prefill's LM head reads the one gathered row), or of one no longer
+    /// than the padding, is computed.
+    fn live_rows(&self, a: &HostTensor) -> Option<HostTensor> {
+        let padding = self.padding_rows.load(std::sync::atomic::Ordering::Relaxed);
+        let (m, k) = a.rows_cols().ok()?;
+        let (m, k) = (m as usize, k as usize);
+        if padding == 0 || m <= 1 || padding >= m || a.shape.len() != 2 {
+            return None;
+        }
+        let live = m - padding;
+        HostTensor::new([live as u64, k as u64], a.data[..live * k].to_vec()).ok()
+    }
+
+    /// A product of `a`'s live rows, back to `rows` rows: the padding rows'
+    /// values are zero (never read).
+    fn with_padding_rows(product: HostTensor, rows: u64) -> Result<HostTensor, KernelError> {
+        let (live, n) = product.rows_cols().map_err(KernelError::from)?;
+        if live == rows {
+            return Ok(product);
+        }
+        let mut data = product.data;
+        data.resize((rows * n) as usize, 0.0);
+        HostTensor::new([rows, n], data).map_err(KernelError::from)
+    }
+
+    /// A matmul-family Kernel's sum or residual, after its product.
+    fn finish_matmul(
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+        mut product: HostTensor,
+    ) -> Result<HostTensor, KernelError> {
+        let name = invocation.kernel.name.as_str();
+        if !matches!(name, "matmul-bias" | "matmul-residual") {
+            return Ok(product);
+        }
+        // Added into the product in place, read where it is stored: the
+        // Reference sums value for value (an f32 sum does not depend on
+        // its operands' order) without copying either operand.
+        let id = &invocation
+            .inputs
+            .get(2)
+            .ok_or_else(|| KernelError::KernelExecutionFailed {
+                reason: "missing input at index 2".into(),
+            })?
+            .resource
+            .id;
+        {
+            let storage = executor.storage.lock().unwrap();
+            if let Some(addend) = storage.get(id)
+                && let Some(&cols) = product.shape.last()
+            {
+                let cols = cols as usize;
+                let same = addend.shape == product.shape;
+                let row = name == "matmul-bias"
+                    && cols > 0
+                    && (addend.shape == [cols as u64] || addend.shape == [1, cols as u64]);
+                if same {
+                    for (value, &term) in product.data.iter_mut().zip(&addend.data) {
+                        *value += term;
+                    }
+                    return Ok(product);
+                }
+                if row && product.data.len().is_multiple_of(cols) {
+                    for values in product.data.chunks_exact_mut(cols) {
+                        for (value, &term) in values.iter_mut().zip(&addend.data) {
+                            *value += term;
+                        }
+                    }
+                    return Ok(product);
+                }
+            }
+        }
+        let addend = executor.input_tensor(invocation, 2)?;
+        match name {
+            "matmul-bias" => add(&product, &addend),
+            _ => residual_add(&addend, &product),
+        }
+        .map_err(KernelError::from)
+    }
+
+    /// A matmul-family Kernel whose weight (input 1) is dense: compact or
+    /// f32 (`speed-up-dense-cpu-matmuls`), across the pool. `None` hands
+    /// any form it does not handle (a transposed `a`, mismatched shapes) to
+    /// the Reference CPU kernel, which reports any error.
+    fn dense_matmul(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+        id: &TensorResourceId,
+    ) -> Option<Result<HostTensor, KernelError>> {
+        if cfg!(target_arch = "wasm32")
+            || ReferenceCpuExecutor::attribute_bool(&invocation.attributes, "transpose_a", false)
+            || ReferenceCpuExecutor::require_f32_accumulation(&invocation.attributes).is_err()
+        {
+            return None;
+        }
+        let transpose_b =
+            ReferenceCpuExecutor::attribute_bool(&invocation.attributes, "transpose_b", false);
+        let a = match executor.input_tensor(invocation, 0) {
+            Ok(a) => a,
+            Err(error) => return Some(Err(error)),
+        };
+        let rows = *a.shape.first()?;
+        let a = self.live_rows(&a).unwrap_or(a);
+        let product = match self.compact(id) {
+            // A weight held transposed is used the other way round.
+            Some(weight) => self.dense_product(
+                &a,
+                dense::Values::Bf16(&weight.bits),
+                weight.stored_shape(),
+                transpose_b != weight.transposed,
+            )?,
+            None => {
+                let storage = executor.storage.lock().unwrap();
+                let b = storage.get(id)?;
+                let (rows, cols) = b.rows_cols().ok()?;
+                if b.shape.len() != 2 {
+                    return None;
+                }
+                self.dense_product(
+                    &a,
+                    dense::Values::F32(&b.data),
+                    [rows as usize, cols as usize],
+                    transpose_b,
+                )?
+            }
+        };
+        Some(product.and_then(|product| {
+            Self::finish_matmul(
+                executor,
+                invocation,
+                Self::with_padding_rows(product, rows)?,
+            )
+        }))
+    }
+
+    /// `a x b` for a dense `b` of stored shape `[rows, cols]`: logically
+    /// `[k, n]`, or `[n, k]` used transposed.
+    fn dense_product(
+        &self,
+        a: &HostTensor,
+        values: dense::Values<'_>,
+        shape: [usize; 2],
+        transpose_b: bool,
+    ) -> Option<Result<HostTensor, KernelError>> {
+        let product = self.dense_plan(a, values, shape, transpose_b)?;
+        let (m, n) = (product.m, product.n);
+        let out = self
+            .run_products(&a.data, &[product])
+            .pop()?
+            .into_sum(m * n);
+        Some(HostTensor::new([m as u64, n as u64], out).map_err(KernelError::from))
+    }
+
+    /// How the pool shares out `a x b`, for a dense `b` of stored shape
+    /// `[rows, cols]`; `None` for mismatched shapes.
+    fn dense_plan<'w>(
+        &self,
+        a: &HostTensor,
+        values: dense::Values<'w>,
+        shape: [usize; 2],
+        transpose_b: bool,
+    ) -> Option<DenseProduct<'w>> {
+        let (m, k) = a.rows_cols().ok()?;
+        let (m, k) = (m as usize, k as usize);
+        if a.shape.len() != 2 {
+            return None;
+        }
+        let [rows, cols] = shape;
+        let (inner, n) = if transpose_b {
+            (cols, rows)
+        } else {
+            (rows, cols)
+        };
+        if inner != k || m == 0 || n == 0 || k == 0 {
+            return None;
+        }
+        let threads = self.pool_for(m).threads();
+        // An input-major weight narrower than twice `INPUT_MAJOR_COLUMNS`
+        // per thread is shared out by blocks of whole rows (contiguous
+        // reads), each task summing its block into a partial product (of
+        // at most a few megabytes): a block of a few hundred columns per
+        // row would read short strided runs, and one of a few thousand
+        // left a thread with a smaller share than another (three column
+        // blocks of a 4864-column weight across two threads).
+        const INPUT_MAJOR_COLUMNS: usize = 2048;
+        let split = if !transpose_b
+            && threads > 1
+            && n < 2 * threads * INPUT_MAJOR_COLUMNS
+            && m * n * threads <= 1 << 20
+        {
+            let tasks = threads.min(k.div_ceil(64)).max(1);
+            Split::Rows {
+                tasks,
+                block: k.div_ceil(tasks),
+            }
+        } else {
+            // Output-major: about eight tasks per thread, of whole groups
+            // of sixteen outputs (the decode kernels take them sixteen at
+            // a time). Input-major: one wide column block per thread, two
+            // when they stay wider than `WIDE_COLUMNS`: a task reads each
+            // row's run of its columns, and runs of a few thousand columns
+            // (a 151936-column LM head in 2000-column blocks) left the
+            // prefetchers behind (locally 27 against 47 GB/s).
+            const WIDE_COLUMNS: usize = 16384;
+            let chunk = if transpose_b {
+                n.div_ceil(16).div_ceil(threads * 8) * 16
+            } else {
+                let blocks = if n >= 2 * threads * WIDE_COLUMNS {
+                    2 * threads
+                } else {
+                    threads
+                };
+                n.div_ceil(blocks).next_multiple_of(16)
+            };
+            Split::Columns {
+                tasks: n.div_ceil(chunk),
+                chunk,
+            }
+        };
+        Some(DenseProduct {
+            values,
+            m,
+            k,
+            n,
+            transpose_b,
+            split,
+        })
+    }
+
+    /// `products` of the same activations `a`, in one pool run: each
+    /// one's tasks as it would run alone, so each product's values do not
+    /// depend on what it ran with.
+    fn run_products(&self, a: &[f32], products: &[DenseProduct<'_>]) -> Vec<Computed> {
+        let level = simd_level();
+        let mut buffers: Vec<Vec<f32>> = products
+            .iter()
+            .map(|product| vec![0.0_f32; product.split.tasks_summed() * product.m * product.n])
+            .collect();
+        let shared: Vec<SharedOut> = buffers
+            .iter_mut()
+            .map(|buffer| SharedOut(buffer.as_mut_ptr()))
+            .collect();
+        let shared = &shared;
+        let total = products.iter().map(|product| product.split.tasks()).sum();
+        let rows = products.first().map_or(1, |product| product.m);
+        self.pool_for(rows).run(total, &|mut task| {
+            let mut index = 0;
+            while task >= products[index].split.tasks() {
+                task -= products[index].split.tasks();
+                index += 1;
+            }
+            let product = &products[index];
+            let (m, k, n) = (product.m, product.k, product.n);
+            let out = &shared[index];
+            match product.split {
+                Split::Rows { block, .. } => {
+                    let rows = (task * block).min(k)..((task + 1) * block).min(k);
+                    // SAFETY: partial `task` belongs to this task only.
+                    let partial =
+                        unsafe { std::slice::from_raw_parts_mut(out.0.add(task * m * n), m * n) };
+                    dense::input_major(level, a, m, k, rows, product.values, n, 0, n, partial);
+                }
+                Split::Columns { chunk, .. } => {
+                    let first = task * chunk;
+                    let count = chunk.min(n - first);
+                    let run = |values: &mut [f32]| {
+                        if product.transpose_b {
+                            dense::output_major(
+                                level,
+                                a,
+                                m,
+                                k,
+                                product.values,
+                                first,
+                                count,
+                                values,
+                            );
+                        } else {
+                            dense::input_major(
+                                level,
+                                a,
+                                m,
+                                k,
+                                0..k,
+                                product.values,
+                                n,
+                                first,
+                                count,
+                                values,
+                            );
+                        }
+                    };
+                    if m == 1 {
+                        // SAFETY: columns `first..first + count` of the one
+                        // row belong to this task only.
+                        run(unsafe { std::slice::from_raw_parts_mut(out.0.add(first), count) });
+                    } else {
+                        let mut local = vec![0.0_f32; m * count];
+                        run(&mut local);
+                        for r in 0..m {
+                            for c in 0..count {
+                                // SAFETY: column `first + c` belongs to this
+                                // task only.
+                                unsafe { *out.0.add(r * n + first + c) = local[r * count + c] };
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        buffers
+            .into_iter()
+            .zip(products)
+            .map(|(values, product)| Computed {
+                values,
+                parts: product.split.tasks_summed(),
+            })
+            .collect()
+    }
+
+    /// The `embedding` Kernel over a compact table: each gathered row's
+    /// values, exactly.
+    fn compact_embedding(
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+        table: &CompactWeight,
+    ) -> Result<HostTensor, KernelError> {
+        let ids = executor.input_tensor(invocation, 1)?;
+        let (vocab, dim) = (table.rows as u64, table.cols);
+        let mut out = Vec::with_capacity(ids.data.len() * dim);
+        for &raw_id in &ids.data {
+            if raw_id < 0.0 || raw_id.fract() != 0.0 || raw_id as u64 >= vocab {
+                return Err(KernelError::KernelExecutionFailed {
+                    reason: format!("token id {raw_id} is not below the vocabulary size {vocab}"),
+                });
+            }
+            let token = raw_id as usize;
+            if table.transposed {
+                // A table held transposed (a vocabulary is taller than
+                // wide): the token's values are a column, one per stored
+                // row.
+                out.extend((0..dim).map(|col| table.get(token, col)));
+            } else {
+                let start = token * dim;
+                out.extend(
+                    table.bits[start..start + dim]
+                        .iter()
+                        .map(|&bits| f32::from_bits(u32::from(bits) << 16)),
+                );
+            }
+        }
+        HostTensor::new([ids.data.len() as u64, dim as u64], out).map_err(KernelError::from)
     }
 
     /// `a x W` for a packed `W` whose stored rows are the output columns.
@@ -132,11 +714,12 @@ impl NativeState {
             k,
         };
         let mut out = vec![0.0_f32; m * n];
-        let chunk = n.div_ceil(self.pool.threads() * 4).max(8);
+        let pool = self.pool_for(m);
+        let chunk = n.div_ceil(pool.threads() * 4).max(8);
         let tasks = n.div_ceil(chunk);
         let shared = SharedOut(out.as_mut_ptr());
         let shared = &shared;
-        self.pool.run(tasks, &|task| {
+        pool.run(tasks, &|task| {
             let first = task * chunk;
             let count = chunk.min(n - first);
             let mut local = vec![0.0_f32; m * count];
@@ -170,12 +753,13 @@ impl NativeState {
         }
         let reader = quant::RunReader::new(weight);
         let runs = n / quant::RUN;
-        let chunk = runs.div_ceil(self.pool.threads() * 4).max(1);
+        let pool = self.pool_for(m);
+        let chunk = runs.div_ceil(pool.threads() * 4).max(1);
         let tasks = runs.div_ceil(chunk);
         let mut out = vec![0.0_f32; m * n];
         let shared = SharedOut(out.as_mut_ptr());
         let shared = &shared;
-        self.pool.run(tasks, &|task| {
+        pool.run(tasks, &|task| {
             let first_run = task * chunk;
             let run_count = chunk.min(runs - first_run);
             let width = run_count * quant::RUN;
@@ -220,19 +804,18 @@ impl NativeState {
         // (a tied embedding table) is used transposed.
         let product = if transpose_a {
             matmul(&a, &self.expand(weight), transpose_a, transpose_b).map_err(KernelError::from)?
-        } else if weight.transposed() != transpose_b {
-            self.packed_matmul(&a, weight)?
         } else {
-            self.packed_axpy(&a, weight)?
+            let live = self.live_rows(&a);
+            let rows = a.shape[0];
+            let a = live.as_ref().unwrap_or(&a);
+            let product = if weight.transposed() != transpose_b {
+                self.packed_matmul(a, weight)?
+            } else {
+                self.packed_axpy(a, weight)?
+            };
+            Self::with_padding_rows(product, rows)?
         };
-        match invocation.kernel.name.as_str() {
-            "matmul-bias" => {
-                add(&product, &executor.input_tensor(invocation, 2)?).map_err(KernelError::from)
-            }
-            "matmul-residual" => residual_add(&executor.input_tensor(invocation, 2)?, &product)
-                .map_err(KernelError::from),
-            _ => Ok(product),
-        }
+        Self::finish_matmul(executor, invocation, product)
     }
 
     fn f32_embedding(
@@ -339,11 +922,12 @@ impl NativeState {
         let offset = kv_len - seq_len;
         let pairs = head_count as usize * seq_len;
         let mut out = vec![0.0_f32; seq_len * q_width];
-        let chunk = pairs.div_ceil(self.pool.threads() * 4).max(1);
+        let pool = self.pool_for(seq_len);
+        let chunk = pairs.div_ceil(pool.threads() * 4).max(1);
         let shared = SharedOut(out.as_mut_ptr());
         let shared = &shared;
         let (q, k, v) = (&q.data, &k.data, &v.data);
-        self.pool.run(pairs.div_ceil(chunk), &|task| {
+        pool.run(pairs.div_ceil(chunk), &|task| {
             let mut weights = Vec::with_capacity(kv_len);
             let mut row = vec![0.0_f32; dim];
             for pair in task * chunk..((task + 1) * chunk).min(pairs) {
@@ -417,7 +1001,517 @@ impl NativeState {
     }
 }
 
+/// `silu(gate) * up`, elementwise, into `gate`'s values: the Reference CPU
+/// `silu` then `mul`, value for value.
+fn silu_times(mut gate: HostTensor, up: &HostTensor) -> Result<HostTensor, KernelError> {
+    if gate.shape != up.shape {
+        return Err(KernelError::KernelExecutionFailed {
+            reason: format!(
+                "gated-matmul products differ in shape: {:?} and {:?}",
+                gate.shape, up.shape
+            ),
+        });
+    }
+    for (g, &u) in gate.data.iter_mut().zip(&up.data) {
+        *g = silu_times_value(*g, u);
+    }
+    Ok(gate)
+}
+
+/// The first column of `scores` holding the highest finite score outside
+/// `excluded`, each score divided by `temperature` unless it is 0 (the
+/// first allowed column when none is higher); `None` when no column is
+/// allowed. Scanned by blocks whose highest score is taken first, which
+/// compilers turn into vector code, then searched in a block only when
+/// it holds a higher score: the column a one-by-one scan keeping the first
+/// strictly higher score picks.
+fn greedy_column(
+    scores: &[f32],
+    excluded: &[std::ops::Range<u64>],
+    temperature: f32,
+) -> Option<u64> {
+    let columns = scores.len();
+    let mut cuts: Vec<(usize, usize)> = excluded
+        .iter()
+        .map(|range| {
+            let clamp =
+                |bound: u64| usize::try_from(bound).map_or(columns, |bound| bound.min(columns));
+            (clamp(range.start), clamp(range.end))
+        })
+        .filter(|(start, end)| start < end)
+        .collect();
+    cuts.sort_unstable();
+    let mut segments = Vec::with_capacity(cuts.len() + 1);
+    let mut at = 0;
+    for (start, end) in cuts {
+        if start > at {
+            segments.push(at..start);
+        }
+        at = at.max(end);
+    }
+    if at < columns {
+        segments.push(at..columns);
+    }
+    let scaled = |score: f32| {
+        if temperature == 0.0 {
+            score
+        } else {
+            score / temperature
+        }
+    };
+    const BLOCK: usize = 512;
+    let mut best: Option<(f32, usize)> = None;
+    for segment in segments {
+        let mut first = segment.start;
+        while first < segment.end {
+            let block = first..(first + BLOCK).min(segment.end);
+            let values = &scores[block.clone()];
+            // The block's highest finite scaled score, and whether it has
+            // a finite score at all.
+            let (high, finite) = if temperature == 0.0 {
+                block_high(values, |score| score)
+            } else {
+                block_high(values, |score| score / temperature)
+            };
+            if finite {
+                let candidate = match best {
+                    None => true,
+                    Some((value, _)) => high > value,
+                };
+                if candidate {
+                    // The first finite column at the high score, else (a
+                    // block whose every finite score scales to a value no
+                    // comparison orders) the first finite column.
+                    let mut found = None;
+                    let mut first_finite = None;
+                    for (offset, &score) in values.iter().enumerate() {
+                        if !score.is_finite() {
+                            continue;
+                        }
+                        first_finite.get_or_insert(offset);
+                        if scaled(score) == high {
+                            found = Some(offset);
+                            break;
+                        }
+                    }
+                    let offset = found.or(first_finite)?;
+                    best = Some((scaled(values[offset]), block.start + offset));
+                }
+            }
+            first = block.end;
+        }
+    }
+    best.map(|(_, column)| column as u64)
+}
+
+/// The highest `scale(score)` of `values`' finite scores (negative
+/// infinity when none is higher), and whether any score is finite. Kept
+/// in sixteen independent lanes, which compilers turn into vector code (a
+/// single running maximum, an ordered reduction, they do not), then
+/// combined: the same highest value, whichever lane holds it.
+#[inline(always)]
+fn block_high(values: &[f32], scale: impl Fn(f32) -> f32) -> (f32, bool) {
+    const LANES: usize = 16;
+    let mut highs = [f32::NEG_INFINITY; LANES];
+    let mut finites = [0_u32; LANES];
+    let (chunks, rest) = values.as_chunks::<LANES>();
+    for chunk in chunks {
+        for lane in 0..LANES {
+            let score = chunk[lane];
+            let is_finite = score.is_finite();
+            let value = scale(score);
+            finites[lane] |= u32::from(is_finite);
+            highs[lane] = if is_finite && value > highs[lane] {
+                value
+            } else {
+                highs[lane]
+            };
+        }
+    }
+    let mut high = f32::NEG_INFINITY;
+    let mut finite = false;
+    for lane in 0..LANES {
+        finite |= finites[lane] != 0;
+        if highs[lane] > high {
+            high = highs[lane];
+        }
+    }
+    for &score in rest {
+        let is_finite = score.is_finite();
+        let value = scale(score);
+        finite |= is_finite;
+        if is_finite && value > high {
+            high = value;
+        }
+    }
+    (high, finite)
+}
+
+/// `silu(g) * u`, as the Reference CPU `silu` then `mul` compute it.
+#[inline]
+fn silu_times_value(g: f32, u: f32) -> f32 {
+    g * (1.0 / (1.0 + (-g).exp())) * u
+}
+
+impl NativeState {
+    /// The compact weight a matmul-family invocation this Provider runs
+    /// as a dense product reads, if it is one.
+    fn product_weight(&self, invocation: &KernelInvocation) -> Option<Arc<CompactWeight>> {
+        if cfg!(target_arch = "wasm32")
+            || !matches!(
+                invocation.kernel.name.as_str(),
+                "matmul" | "matmul-bias" | "matmul-residual"
+            )
+            || ReferenceCpuExecutor::attribute_bool(&invocation.attributes, "transpose_a", false)
+            || ReferenceCpuExecutor::require_f32_accumulation(&invocation.attributes).is_err()
+            || invocation.outputs.len() != 1
+        {
+            return None;
+        }
+        self.compact(&invocation.inputs.get(1)?.resource.id)
+    }
+
+    /// A replay's steps for a recorded step's `invocations`: each one
+    /// alone, except dense products of one input on compact weights (a
+    /// layer's query, key and value projections), which run as one group
+    /// at the first one's place. A later product joins the group only when
+    /// no invocation it moves ahead of writes what it reads, or reads or
+    /// writes what it writes, and no member of the group writes what a
+    /// member reads: the group then leaves what running the invocations in
+    /// their recorded order leaves.
+    fn schedule(&self, invocations: &[&KernelInvocation]) -> Vec<capture::Scheduled> {
+        /// How far ahead a product may be moved.
+        const WINDOW: usize = 8;
+        let ids = |resources: &[magnetar_kernel::kernel::KernelResource]| -> Vec<TensorResourceId> {
+            resources
+                .iter()
+                .map(|resource| resource.resource.id.clone())
+                .collect()
+        };
+        let reads: Vec<Vec<TensorResourceId>> = invocations
+            .iter()
+            .map(|invocation| ids(&invocation.inputs))
+            .collect();
+        let writes: Vec<Vec<TensorResourceId>> = invocations
+            .iter()
+            .map(|invocation| ids(&invocation.outputs))
+            .collect();
+        let meets =
+            |a: &[TensorResourceId], b: &[TensorResourceId]| a.iter().any(|id| b.contains(id));
+        let mut taken = vec![false; invocations.len()];
+        let mut steps = Vec::new();
+        for index in 0..invocations.len() {
+            if taken[index] {
+                continue;
+            }
+            taken[index] = true;
+            let mut members = vec![index];
+            if self.product_weight(invocations[index]).is_some() {
+                let input = &reads[index][0];
+                let mut passed: Vec<usize> = Vec::new();
+                for next in index + 1..(index + 1 + WINDOW).min(invocations.len()) {
+                    if taken[next] {
+                        continue;
+                    }
+                    let joins = reads[next].first() == Some(input)
+                        && self.product_weight(invocations[next]).is_some()
+                        && passed.iter().all(|&between| {
+                            !meets(&writes[between], &reads[next])
+                                && !meets(&reads[between], &writes[next])
+                                && !meets(&writes[between], &writes[next])
+                        })
+                        && {
+                            let mut group = members.clone();
+                            group.push(next);
+                            group.iter().all(|&member| {
+                                group
+                                    .iter()
+                                    .all(|&other| !meets(&writes[other], &reads[member]))
+                            })
+                        };
+                    if joins {
+                        taken[next] = true;
+                        members.push(next);
+                    } else {
+                        passed.push(next);
+                    }
+                }
+            }
+            steps.push(capture::Scheduled {
+                invocations: members,
+            });
+        }
+        steps
+    }
+
+    /// Runs a [`Self::schedule`] group: its products in one pool run
+    /// (each with the tasks it runs alone, so with the values it has
+    /// alone), then each finished and stored in order. `None`, having run
+    /// nothing, for a group whose products cannot be planned.
+    fn run_product_group<I: std::borrow::Borrow<KernelInvocation>>(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        group: &[I],
+    ) -> Option<Result<(), KernelError>> {
+        let group: Vec<&KernelInvocation> = group.iter().map(I::borrow).collect();
+        let weights = group
+            .iter()
+            .map(|invocation| self.product_weight(invocation))
+            .collect::<Option<Vec<_>>>()?;
+        let a = executor.input_tensor(group[0], 0).ok()?;
+        let rows = *a.shape.first()?;
+        let a = self.live_rows(&a).unwrap_or(a);
+        let products = weights
+            .iter()
+            .zip(&group)
+            .map(|(weight, invocation)| {
+                let transpose_b = ReferenceCpuExecutor::attribute_bool(
+                    &invocation.attributes,
+                    "transpose_b",
+                    false,
+                );
+                self.dense_plan(
+                    &a,
+                    dense::Values::Bf16(&weight.bits),
+                    weight.stored_shape(),
+                    transpose_b != weight.transposed,
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let computed = self.run_products(&a.data, &products);
+        for ((computed, product), invocation) in computed.into_iter().zip(&products).zip(group) {
+            let (m, n) = (product.m, product.n);
+            let stored = HostTensor::new([m as u64, n as u64], computed.into_sum(m * n))
+                .map_err(KernelError::from)
+                .and_then(|product| Self::with_padding_rows(product, rows))
+                .and_then(|product| Self::finish_matmul(executor, invocation, product))
+                .and_then(|output| executor.store_output(invocation, 0, output).map(|_| ()));
+            if let Err(error) = stored {
+                return Some(Err(error));
+            }
+        }
+        Some(Ok(()))
+    }
+
+    /// `gated-matmul` on two compact weights of one shape: both products
+    /// in one pool run, then their partial sums and the activation across
+    /// the pool. Each product's tasks are those it runs alone, its sums
+    /// are in the same order and the activation is [`silu_times`]', so the
+    /// values are those of the two products then `silu_times`. `None`
+    /// for any other form.
+    fn gated_dense(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+    ) -> Option<Result<HostTensor, KernelError>> {
+        if cfg!(target_arch = "wasm32")
+            || ReferenceCpuExecutor::attribute_bool(&invocation.attributes, "transpose_a", false)
+            || ReferenceCpuExecutor::require_f32_accumulation(&invocation.attributes).is_err()
+        {
+            return None;
+        }
+        let transpose_b =
+            ReferenceCpuExecutor::attribute_bool(&invocation.attributes, "transpose_b", false);
+        let gate = self.compact(&invocation.inputs.get(1)?.resource.id)?;
+        let up = self.compact(&invocation.inputs.get(2)?.resource.id)?;
+        let a = executor.input_tensor(invocation, 0).ok()?;
+        let rows = *a.shape.first()?;
+        let a = self.live_rows(&a).unwrap_or(a);
+        fn plan<'w>(
+            state: &NativeState,
+            a: &HostTensor,
+            weight: &'w CompactWeight,
+            transpose_b: bool,
+        ) -> Option<DenseProduct<'w>> {
+            state.dense_plan(
+                a,
+                dense::Values::Bf16(&weight.bits),
+                weight.stored_shape(),
+                transpose_b != weight.transposed,
+            )
+        }
+        let products = [
+            plan(self, &a, &gate, transpose_b)?,
+            plan(self, &a, &up, transpose_b)?,
+        ];
+        let (m, n) = (products[0].m, products[0].n);
+        if products[1].n != n {
+            return None;
+        }
+        let computed = self.run_products(&a.data, &products);
+        let (gate, up) = (&computed[0], &computed[1]);
+        let len = m * n;
+        let mut out = vec![0.0_f32; len];
+        let pool = self.pool_for(m);
+        let chunk = len.div_ceil(pool.threads()).next_multiple_of(64);
+        let shared = SharedOut(out.as_mut_ptr());
+        let shared = &shared;
+        pool.run(len.div_ceil(chunk), &|task| {
+            for index in task * chunk..((task + 1) * chunk).min(len) {
+                let g = gate.get(len, index);
+                let u = up.get(len, index);
+                // SAFETY: element `index` belongs to this task only.
+                unsafe { *shared.0.add(index) = silu_times_value(g, u) };
+            }
+        });
+        Some(
+            HostTensor::new([m as u64, n as u64], out)
+                .map_err(KernelError::from)
+                .and_then(|product| Self::with_padding_rows(product, rows)),
+        )
+    }
+
+    /// `a x W` for a matmul-family invocation whose weight is `id`: packed,
+    /// compact or f32; `None` for a form only the Reference CPU kernel takes.
+    fn weight_product(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+        id: &TensorResourceId,
+    ) -> Option<Result<HostTensor, KernelError>> {
+        match self.weight(id) {
+            Some(weight) => Some(self.matmul(executor, invocation, &weight)),
+            None => self.dense_matmul(executor, invocation, id),
+        }
+    }
+
+    /// `a x wᵀ` for a dense weight `w` in checkpoint `[out, in]` order,
+    /// compact or f32, across the pool; `None` for a packed weight or
+    /// mismatched shapes.
+    fn project(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        a: &HostTensor,
+        id: &TensorResourceId,
+    ) -> Option<Result<HostTensor, KernelError>> {
+        if self.weight(id).is_some() {
+            return None;
+        }
+        match self.compact(id) {
+            // A weight held transposed is used the other way round.
+            Some(weight) => self.dense_product(
+                a,
+                dense::Values::Bf16(&weight.bits),
+                weight.stored_shape(),
+                !weight.transposed,
+            ),
+            None => {
+                let storage = executor.storage.lock().unwrap();
+                let w = storage.get(id)?;
+                let (rows, cols) = w.rows_cols().ok()?;
+                if w.shape.len() != 2 {
+                    return None;
+                }
+                self.dense_product(
+                    a,
+                    dense::Values::F32(&w.data),
+                    [rows as usize, cols as usize],
+                    true,
+                )
+            }
+        }
+    }
+
+    /// `gated-delta-mixer` (`support-qwen38-flash-next`): the four input
+    /// projections and the output projection as this Provider's dense
+    /// matmuls (compact weights read in place, across the pool), everything
+    /// between them as the shared semantics compute it
+    /// (`gated_delta_mixer_from_projections`). `None` hands a form it does
+    /// not handle (a packed projection weight) to the Reference kernel.
+    fn gated_delta_mixer(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+    ) -> Option<Result<Vec<HostTensor>, KernelError>> {
+        if cfg!(target_arch = "wasm32") || !(12..=13).contains(&invocation.inputs.len()) {
+            return None;
+        }
+        let id = |index: usize| &invocation.inputs[index].resource.id;
+        if [3, 4, 5, 6, 11]
+            .iter()
+            .any(|&index| self.weight(id(index)).is_some())
+        {
+            return None;
+        }
+        Some((|| {
+            let config =
+                operator_semantics::gated_delta_mixer_from_attributes(&invocation.attributes)
+                    .map_err(KernelError::from)?;
+            let mut x = executor.input_tensor(invocation, 0)?;
+            let [tokens, hidden] = x.shape[..] else {
+                return Err(KernelError::KernelExecutionFailed {
+                    reason: "gated-delta hidden input must be rank two".into(),
+                });
+            };
+            // A masked token's input is zero, so are its projections.
+            if invocation.inputs.len() == 13 {
+                let mask = executor.input_tensor(invocation, 12)?;
+                if mask.shape != [tokens]
+                    || mask.data.iter().any(|&value| value != 0.0 && value != 1.0)
+                {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "gated-delta mask must be [tokens] zeros and ones".into(),
+                    });
+                }
+                for (row, &keep) in x.data.chunks_exact_mut(hidden as usize).zip(&mask.data) {
+                    if keep == 0.0 {
+                        row.fill(0.0);
+                    }
+                }
+            }
+            let shape_error = || KernelError::KernelExecutionFailed {
+                reason: "gated-delta projection weight does not match its input".into(),
+            };
+            let mut projections = Vec::with_capacity(4);
+            for index in 3..=6 {
+                let product = self
+                    .project(executor, &x, id(index))
+                    .ok_or_else(shape_error)??;
+                projections.push(product.data);
+            }
+            let states = [
+                executor.input_tensor(invocation, 1)?,
+                executor.input_tensor(invocation, 2)?,
+            ];
+            let weights = [7, 8, 9, 10].map(|index| executor.input_tensor(invocation, index));
+            let [convolution, a_log, dt_bias, norm] = weights;
+            let [normalized, convolution_state, recurrent_state] =
+                operator_semantics::gated_delta_mixer_from_projections(
+                    [
+                        &projections[0],
+                        &projections[1],
+                        &projections[2],
+                        &projections[3],
+                    ],
+                    tokens,
+                    [&states[0], &states[1]],
+                    [&convolution?, &a_log?, &dt_bias?, &norm?],
+                    config,
+                )
+                .map_err(KernelError::from)?;
+            let output = self
+                .project(executor, &normalized, id(11))
+                .ok_or_else(shape_error)??;
+            if output.shape != [tokens, hidden] {
+                return Err(shape_error());
+            }
+            Ok(vec![output, convolution_state, recurrent_state])
+        })())
+    }
+}
+
 impl PackedWeights for NativeState {
+    fn run_multi(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+    ) -> Option<Result<Vec<HostTensor>, KernelError>> {
+        match invocation.kernel.name.as_str() {
+            "gated-delta-mixer" => self.gated_delta_mixer(executor, invocation),
+            _ => None,
+        }
+    }
+
     fn run(
         &self,
         executor: &ReferenceCpuExecutor,
@@ -425,18 +1519,37 @@ impl PackedWeights for NativeState {
     ) -> Option<Result<HostTensor, KernelError>> {
         match invocation.kernel.name.as_str() {
             "matmul" | "matmul-bias" | "matmul-residual" => {
-                let weight = self.weight(&invocation.inputs.get(1)?.resource.id)?;
-                Some(self.matmul(executor, invocation, &weight))
+                self.weight_product(executor, invocation, &invocation.inputs.get(1)?.resource.id)
+            }
+            // `silu(a x gate) * (a x up)`: both products as the matmul
+            // family computes them, then the activation in place, with no
+            // intermediate resource and no separate `silu-mul` Kernel.
+            "gated-matmul" => {
+                if let Some(product) = self.gated_dense(executor, invocation) {
+                    return Some(product);
+                }
+                let gate = self.weight_product(
+                    executor,
+                    invocation,
+                    &invocation.inputs.get(1)?.resource.id,
+                )?;
+                let up = self.weight_product(
+                    executor,
+                    invocation,
+                    &invocation.inputs.get(2)?.resource.id,
+                )?;
+                Some(gate.and_then(|gate| up.and_then(|up| silu_times(gate, &up))))
             }
             "attention" => self.attention(executor, invocation),
             "embedding" => {
                 let id = &invocation.inputs.first()?.resource.id;
-                let rows = match self.weight(id) {
-                    Some(table) => self.embedding(executor, invocation, &table),
+                let rows = match (self.weight(id), self.compact(id)) {
+                    (Some(table), _) => self.embedding(executor, invocation, &table),
+                    (None, Some(table)) => Self::compact_embedding(executor, invocation, &table),
                     // An f32 table (one this Provider received dequantized):
                     // gather its rows in place instead of the Reference
                     // CPU kernel's copy of the whole table per lookup.
-                    None => Self::f32_embedding(executor, invocation, id),
+                    (None, None) => Self::f32_embedding(executor, invocation, id),
                 };
                 // `scale` multiplies every gathered row.
                 let scale =
@@ -453,12 +1566,24 @@ impl PackedWeights for NativeState {
     }
 
     fn materialize(&self, id: &TensorResourceId) -> Option<HostTensor> {
-        self.weight(id).map(|weight| self.expand(&weight))
+        if let Some(weight) = self.weight(id) {
+            return Some(self.expand(&weight));
+        }
+        let weight = self.compact(id)?;
+        let started = std::time::Instant::now();
+        let tensor = weight.expand();
+        let mut materialized = self.materialized.lock().unwrap();
+        materialized.0 += 1;
+        materialized.1 += started.elapsed().as_secs_f64();
+        Some(tensor)
     }
 
     fn shape(&self, id: &TensorResourceId) -> Option<Vec<u64>> {
-        self.weight(id)
-            .map(|weight| weight.logical_shape().to_vec())
+        if let Some(weight) = self.weight(id) {
+            return Some(weight.logical_shape().to_vec());
+        }
+        self.compact(id)
+            .map(|weight| vec![weight.rows as u64, weight.cols as u64])
     }
 }
 
@@ -469,6 +1594,11 @@ pub struct NativeCpuExecutor {
     inner: Arc<ReferenceCpuExecutor>,
     state: Arc<NativeState>,
     packed_weights: bool,
+    /// Whether exact bfloat16 dense weights are stored compact.
+    compact_weights: bool,
+    /// Whether steps are captured and replayed ([`capture`]).
+    step_capture: bool,
+    capture: Mutex<capture::CaptureState>,
     /// Per-Kernel invocation counts and seconds, when [`PROFILE_ENV`] is set.
     profile: Option<Mutex<BTreeMap<String, (u64, f64)>>>,
 }
@@ -510,22 +1640,52 @@ impl NativeCpuExecutor {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&threads| threads > 0)
             .unwrap_or_else(|| {
+                // Every logical CPU: on the 2-core, 4-thread benchmark
+                // runners one thread per physical core was slower (TTFT
+                // 81.3 against 71.5 ms, TPOT 35.8 against 34.8 ms, run
+                // 45343428878).
                 std::thread::available_parallelism()
                     .map(|count| count.get())
                     .unwrap_or(1)
             });
-        Self::with_settings(
+        let decode_threads = std::env::var(DECODE_THREADS_ENV)
+            .ok()
+            .and_then(|value| match value.as_str() {
+                "cores" => Some(topology::one_per_core()),
+                _ => value.parse::<usize>().ok(),
+            })
+            .filter(|&decode| decode > 0 && decode != threads);
+        let mut executor = Self::with_pools(
             std::env::var(PACKED_WEIGHTS_ENV).as_deref() != Ok("0"),
             std::env::var(INT8_ACTIVATIONS_ENV).as_deref() != Ok("0"),
             threads,
-        )
+            decode_threads,
+        );
+        executor.compact_weights = std::env::var(COMPACT_WEIGHTS_ENV).as_deref() != Ok("0");
+        executor.step_capture = std::env::var(STEP_CAPTURE_ENV).as_deref() != Ok("0");
+        executor
     }
 
     /// An executor with explicit controls (tests, embedders).
     pub fn with_settings(packed_weights: bool, int8_activations: bool, threads: usize) -> Self {
+        Self::with_pools(packed_weights, int8_activations, threads, None)
+    }
+
+    /// [`Self::with_settings`], one-row Kernels running on a pool of
+    /// `decode_threads` threads of their own when it is given
+    /// ([`DECODE_THREADS_ENV`]).
+    pub fn with_pools(
+        packed_weights: bool,
+        int8_activations: bool,
+        threads: usize,
+        decode_threads: Option<usize>,
+    ) -> Self {
         let state = Arc::new(NativeState {
             packed: Mutex::new(BTreeMap::new()),
+            compact: Mutex::new(BTreeMap::new()),
+            padding_rows: std::sync::atomic::AtomicUsize::new(0),
             pool: pool::Pool::new(threads),
+            decode_pool: decode_threads.map(pool::Pool::new),
             int8_activations,
             materialized: Mutex::new((0, 0.0)),
         });
@@ -538,6 +1698,9 @@ impl NativeCpuExecutor {
             inner: Arc::new(inner),
             state,
             packed_weights,
+            compact_weights: true,
+            step_capture: true,
+            capture: Mutex::new(capture::CaptureState::default()),
             profile: (std::env::var(PROFILE_ENV).as_deref() == Ok("1"))
                 .then(|| Mutex::new(BTreeMap::new())),
         }
@@ -552,13 +1715,88 @@ impl NativeCpuExecutor {
         self.state.pool.threads()
     }
 
-    /// Whether `id` is held packed.
-    pub fn is_packed(&self, id: &TensorResourceId) -> bool {
-        self.state.weight(id).is_some()
+    /// Runs a replay's invocations, in order.
+    fn run_recorded(
+        &self,
+        recording: &capture::Recording,
+        invocations: &[std::borrow::Cow<'_, KernelInvocation>],
+    ) -> Result<(), magnetar_provider_api::StepReplayError> {
+        let invocations: Vec<&KernelInvocation> = invocations
+            .iter()
+            .map(|invocation| invocation.as_ref())
+            .collect();
+        let schedule = recording
+            .schedule
+            .get_or_init(|| self.state.schedule(&invocations));
+        for step in schedule {
+            let members: Vec<&KernelInvocation> = step
+                .invocations
+                .iter()
+                .map(|&index| invocations[index])
+                .collect();
+            if members.len() > 1 {
+                // Dense products of one input in one pool run.
+                let started = self.profile.as_ref().map(|_| std::time::Instant::now());
+                let ran = self.state.run_product_group(&self.inner, &members);
+                self.profile("grouped products", started);
+                match ran {
+                    Some(Ok(())) => continue,
+                    Some(Err(error)) => {
+                        return Err(capture::replay_failed(format!(
+                            "replaying grouped {}: {error:?}",
+                            members[0].kernel.name
+                        )));
+                    }
+                    // One by one, in the step's order.
+                    None => {}
+                }
+            }
+            for invocation in members {
+                let started = self.profile.as_ref().map(|_| std::time::Instant::now());
+                let ran = self.inner.run_invocation_unrecorded(invocation);
+                self.profile(&invocation.kernel.name, started);
+                if let Err(error) = ran {
+                    return Err(capture::replay_failed(format!(
+                        "replaying {}: {error:?}",
+                        invocation.kernel.name
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
+    /// Fails the step capture in progress, if any: `what` writes host data
+    /// a replay would not write again.
+    fn poison_capture(&self, what: &str) {
+        self.capture.lock().unwrap().poison(what);
+    }
+
+    /// Adds `seconds` of Kernel `name` to the profile, when profiling.
+    fn profile(&self, name: &str, started: Option<std::time::Instant>) {
+        if let (Some(profile), Some(started)) = (&self.profile, started) {
+            let mut profile = profile.lock().unwrap();
+            let entry = profile.entry(name.to_string()).or_default();
+            entry.0 += 1;
+            entry.1 += started.elapsed().as_secs_f64();
+        }
+    }
+
+    /// Whether `id` is held packed, or compact.
+    pub fn is_packed(&self, id: &TensorResourceId) -> bool {
+        self.state.weight(id).is_some() || self.is_compact(id)
+    }
+
+    /// Whether `id` is held as compact bfloat16 bits.
+    pub fn is_compact(&self, id: &TensorResourceId) -> bool {
+        self.state.compact(id).is_some()
+    }
+
+    /// Forgets a packed or compact weight `id`, which is being replaced.
     fn forget_packed(&self, id: &TensorResourceId) -> bool {
-        self.state.packed.lock().unwrap().remove(id).is_some()
+        let packed = self.state.packed.lock().unwrap().remove(id).is_some();
+        let compact = self.state.compact.lock().unwrap().remove(id).is_some();
+        packed || compact
     }
 }
 
@@ -610,12 +1848,19 @@ impl ProviderExecutionApi for NativeCpuExecutor {
             invocation,
             memory,
         );
-        if let (Some(profile), Some(started)) = (&self.profile, started) {
-            let mut profile = profile.lock().unwrap();
-            let entry = profile.entry(invocation.kernel.name.clone()).or_default();
-            entry.0 += 1;
-            entry.1 += started.elapsed().as_secs_f64();
+        self.profile(&invocation.kernel.name, started);
+        let mut state = self.capture.lock().unwrap();
+        if let Some(recording) = &mut state.recording {
+            match &handle {
+                Ok(_) => recording.invocations.push(invocation.clone()),
+                Err(_) => {
+                    recording
+                        .failure
+                        .get_or_insert_with(|| "a submission failed".into());
+                }
+            }
         }
+        drop(state);
         handle
     }
 
@@ -631,8 +1876,35 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         id: TensorResourceId,
         tensor: HostTensor,
     ) -> Result<(), ProviderExecutionError> {
+        self.poison_capture("a host tensor write");
         self.forget_packed(&id);
         ProviderExecutionApi::write_tensor(&*self.inner, id, tensor)
+    }
+
+    /// A weight whose every value is exactly a bfloat16 value is stored
+    /// as those values' bits (`speed-up-dense-cpu-matmuls`); any other one
+    /// as f32.
+    fn write_weight_tensor(
+        &self,
+        id: TensorResourceId,
+        tensor: HostTensor,
+    ) -> Result<(), ProviderExecutionError> {
+        self.poison_capture("a weight write");
+        let compact = self
+            .compact_weights
+            .then(|| CompactWeight::of(&tensor))
+            .flatten();
+        let Some(compact) = compact else {
+            return self.write_tensor(id, tensor);
+        };
+        self.forget_packed(&id);
+        self.inner.storage.lock().unwrap().remove(&id);
+        self.state
+            .compact
+            .lock()
+            .unwrap()
+            .insert(id, Arc::new(compact));
+        Ok(())
     }
 
     fn write_packed_weight_tensor(
@@ -640,6 +1912,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         id: TensorResourceId,
         weight: PackedWeight,
     ) -> Result<PackedWeightWrite, ProviderExecutionError> {
+        self.poison_capture("a packed weight write");
         if !self.packed_weights {
             return Ok(PackedWeightWrite::Declined);
         }
@@ -678,6 +1951,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
     ) -> Result<(), MemoryError> {
+        self.poison_capture("a host tensor write");
         // A packed weight is replaced only once its replacement is admitted
         // and stored: a denied admission leaves it resident.
         ProviderExecutionApi::write_tensor_admitted(
@@ -713,6 +1987,9 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         // Writing back an `Opaque` value (what `read_tensor_value` returns)
         // stores nothing, so a packed weight stays resident.
         let replaces = !matches!(value, TensorValue::Opaque);
+        if replaces {
+            self.poison_capture("a host tensor write");
+        }
         ProviderExecutionApi::write_tensor_value(&*self.inner, id.clone(), value)?;
         if replaces {
             self.forget_packed(&id);
@@ -729,6 +2006,9 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         owner: MemoryAllocationOwner,
     ) -> Result<(), TensorValueAdmissionError> {
         let replaces = !matches!(value, TensorValue::Opaque);
+        if replaces {
+            self.poison_capture("a host tensor write");
+        }
         ProviderExecutionApi::write_tensor_value_admitted(
             &*self.inner,
             memory,
@@ -751,6 +2031,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         class: MemoryAllocationClass,
         owner: MemoryAllocationOwner,
     ) -> Result<MemoryAllocationId, TensorValueAdmissionError> {
+        self.poison_capture("a tensor copy");
         let allocation = ProviderExecutionApi::copy_tensor_admitted(
             &*self.inner,
             memory,
@@ -771,6 +2052,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         precision: KvStorePrecision,
         head_dimension: u64,
     ) -> Result<bool, ProviderExecutionError> {
+        self.poison_capture("a KV store reset");
         // The store replaces whatever `id` held, a packed weight included.
         self.forget_packed(id);
         Ok(self
@@ -786,6 +2068,7 @@ impl ProviderExecutionApi for NativeCpuExecutor {
         head_dimension: u64,
         exact_rows: u64,
     ) -> Result<bool, ProviderExecutionError> {
+        self.poison_capture("a KV store reset");
         // The store replaces whatever `id` held, a packed weight included.
         self.forget_packed(id);
         Ok(self.inner.write_zeroed_kv_store_with_exact_head(
@@ -807,6 +2090,130 @@ impl ProviderExecutionApi for NativeCpuExecutor {
 
     fn observations(&self) -> Vec<KernelObservation> {
         ProviderExecutionApi::observations(&*self.inner)
+    }
+
+    fn supports_step_capture(&self) -> bool {
+        self.step_capture && !cfg!(target_arch = "wasm32")
+    }
+
+    fn begin_step_capture(
+        &self,
+        request: &magnetar_provider_api::StepCaptureRequest,
+    ) -> Result<(), ProviderExecutionError> {
+        let mut state = self.capture.lock().unwrap();
+        if !self.supports_step_capture() || state.recording.is_some() {
+            return Err(ProviderExecutionError::new(
+                ProviderExecutionErrorCode::UnsupportedOperation,
+                ProviderExecutionPhase::Submit,
+                ProviderBinding::new(NATIVE_CPU_PROVIDER_NAME),
+                None,
+                "step capture is off or already in progress",
+            ));
+        }
+        state.recording = Some(capture::Recording {
+            advancing: request.advancing_attributes.clone(),
+            ..capture::Recording::default()
+        });
+        Ok(())
+    }
+
+    fn end_step_capture(
+        &self,
+    ) -> Result<magnetar_provider_api::StepCaptureId, ProviderExecutionError> {
+        let mut state = self.capture.lock().unwrap();
+        let failed = |reason: String| {
+            ProviderExecutionError::new(
+                ProviderExecutionErrorCode::UnsupportedOperation,
+                ProviderExecutionPhase::Complete,
+                ProviderBinding::new(NATIVE_CPU_PROVIDER_NAME),
+                None,
+                reason,
+            )
+        };
+        let recording = state
+            .recording
+            .take()
+            .ok_or_else(|| failed("no step capture in progress".into()))?;
+        if let Some(reason) = recording.failure {
+            return Err(failed(reason));
+        }
+        let id = magnetar_provider_api::StepCaptureId::new(format!("cpu-step:{}", state.next));
+        state.next += 1;
+        state.captures.insert(id.clone(), Arc::new(recording));
+        Ok(id)
+    }
+
+    fn abort_step_capture(&self) {
+        self.capture.lock().unwrap().recording = None;
+    }
+
+    fn replay_step(
+        &self,
+        id: &magnetar_provider_api::StepCaptureId,
+        offset: u64,
+        inputs: Vec<(TensorResourceId, HostTensor)>,
+    ) -> Result<(), magnetar_provider_api::StepReplayError> {
+        let recording = self
+            .capture
+            .lock()
+            .unwrap()
+            .captures
+            .get(id)
+            .cloned()
+            .ok_or_else(|| magnetar_provider_api::StepReplayError::Invalidated {
+                reason: format!("no capture {}", id.as_str()),
+            })?;
+        // Every attribute advanced first: an offset that does not fit runs
+        // nothing.
+        let invocations = recording
+            .invocations
+            .iter()
+            .map(|invocation| capture::advanced(invocation, &recording.advancing, offset))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (id, tensor) in inputs {
+            self.forget_packed(&id);
+            self.inner.write_tensor(id, tensor);
+        }
+        // A replayed bucketed prefill: its row matmuls skip the padding.
+        let padding = if recording
+            .advancing
+            .iter()
+            .any(|name| name == PADDING_ROWS_ATTRIBUTE)
+        {
+            usize::try_from(offset).unwrap_or(0)
+        } else {
+            0
+        };
+        self.state
+            .padding_rows
+            .store(padding, std::sync::atomic::Ordering::Relaxed);
+        let ran = self.run_recorded(&recording, &invocations);
+        self.state
+            .padding_rows
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        ran
+    }
+
+    fn release_step_capture(&self, id: &magnetar_provider_api::StepCaptureId) {
+        self.capture.lock().unwrap().captures.remove(id);
+    }
+
+    /// The highest-scoring column of `logits`' row `row` outside
+    /// `excluded`, each score divided by `temperature` unless it is 0,
+    /// read in place.
+    fn select_greedy_column(
+        &self,
+        logits: &TensorResourceId,
+        row: u64,
+        excluded: &[std::ops::Range<u64>],
+        temperature: f32,
+    ) -> Option<u64> {
+        let storage = self.inner.storage.lock().unwrap();
+        let tensor = storage.get(logits)?;
+        let columns = *tensor.shape.last()? as usize;
+        let start = usize::try_from(row).ok()?.checked_mul(columns)?;
+        let scores = tensor.data.get(start..start.checked_add(columns)?)?;
+        greedy_column(scores, excluded, temperature)
     }
 }
 

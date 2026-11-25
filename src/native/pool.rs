@@ -4,9 +4,31 @@
 
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+/// How long a worker that finished a job, and a caller waiting for the
+/// last tasks, poll before sleeping. A decode step runs a pooled Kernel
+/// every few hundred microseconds: workers polling between them start the
+/// next one at once, where a sleeping worker's wake-up (tens to hundreds of
+/// microseconds) left the caller running most of its tasks alone.
+const SPIN: Duration = Duration::from_micros(500);
+
+/// Polls `ready` until it holds or [`SPIN`] has passed; whether it holds.
+fn spin_until(ready: impl Fn() -> bool) -> bool {
+    let start = Instant::now();
+    let mut polls = 0_u32;
+    while !ready() {
+        std::hint::spin_loop();
+        polls = polls.wrapping_add(1);
+        if polls.is_multiple_of(256) && start.elapsed() >= SPIN {
+            return ready();
+        }
+    }
+    true
+}
 
 type Task = dyn Fn(usize) + Sync;
 
@@ -53,6 +75,9 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     wake: Condvar,
+    /// `State::generation`, readable without the lock, for polling workers.
+    posted: AtomicU64,
+    stopping: AtomicBool,
 }
 
 pub struct Pool {
@@ -69,6 +94,8 @@ impl Pool {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
+            posted: AtomicU64::new(0),
+            stopping: AtomicBool::new(false),
         });
         let workers = (1..threads.max(1))
             .map(|_| {
@@ -76,6 +103,10 @@ impl Pool {
                 std::thread::spawn(move || {
                     let mut seen = 0;
                     loop {
+                        spin_until(|| {
+                            shared.posted.load(Ordering::Acquire) != seen
+                                || shared.stopping.load(Ordering::Acquire)
+                        });
                         let job = {
                             let mut state = shared.state.lock().unwrap();
                             while !state.shutdown && state.generation == seen {
@@ -133,12 +164,17 @@ impl Pool {
             let mut state = self.shared.state.lock().unwrap();
             state.job = Some(job.clone());
             state.generation += 1;
+            self.shared
+                .posted
+                .store(state.generation, Ordering::Release);
         }
         self.shared.wake.notify_all();
         job.work();
-        let mut finished = job.finished.lock().unwrap();
-        while !*finished {
-            finished = job.done.wait(finished).unwrap();
+        if !spin_until(|| job.pending.load(Ordering::Acquire) == 0) {
+            let mut finished = job.finished.lock().unwrap();
+            while !*finished {
+                finished = job.done.wait(finished).unwrap();
+            }
         }
         self.shared.state.lock().unwrap().job = None;
     }
@@ -147,6 +183,7 @@ impl Pool {
 impl Drop for Pool {
     fn drop(&mut self) {
         self.shared.state.lock().unwrap().shutdown = true;
+        self.shared.stopping.store(true, Ordering::Release);
         self.shared.wake.notify_all();
         for worker in self.workers.drain(..) {
             let _ = worker.join();

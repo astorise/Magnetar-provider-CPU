@@ -113,17 +113,20 @@ use magnetar_core::{
     device::DeviceMetadata, device::DeviceType,
 };
 use magnetar_core::{
-    operator::ATTENTION_LATENT_KV_FEATURE, operator::ATTENTION_SCALE_FEATURE,
-    operator::ATTENTION_TURBOQUANT_KV_FEATURE, operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
+    operator::ACTIVATION_RELU_SQUARED_FEATURE, operator::ATTENTION_LATENT_KV_FEATURE,
+    operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_TURBOQUANT_KV_FEATURE,
+    operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
     operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
     operator::ConcatAxis, operator::EMBEDDING_SCALE_FEATURE,
     operator::KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE, operator::KV_WRITE_TURBOQUANT_FEATURE,
     operator::MOE_EXPERTS_ACTIVATION_FEATURE, operator::MOE_PER_EXPERT_SCALE_FEATURE,
+    operator::MOE_RELU_SQUARED_FEATURE, operator::MOE_SIGMOID_ROUTING_FEATURE,
     operator::OperatorAttributeValue, operator::OperatorFamily, operator::OperatorId,
     operator::OperatorSpec, operator::RMSNORM_PER_HEAD_FEATURE,
-    operator::RMSNORM_WITHOUT_WEIGHT_FEATURE, operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE,
-    operator::ROPE_PARTIAL_ROTARY_FEATURE, operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE,
-    operator::RopeBandedFrequencyScaling, operator::RopeYarnFrequencyScaling,
+    operator::RMSNORM_WEIGHT_OFFSET_FEATURE, operator::RMSNORM_WITHOUT_WEIGHT_FEATURE,
+    operator::ROPE_BANDED_FREQUENCY_SCALING_FEATURE, operator::ROPE_PARTIAL_ROTARY_FEATURE,
+    operator::ROPE_YARN_FREQUENCY_SCALING_FEATURE, operator::RopeBandedFrequencyScaling,
+    operator::RopeYarnFrequencyScaling, operator::SPLIT_PER_HEAD_FEATURE,
     operator::TensorLayoutKind, operator::TensorRole, operator::concat_axis,
 };
 use magnetar_graph::{
@@ -342,6 +345,38 @@ pub fn embedding_lookup(
         out.extend_from_slice(&table.data[start..start + dim as usize]);
     }
     HostTensor::new([ids.data.len() as u64, dim], out)
+}
+
+/// The two halves of each of `head_count` equal blocks of the last
+/// dimension: the first halves in order, then the second halves.
+fn split_heads_in_half(
+    input: &HostTensor,
+    head_count: u64,
+) -> Result<[HostTensor; 2], KernelError> {
+    let invalid = |reason: String| KernelError::KernelExecutionFailed { reason };
+    let Some((&width, outer)) = input.shape.split_last() else {
+        return Err(invalid("split needs at least one dimension".into()));
+    };
+    if head_count == 0 || width == 0 || !width.is_multiple_of(2 * head_count) {
+        return Err(invalid(format!(
+            "split of width {width} across {head_count} head(s) needs a multiple of {}",
+            2 * head_count
+        )));
+    }
+    let block = (width / head_count) as usize;
+    let half = block / 2;
+    let mut left = Vec::with_capacity(input.data.len() / 2);
+    let mut right = Vec::with_capacity(input.data.len() / 2);
+    for chunk in input.data.chunks_exact(block) {
+        left.extend_from_slice(&chunk[..half]);
+        right.extend_from_slice(&chunk[half..]);
+    }
+    let mut shape = outer.to_vec();
+    shape.push(width / 2);
+    let tensor = |data: Vec<f32>| {
+        HostTensor::new(shape.clone(), data).map_err(|error| invalid(error.to_string()))
+    };
+    Ok([tensor(left)?, tensor(right)?])
 }
 
 /// Correctness-first RMSNorm with `f32` accumulation.
@@ -663,15 +698,21 @@ pub fn rope_scaled(
     let head_width = head_width as usize;
     let table = frequencies.table(base, dimension, rotated_pairs.min(half));
     let amplitude = frequencies.amplitude();
+    // A row's rotations depend on its position and the pair, not the head:
+    // computed once per row for every head.
+    let mut rotations = Vec::with_capacity(table.len());
     for row in 0..rows as usize {
         let position = ((position_offset as usize + row) as f32) * scale;
         let row_start = row * cols as usize;
+        rotations.clear();
+        rotations.extend(table.iter().map(|&frequency| {
+            let angle = position * frequency;
+            let (sin, cos) = angle.sin_cos();
+            (sin * amplitude, cos * amplitude)
+        }));
         for head in 0..head_count as usize {
             let col_base = row_start + head * head_width;
-            for (pair, &frequency) in table.iter().enumerate() {
-                let angle = position * frequency;
-                let (sin, cos) = angle.sin_cos();
-                let (sin, cos) = (sin * amplitude, cos * amplitude);
+            for (pair, &(sin, cos)) in rotations.iter().enumerate() {
                 let (first, second) = match pairing {
                     RopePairing::Interleaved => (col_base + 2 * pair, col_base + 2 * pair + 1),
                     RopePairing::HalfSplit => (col_base + pair, col_base + pair + half),
@@ -1427,12 +1468,21 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
     let rmsnorm = with_features(
         "rmsnorm",
         OperatorFamily::Normalization,
-        &[RMSNORM_PER_HEAD_FEATURE, RMSNORM_WITHOUT_WEIGHT_FEATURE],
+        &[
+            RMSNORM_PER_HEAD_FEATURE,
+            RMSNORM_WITHOUT_WEIGHT_FEATURE,
+            RMSNORM_WEIGHT_OFFSET_FEATURE,
+        ],
     );
     let moe_experts = with_features(
         "moe-experts",
         OperatorFamily::LinearAlgebra,
-        &[MOE_EXPERTS_ACTIVATION_FEATURE, MOE_PER_EXPERT_SCALE_FEATURE],
+        &[
+            MOE_EXPERTS_ACTIVATION_FEATURE,
+            MOE_PER_EXPERT_SCALE_FEATURE,
+            MOE_SIGMOID_ROUTING_FEATURE,
+            MOE_RELU_SQUARED_FEATURE,
+        ],
     );
     let rope = with_features(
         "rope",
@@ -1453,6 +1503,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("matmul-bias", OperatorFamily::LinearAlgebra),
         baseline_advertisement("matmul-residual", OperatorFamily::LinearAlgebra),
         baseline_advertisement("silu-mul", OperatorFamily::Activation),
+        baseline_advertisement("gated-matmul", OperatorFamily::LinearAlgebra),
         baseline_advertisement("batched-matmul", OperatorFamily::LinearAlgebra),
         moe_experts,
         baseline_advertisement("row-scale", OperatorFamily::Tensor),
@@ -1460,10 +1511,36 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         rmsnorm,
         rope,
         attention,
+        baseline_advertisement("encoder-attention", OperatorFamily::Attention),
+        baseline_advertisement("differential-attention", OperatorFamily::Attention),
+        baseline_advertisement(
+            "projected-differential-attention",
+            OperatorFamily::Attention,
+        ),
+        baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("gated-delta-mixer", OperatorFamily::LinearAlgebra),
+        with_features("split", OperatorFamily::Tensor, &[SPLIT_PER_HEAD_FEATURE]),
+        baseline_advertisement("gated-residual", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("gated-residual-final", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("gated-residual-inject", OperatorFamily::Tensor),
+        baseline_advertisement("repeat-features", OperatorFamily::Tensor),
+        baseline_advertisement("qsa-select", OperatorFamily::Tensor),
+        baseline_advertisement("ngram-embedding", OperatorFamily::Tensor),
+        baseline_advertisement("ngram-ple", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("mamba3-mimo", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("mamba3-mixer", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("token-shift", OperatorFamily::Tensor),
+        baseline_advertisement("affine-layernorm", OperatorFamily::Normalization),
+        baseline_advertisement("gelu-exact", OperatorFamily::Activation),
+        baseline_advertisement("slice-last", OperatorFamily::Tensor),
         baseline_advertisement("softmax", OperatorFamily::Activation),
         baseline_advertisement("silu", OperatorFamily::Activation),
         baseline_advertisement("gelu", OperatorFamily::Activation),
-        baseline_advertisement("activation", OperatorFamily::Activation),
+        with_features(
+            "activation",
+            OperatorFamily::Activation,
+            &[ACTIVATION_RELU_SQUARED_FEATURE],
+        ),
         baseline_advertisement("add", OperatorFamily::Tensor),
         concat,
         // Creates and writes TurboQuant stores (`turboquant-kv-history`),
@@ -1478,6 +1555,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         ),
         baseline_advertisement("mul", OperatorFamily::Tensor),
         baseline_advertisement("residual-add", OperatorFamily::Tensor),
+        baseline_advertisement("geodesic-residual", OperatorFamily::Tensor),
         baseline_advertisement("dtype-conversion", OperatorFamily::Tensor),
         baseline_advertisement("layout-conversion", OperatorFamily::Layout),
     ]
@@ -1610,6 +1688,18 @@ impl ReferenceCpuExecutor {
 
     pub fn write_tensor(&self, id: TensorResourceId, tensor: HostTensor) {
         self.storage.lock().unwrap().insert(id, tensor);
+    }
+
+    /// [`Self::write_tensor`] under a borrowed id: a Kernel's output slot,
+    /// rewritten every step, keeps its key instead of a copy of it.
+    fn write_tensor_at(&self, id: &TensorResourceId, tensor: HostTensor) {
+        let mut storage = self.storage.lock().unwrap();
+        match storage.get_mut(id) {
+            Some(slot) => *slot = tensor,
+            None => {
+                storage.insert(id.clone(), tensor);
+            }
+        }
     }
 
     pub fn read_tensor(&self, id: &TensorResourceId) -> Option<HostTensor> {
@@ -2423,12 +2513,12 @@ impl ReferenceCpuExecutor {
             })
     }
 
-    fn store_output(
+    fn store_output<'a>(
         &self,
-        invocation: &KernelInvocation,
+        invocation: &'a KernelInvocation,
         index: usize,
         tensor: HostTensor,
-    ) -> Result<TensorResourceDescriptor, KernelError> {
+    ) -> Result<&'a TensorResourceDescriptor, KernelError> {
         let resource =
             invocation
                 .outputs
@@ -2436,8 +2526,68 @@ impl ReferenceCpuExecutor {
                 .ok_or_else(|| KernelError::KernelExecutionFailed {
                     reason: format!("missing output at index {index}"),
                 })?;
-        self.write_tensor(resource.resource.id.clone(), tensor);
-        Ok(resource.resource.clone())
+        self.write_tensor_at(&resource.resource.id, tensor);
+        Ok(&resource.resource)
+    }
+
+    /// Calls `run` with input `index` of `invocation`, borrowed where it
+    /// is stored (no copy), or materialized when it is a packed weight.
+    fn with_input<R>(
+        &self,
+        invocation: &KernelInvocation,
+        index: usize,
+        run: impl FnOnce(&HostTensor) -> Result<R, KernelError>,
+    ) -> Result<R, KernelError> {
+        self.with_inputs(invocation, &[index], |inputs| run(inputs[0]))
+    }
+
+    /// Calls `run` with the `indices` inputs of `invocation`, each borrowed
+    /// where it is stored or materialized when it is a packed weight: the
+    /// values [`Self::input_tensor`] reads, without copying stored ones.
+    /// `run` holds the storage lock, so it must not read or write storage.
+    fn with_inputs<R>(
+        &self,
+        invocation: &KernelInvocation,
+        indices: &[usize],
+        run: impl FnOnce(&[&HostTensor]) -> Result<R, KernelError>,
+    ) -> Result<R, KernelError> {
+        let storage = self.storage.lock().unwrap();
+        let mut materialized = Vec::new();
+        for &index in indices {
+            let id = &invocation
+                .inputs
+                .get(index)
+                .ok_or_else(|| KernelError::KernelExecutionFailed {
+                    reason: format!("missing input at index {index}"),
+                })?
+                .resource
+                .id;
+            if storage.contains_key(id) {
+                continue;
+            }
+            let tensor = self
+                .packed
+                .as_ref()
+                .and_then(|packed| packed.materialize(id))
+                .ok_or_else(|| KernelError::KernelExecutionFailed {
+                    reason: format!("no materialized data for input resource {id}"),
+                })?;
+            materialized.push((index, tensor));
+        }
+        let inputs: Vec<&HostTensor> = indices
+            .iter()
+            .map(|&index| {
+                let id = &invocation.inputs[index].resource.id;
+                storage.get(id).unwrap_or_else(|| {
+                    &materialized
+                        .iter()
+                        .find(|(at, _)| *at == index)
+                        .expect("materialized above")
+                        .1
+                })
+            })
+            .collect();
+        run(&inputs)
     }
 
     /// `matmul` and `matmul-bias` accumulate in f32 only; any other
@@ -2526,24 +2676,98 @@ impl ReferenceCpuExecutor {
     }
 
     fn run_invocation(&self, invocation: &KernelInvocation) -> Result<KernelResult, KernelError> {
+        self.run_invocation_recording(invocation, true)
+    }
+
+    /// Runs `invocation` without building its [`KernelResult`]: a replayed
+    /// step's invocations, whose results nothing reads.
+    pub(crate) fn run_invocation_unrecorded(
+        &self,
+        invocation: &KernelInvocation,
+    ) -> Result<(), KernelError> {
+        self.run_invocation_recording(invocation, false).map(|_| ())
+    }
+
+    /// [`Self::run_invocation`]; with `record` false, the result lists no
+    /// output (no copies of the output descriptors and ids).
+    fn run_invocation_recording(
+        &self,
+        invocation: &KernelInvocation,
+        record: bool,
+    ) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
+        if matches!(name, "affine-layernorm" | "gelu-exact" | "slice-last")
+            && invocation.outputs.iter().any(|output| {
+                invocation
+                    .inputs
+                    .iter()
+                    .any(|input| input.resource.id == output.resource.id)
+            })
+        {
+            return Err(KernelError::KernelAliasingUnsupported);
+        }
         let mut result = KernelResult::success(invocation.id.clone());
         if name == "kv-write" {
             let descriptor = self.run_kv_write(invocation)?;
-            result
-                .output_readiness
-                .insert(descriptor.id.to_string(), true);
-            result.updated_resources.push(descriptor);
+            if record {
+                result
+                    .output_readiness
+                    .insert(descriptor.id.to_string(), true);
+                result.updated_resources.push(descriptor);
+            }
+            return Ok(result);
+        }
+        if let Some(packed) = &self.packed
+            && let Some(outputs) = packed.run_multi(self, invocation)
+        {
+            // Every output distinct from the inputs and from each other, as
+            // the Reference kernels require.
+            let ids: Vec<_> = invocation.outputs.iter().map(|o| &o.resource.id).collect();
+            if ids.iter().enumerate().any(|(index, id)| {
+                ids[..index].contains(id)
+                    || invocation
+                        .inputs
+                        .iter()
+                        .any(|input| &input.resource.id == *id)
+            }) {
+                return Err(KernelError::KernelExecutionFailed {
+                    reason: format!("{name} outputs must be distinct from all inputs and outputs"),
+                });
+            }
+            let outputs = outputs?;
+            if outputs.len() != invocation.outputs.len()
+                || outputs
+                    .iter()
+                    .zip(&invocation.outputs)
+                    .any(|(tensor, resource)| {
+                        resource.resource.descriptor.shape.dimensions != tensor.shape
+                    })
+            {
+                return Err(KernelError::KernelExecutionFailed {
+                    reason: format!("{name} output descriptor does not match computed shape"),
+                });
+            }
+            for (index, tensor) in outputs.into_iter().enumerate() {
+                let descriptor = self.store_output(invocation, index, tensor)?;
+                if record {
+                    result
+                        .output_readiness
+                        .insert(descriptor.id.to_string(), true);
+                    result.updated_resources.push(descriptor.clone());
+                }
+            }
             return Ok(result);
         }
         if let Some(packed) = &self.packed
             && let Some(output) = packed.run(self, invocation)
         {
             let descriptor = self.store_output(invocation, 0, output?)?;
-            result
-                .output_readiness
-                .insert(descriptor.id.to_string(), true);
-            result.updated_resources.push(descriptor);
+            if record {
+                result
+                    .output_readiness
+                    .insert(descriptor.id.to_string(), true);
+                result.updated_resources.push(descriptor.clone());
+            }
             return Ok(result);
         }
         let output = match name {
@@ -2594,6 +2818,38 @@ impl ReferenceCpuExecutor {
                 let up = self.input_tensor(invocation, 1)?;
                 mul(&silu(&gate), &up).map_err(KernelError::from)?
             }
+            // `graph_fusion::fuse_gated_matmul`: both matmuls, then the
+            // `silu-mul` they fed, as the Runtime's Reference CPU kernel.
+            "gated-matmul" => {
+                let a = self.input_tensor(invocation, 0)?;
+                let gate = self.input_tensor(invocation, 1)?;
+                let up = self.input_tensor(invocation, 2)?;
+                let transpose_a =
+                    Self::attribute_bool(&invocation.attributes, "transpose_a", false);
+                let transpose_b =
+                    Self::attribute_bool(&invocation.attributes, "transpose_b", false);
+                Self::require_f32_accumulation(&invocation.attributes)?;
+                let gate =
+                    matmul(&a, &gate, transpose_a, transpose_b).map_err(KernelError::from)?;
+                let up = matmul(&a, &up, transpose_a, transpose_b).map_err(KernelError::from)?;
+                mul(&silu(&gate), &up).map_err(KernelError::from)?
+            }
+            "geodesic-residual" => {
+                let layer_index = Self::attribute_integer(&invocation.attributes, "layer_index")
+                    .and_then(|index| u32::try_from(index).ok())
+                    .filter(|index| *index != u32::MAX)
+                    .ok_or_else(|| KernelError::KernelAttributeUnsupported {
+                        attribute: "layer_index".into(),
+                    })?;
+                magnetar_provider_api::operator_semantics::geodesic_residual(
+                    &self.input_tensor(invocation, 0)?,
+                    &self.input_tensor(invocation, 1)?,
+                    &self.input_tensor(invocation, 2)?,
+                    &self.input_tensor(invocation, 3)?,
+                    layer_index,
+                )
+                .map_err(KernelError::from)?
+            }
             "batched-matmul" => {
                 let a = self.input_tensor(invocation, 0)?;
                 let b = self.input_tensor(invocation, 1)?;
@@ -2610,8 +2866,6 @@ impl ReferenceCpuExecutor {
                 let h = self.input_tensor(invocation, 0)?;
                 let logits = self.input_tensor(invocation, 1)?;
                 let gate = self.input_tensor(invocation, 2)?;
-                let up = self.input_tensor(invocation, 3)?;
-                let down = self.input_tensor(invocation, 4)?;
                 let integer = |name: &str| {
                     Self::attribute_integer(&invocation.attributes, name)
                         .filter(|value| *value > 0)
@@ -2642,23 +2896,68 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
-                let per_expert_scale = match invocation.inputs.len() {
-                    6 => Some(self.input_tensor(invocation, 5)?),
-                    _ => None,
+                let ungated = activation == MoeExpertActivation::ReluSquared;
+                let up = if ungated {
+                    None
+                } else {
+                    Some(self.input_tensor(invocation, 3)?)
                 };
-                operator_semantics::moe_experts_local_with(
-                    &h,
-                    &logits,
-                    [&gate, &up, &down],
-                    routing,
-                    first,
-                    count,
-                    MoeExpertOptions {
-                        activation,
-                        per_expert_scale: per_expert_scale.as_ref(),
-                    },
+                let down = self.input_tensor(invocation, if ungated { 3 } else { 4 })?;
+                let sigmoid = operator_semantics::sigmoid_routing_from_attributes(
+                    &invocation.attributes,
+                    routing.top_k,
                 )
-                .map_err(KernelError::from)?
+                .map_err(KernelError::from)?;
+                let (bias, per_expert_scale) =
+                    match (ungated, sigmoid.is_some(), invocation.inputs.len()) {
+                        (false, false, 5) => (None, None),
+                        (false, false, 6) => (None, Some(self.input_tensor(invocation, 5)?)),
+                        (false, true, 6) => (Some(self.input_tensor(invocation, 5)?), None),
+                        (false, true, 7) => (
+                            Some(self.input_tensor(invocation, 5)?),
+                            Some(self.input_tensor(invocation, 6)?),
+                        ),
+                        (true, true, 5) => (Some(self.input_tensor(invocation, 4)?), None),
+                        (true, true, 6) => (
+                            Some(self.input_tensor(invocation, 4)?),
+                            Some(self.input_tensor(invocation, 5)?),
+                        ),
+                        _ => {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: "moe-experts input count does not match routing".into(),
+                            });
+                        }
+                    };
+                let options = MoeExpertOptions {
+                    activation,
+                    per_expert_scale: per_expert_scale.as_ref(),
+                };
+                let output = if let (Some(sigmoid), Some(bias)) = (sigmoid, bias.as_ref()) {
+                    operator_semantics::moe_experts_local_sigmoid_with(
+                        &h,
+                        &logits,
+                        [&gate, up.as_ref().unwrap_or(&gate), &down],
+                        routing,
+                        first,
+                        count,
+                        operator_semantics::MoeSigmoidExpertOptions {
+                            experts: options,
+                            routing: sigmoid,
+                            selection_bias: bias,
+                        },
+                    )
+                } else {
+                    operator_semantics::moe_experts_local_with(
+                        &h,
+                        &logits,
+                        [&gate, up.as_ref().unwrap_or(&gate), &down],
+                        routing,
+                        first,
+                        count,
+                        options,
+                    )
+                };
+                output.map_err(KernelError::from)?
             }
             "row-scale" => {
                 let x = self.input_tensor(invocation, 0)?;
@@ -2677,7 +2976,6 @@ impl ReferenceCpuExecutor {
                 }
             }
             "rmsnorm" => {
-                let input = self.input_tensor(invocation, 0)?;
                 let epsilon = Self::attribute_float(&invocation.attributes, "epsilon", 1e-6);
                 // Present head attributes must both be positive integers:
                 // a malformed one is refused, never read as absent.
@@ -2699,13 +2997,10 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
-                let weight = match invocation.inputs.len() {
-                    1 => None,
-                    _ => Some(self.input_tensor(invocation, 1)?),
-                };
+                let weighted = invocation.inputs.len() != 1;
                 if let Some(OperatorAttributeValue::Boolean(with_scale)) =
                     invocation.attributes.get("with_scale")
-                    && *with_scale != weight.is_some()
+                    && *with_scale != weighted
                 {
                     return Err(KernelError::KernelAttributeUnsupported {
                         attribute: format!(
@@ -2714,19 +3009,58 @@ impl ReferenceCpuExecutor {
                         ),
                     });
                 }
-                match (&weight, heads) {
-                    // Today's form keeps its own weight shapes.
-                    (Some(weight), None) => {
-                        rmsnorm(&input, weight, epsilon).map_err(KernelError::from)?
+                // Zero-centered norms scale by `weight_offset + weight`
+                // (`support-qwen38-flash-next`).
+                let offset = match invocation.attributes.get("weight_offset") {
+                    None => None,
+                    Some(OperatorAttributeValue::Float(offset)) if offset.is_finite() => {
+                        Some(*offset as f32)
                     }
-                    _ => {
-                        operator_semantics::rmsnorm_blocks(&input, weight.as_ref(), epsilon, heads)
-                            .map_err(KernelError::from)?
+                    Some(other) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("rmsnorm weight_offset {other:?}"),
+                        });
                     }
+                };
+                if offset.is_some() && !weighted {
+                    return Err(KernelError::KernelAttributeUnsupported {
+                        attribute: "rmsnorm weight_offset needs a weight".into(),
+                    });
                 }
+                // The input and weight read where they are stored.
+                let indices: &[usize] = if weighted { &[0, 1] } else { &[0] };
+                self.with_inputs(invocation, indices, |inputs| {
+                    let shifted;
+                    let (input, weight) = match (inputs.get(1).copied(), offset) {
+                        (Some(weight), Some(offset)) => {
+                            shifted = HostTensor::new(
+                                weight.shape.clone(),
+                                weight
+                                    .data
+                                    .iter()
+                                    .map(|value| value + offset)
+                                    .collect::<Vec<_>>(),
+                            )
+                            .map_err(|error| {
+                                KernelError::KernelExecutionFailed {
+                                    reason: error.to_string(),
+                                }
+                            })?;
+                            (inputs[0], Some(&shifted))
+                        }
+                        (weight, _) => (inputs[0], weight),
+                    };
+                    match (weight, heads) {
+                        // Today's form keeps its own weight shapes.
+                        (Some(weight), None) => {
+                            rmsnorm(input, weight, epsilon).map_err(KernelError::from)
+                        }
+                        _ => operator_semantics::rmsnorm_blocks(input, weight, epsilon, heads)
+                            .map_err(KernelError::from),
+                    }
+                })?
             }
             "rope" => {
-                let input = self.input_tensor(invocation, 0)?;
                 let base = Self::attribute_float(&invocation.attributes, "base", 10000.0);
                 let scale = Self::attribute_float(&invocation.attributes, "scale", 1.0);
                 let dimension = Self::attribute_integer(&invocation.attributes, "dimension")
@@ -2803,16 +3137,349 @@ impl ReferenceCpuExecutor {
                     (Some(yarn), _) => RopeFrequencies::Yarn(yarn),
                     (None, banded) => RopeFrequencies::from_banded(banded.as_ref()),
                 };
-                rope_scaled(
-                    &input,
-                    base,
-                    scale,
-                    dimension,
-                    position_offset,
-                    head_count,
-                    pairing,
-                    frequencies,
-                    Self::attribute_float_opt(&invocation.attributes, "partial_rotary_factor"),
+                let partial_rotary_factor =
+                    Self::attribute_float_opt(&invocation.attributes, "partial_rotary_factor");
+                // The input read where it is stored.
+                self.with_input(invocation, 0, |input| {
+                    rope_scaled(
+                        input,
+                        base,
+                        scale,
+                        dimension,
+                        position_offset,
+                        head_count,
+                        pairing,
+                        frequencies,
+                        partial_rotary_factor,
+                    )
+                    .map_err(KernelError::from)
+                })?
+            }
+            // Each of `head_count` (default 1) blocks of the last dimension
+            // splits in half (`split-per-head`, `support-qwen38-flash-next`).
+            "split" => {
+                if invocation.outputs.len() != 2 {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "split requires exactly two outputs".into(),
+                    });
+                }
+                let head_count = match invocation.attributes.get("head_count") {
+                    None => 1,
+                    Some(OperatorAttributeValue::Integer(value)) if *value > 0 => *value as u64,
+                    Some(other) => {
+                        return Err(KernelError::KernelAttributeUnsupported {
+                            attribute: format!("split head_count {other:?}"),
+                        });
+                    }
+                };
+                let input = self.input_tensor(invocation, 0)?;
+                for (index, tensor) in split_heads_in_half(&input, head_count)?
+                    .into_iter()
+                    .enumerate()
+                {
+                    if invocation.outputs[index]
+                        .resource
+                        .descriptor
+                        .shape
+                        .dimensions
+                        != tensor.shape
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason: "split output descriptor does not match computed shape".into(),
+                        });
+                    }
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    if record {
+                        result
+                            .output_readiness
+                            .insert(descriptor.id.to_string(), true);
+                        result.updated_resources.push(descriptor.clone());
+                    }
+                }
+                return Ok(result);
+            }
+            // Qwen4-Exp's blocks (`support-qwen38-flash-next` lot 3), through
+            // the shared semantics.
+            name @ ("gated-residual"
+            | "gated-residual-final"
+            | "gated-residual-inject"
+            | "repeat-features"
+            | "qsa-select"
+            | "ngram-embedding"
+            | "ngram-ple") => {
+                let outputs = &invocation.outputs;
+                for (i, output) in outputs.iter().enumerate() {
+                    if outputs[..i]
+                        .iter()
+                        .any(|other| other.resource.id == output.resource.id)
+                        || invocation
+                            .inputs
+                            .iter()
+                            .any(|input| input.resource.id == output.resource.id)
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason: format!(
+                                "{name} outputs must be distinct from all inputs and outputs"
+                            ),
+                        });
+                    }
+                }
+                let inputs = (0..invocation.inputs.len())
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let computed = operator_semantics::hyper_stream_operator(
+                    name,
+                    &inputs,
+                    &invocation.attributes,
+                )
+                .map_err(KernelError::from)?;
+                if outputs.len() != computed.len()
+                    || outputs.iter().zip(&computed).any(|(resource, tensor)| {
+                        resource.resource.descriptor.shape.dimensions != tensor.shape
+                    })
+                {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: format!("{name} output descriptor does not match computed shape"),
+                    });
+                }
+                for (index, tensor) in computed.into_iter().enumerate() {
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    if record {
+                        result
+                            .output_readiness
+                            .insert(descriptor.id.to_string(), true);
+                        result.updated_resources.push(descriptor.clone());
+                    }
+                }
+                return Ok(result);
+            }
+            name @ ("mamba2-mixer" | "gated-delta-mixer") => {
+                if invocation.outputs.len() != 3 {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: format!("{name} requires exactly three outputs"),
+                    });
+                }
+                let outputs = &invocation.outputs;
+                for (i, output) in outputs.iter().enumerate() {
+                    if outputs[..i]
+                        .iter()
+                        .any(|other| other.resource.id == output.resource.id)
+                        || invocation
+                            .inputs
+                            .iter()
+                            .any(|input| input.resource.id == output.resource.id)
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason: format!(
+                                "{name} outputs must be distinct from all inputs and outputs"
+                            ),
+                        });
+                    }
+                }
+                let inputs = (0..invocation.inputs.len())
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let computed = if name == "mamba2-mixer" {
+                    let config =
+                        operator_semantics::mamba2_mixer_from_attributes(&invocation.attributes)
+                            .map_err(KernelError::from)?;
+                    operator_semantics::mamba2_mixer(&inputs, config)
+                } else {
+                    let config = operator_semantics::gated_delta_mixer_from_attributes(
+                        &invocation.attributes,
+                    )
+                    .map_err(KernelError::from)?;
+                    operator_semantics::gated_delta_mixer(&inputs, config)
+                }
+                .map_err(KernelError::from)?;
+                if outputs.iter().zip(&computed).any(|(resource, tensor)| {
+                    resource.resource.descriptor.shape.dimensions != tensor.shape
+                }) {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: format!("{name} output descriptor does not match computed shape"),
+                    });
+                }
+                for (index, tensor) in computed.into_iter().enumerate() {
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    if record {
+                        result
+                            .output_readiness
+                            .insert(descriptor.id.to_string(), true);
+                        result.updated_resources.push(descriptor.clone());
+                    }
+                }
+                return Ok(result);
+            }
+            name @ ("mamba3-mimo" | "mamba3-mixer" | "projected-differential-attention") => {
+                if invocation.outputs.len() != 5 {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: format!("{name} requires exactly five outputs"),
+                    });
+                }
+                let outputs = &invocation.outputs;
+                for (index, output) in outputs.iter().enumerate() {
+                    if outputs[..index]
+                        .iter()
+                        .any(|other| other.resource.id == output.resource.id)
+                        || invocation
+                            .inputs
+                            .iter()
+                            .any(|input| input.resource.id == output.resource.id)
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason: format!(
+                                "{name} outputs must be distinct from all inputs and outputs"
+                            ),
+                        });
+                    }
+                }
+                let inputs = (0..invocation.inputs.len())
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let computed = if name == "mamba3-mimo" {
+                    let config =
+                        operator_semantics::mamba3_mimo_from_attributes(&invocation.attributes)
+                            .map_err(KernelError::from)?;
+                    operator_semantics::mamba3_mimo(&inputs, config)
+                } else if name == "mamba3-mixer" {
+                    let config =
+                        operator_semantics::mamba3_mixer_from_attributes(&invocation.attributes)
+                            .map_err(KernelError::from)?;
+                    operator_semantics::mamba3_mixer(&inputs, config)
+                } else {
+                    let config =
+                        operator_semantics::projected_differential_attention_from_attributes(
+                            &invocation.attributes,
+                        )
+                        .map_err(KernelError::from)?;
+                    operator_semantics::projected_differential_attention(&inputs, config)
+                }
+                .map_err(KernelError::from)?;
+                if outputs.iter().zip(&computed).any(|(resource, tensor)| {
+                    resource.resource.descriptor.shape.dimensions != tensor.shape
+                }) {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: format!("{name} output descriptor does not match computed shape"),
+                    });
+                }
+                for (index, tensor) in computed.into_iter().enumerate() {
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    if record {
+                        result
+                            .output_readiness
+                            .insert(descriptor.id.to_string(), true);
+                        result.updated_resources.push(descriptor.clone());
+                    }
+                }
+                return Ok(result);
+            }
+            "token-shift" => {
+                if invocation.inputs.len() != 4 || invocation.outputs.len() != 2 {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "token-shift requires four inputs and two outputs".into(),
+                    });
+                }
+                let outputs = &invocation.outputs;
+                for (index, output) in outputs.iter().enumerate() {
+                    if outputs[..index]
+                        .iter()
+                        .any(|other| other.resource.id == output.resource.id)
+                        || invocation
+                            .inputs
+                            .iter()
+                            .any(|input| input.resource.id == output.resource.id)
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason:
+                                "token-shift outputs must be distinct from all inputs and outputs"
+                                    .into(),
+                        });
+                    }
+                }
+                let inputs = (0..invocation.inputs.len())
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let computed =
+                    operator_semantics::token_shift(&inputs).map_err(KernelError::from)?;
+                if outputs.iter().zip(&computed).any(|(resource, tensor)| {
+                    resource.resource.descriptor.shape.dimensions != tensor.shape
+                }) {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "token-shift output descriptor does not match computed shape"
+                            .into(),
+                    });
+                }
+                for (index, tensor) in computed.into_iter().enumerate() {
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    if record {
+                        result
+                            .output_readiness
+                            .insert(descriptor.id.to_string(), true);
+                        result.updated_resources.push(descriptor.clone());
+                    }
+                }
+                return Ok(result);
+            }
+            "affine-layernorm" => {
+                if !(2..=3).contains(&invocation.inputs.len()) {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "affine-layernorm expects scale and optional bias".into(),
+                    });
+                }
+                let epsilon = operator_semantics::affine_layernorm_epsilon(&invocation.attributes)
+                    .map_err(KernelError::from)?;
+                let input = self.input_tensor(invocation, 0)?;
+                let scale = self.input_tensor(invocation, 1)?;
+                let bias = if invocation.inputs.len() == 3 {
+                    Some(self.input_tensor(invocation, 2)?)
+                } else {
+                    None
+                };
+                operator_semantics::affine_layernorm(&input, &scale, bias.as_ref(), epsilon)
+                    .map_err(KernelError::from)?
+            }
+            "gelu-exact" => operator_semantics::gelu_exact(&self.input_tensor(invocation, 0)?)
+                .map_err(KernelError::from)?,
+            "slice-last" => {
+                let (start, width) =
+                    operator_semantics::slice_last_attributes(&invocation.attributes)
+                        .map_err(KernelError::from)?;
+                operator_semantics::slice_last(&self.input_tensor(invocation, 0)?, start, width)
+                    .map_err(KernelError::from)?
+            }
+            "differential-attention" => {
+                if invocation.inputs.len() != 4
+                    || invocation.outputs.len() != 1
+                    || invocation
+                        .inputs
+                        .iter()
+                        .any(|input| input.resource.id == invocation.outputs[0].resource.id)
+                {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "differential-attention needs four inputs and a distinct output"
+                            .into(),
+                    });
+                }
+                let config = operator_semantics::differential_attention_from_attributes(
+                    &invocation.attributes,
+                )
+                .map_err(KernelError::from)?;
+                let inputs = (0..4)
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                operator_semantics::differential_attention(&inputs, config)
+                    .map_err(KernelError::from)?
+            }
+            "encoder-attention" => {
+                let config =
+                    operator_semantics::encoder_attention_from_attributes(&invocation.attributes)
+                        .map_err(KernelError::from)?;
+                operator_semantics::encoder_attention(
+                    &self.input_tensor(invocation, 0)?,
+                    &self.input_tensor(invocation, 1)?,
+                    &self.input_tensor(invocation, 2)?,
+                    &self.input_tensor(invocation, 3)?,
+                    config,
                 )
                 .map_err(KernelError::from)?
             }
@@ -2984,6 +3651,9 @@ impl ReferenceCpuExecutor {
                     "silu" => silu(&input),
                     "gelu" => gelu(&input),
                     "sigmoid" => sigmoid(&input),
+                    "relu_squared" => {
+                        operator_semantics::relu_squared(&input).map_err(KernelError::from)?
+                    }
                     "softcap" => operator_semantics::softcap(&input, float("cap")?)
                         .map_err(KernelError::from)?,
                     "scale" => operator_semantics::scale(&input, float("factor")?)
@@ -3056,11 +3726,25 @@ impl ReferenceCpuExecutor {
                 });
             }
         };
+        if matches!(
+            name,
+            "affine-layernorm" | "gelu-exact" | "slice-last" | "differential-attention"
+        ) && invocation
+            .outputs
+            .first()
+            .is_none_or(|resource| resource.resource.descriptor.shape.dimensions != output.shape)
+        {
+            return Err(KernelError::KernelExecutionFailed {
+                reason: format!("{name} output descriptor does not match computed shape"),
+            });
+        }
         let descriptor = self.store_output(invocation, 0, output)?;
-        result
-            .output_readiness
-            .insert(descriptor.id.to_string(), true);
-        result.updated_resources.push(descriptor);
+        if record {
+            result
+                .output_readiness
+                .insert(descriptor.id.to_string(), true);
+            result.updated_resources.push(descriptor.clone());
+        }
         Ok(result)
     }
 }

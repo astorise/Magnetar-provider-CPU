@@ -3227,9 +3227,12 @@ impl ReferenceCpuExecutor {
                 let inputs = (0..invocation.inputs.len())
                     .map(|index| self.input_tensor(invocation, index))
                     .collect::<Result<Vec<_>, _>>()?;
-                let computed =
-                    operator_semantics::qwen4_exp_operator(name, &inputs, &invocation.attributes)
-                        .map_err(KernelError::from)?;
+                let computed = operator_semantics::hyper_stream_operator(
+                    name,
+                    &inputs,
+                    &invocation.attributes,
+                )
+                .map_err(KernelError::from)?;
                 if outputs.len() != computed.len()
                     || outputs.iter().zip(&computed).any(|(resource, tensor)| {
                         resource.resource.descriptor.shape.dimensions != tensor.shape

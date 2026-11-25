@@ -2116,6 +2116,22 @@ fn gated_delta_mixer_reads_compact_weights() {
     assert_eq!(executor.state.materialized.lock().unwrap().0, 0);
 }
 
+/// Design D8: the optimized Provider advertises the gathered form of the
+/// n-gram embedding, so the Runtime may send it the rows it read by itself.
+#[test]
+fn the_native_provider_advertises_the_gathered_ngram_rows() {
+    let advertisements = native_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "ngram-embedding")
+        .unwrap();
+    assert!(
+        advertisement.id.features.iter().any(
+            |feature| feature == magnetar_core::operator::NGRAM_EMBEDDING_GATHERED_ROWS_FEATURE
+        )
+    );
+}
+
 /// `support-qwen38-flash-next`: an attention reading a selection (its
 /// fourth input, with `token_selection`) is advertised as a feature, runs
 /// through the Reference CPU kernel on the optimized Provider, and

@@ -347,7 +347,6 @@ pub fn embedding_lookup(
     HostTensor::new([ids.data.len() as u64, dim], out)
 }
 
-/// Correctness-first RMSNorm with `f32` accumulation.
 /// The two halves of each of `head_count` equal blocks of the last
 /// dimension: the first halves in order, then the second halves.
 fn split_heads_in_half(
@@ -380,6 +379,7 @@ fn split_heads_in_half(
     Ok([tensor(left)?, tensor(right)?])
 }
 
+/// Correctness-first RMSNorm with `f32` accumulation.
 pub fn rmsnorm(
     input: &HostTensor,
     weight: &HostTensor,

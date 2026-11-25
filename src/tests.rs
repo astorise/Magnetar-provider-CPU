@@ -2135,3 +2135,130 @@ fn rope_applies_banded_frequency_scaling_and_advertises_it() {
             .contains(ROPE_BANDED_FREQUENCY_SCALING_FEATURE)
     );
 }
+
+/// Qwen3.5's attention forms (`support-qwen38-flash-next`): the per-head
+/// query/gate split and the zero-centered RMSNorm weight.
+#[test]
+fn per_head_split_and_norm_weight_offset_follow_their_attributes() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let run = |name: &str,
+               inputs: &[(&str, Vec<u64>, Vec<f32>)],
+               outputs: &[(&str, Vec<u64>)],
+               attributes: BTreeMap<String, OperatorAttributeValue>| {
+        let advertisement = advertisements
+            .iter()
+            .find(|item| item.id.name == name)
+            .unwrap();
+        let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+        let mut invocation = KernelInvocation::new(
+            KernelInvocationId::new(name),
+            advertisement.implemented_operator.clone(),
+            advertisement.id.clone(),
+            ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        );
+        for (id, shape, values) in inputs {
+            executor.write_tensor(
+                TensorResourceId::new(*id),
+                HostTensor::new(shape.clone(), values.clone()).unwrap(),
+            );
+            invocation = invocation.with_input(resource(id, shape.clone()));
+        }
+        for (id, shape) in outputs {
+            invocation = invocation.with_output(resource(id, shape.clone()));
+        }
+        let invocation = invocation.with_attributes(attributes);
+        executor
+            .execute_invocation(advertisement, operator, &invocation)
+            .status
+    };
+    let read = |name: &str| {
+        executor
+            .read_tensor(&TensorResourceId::new(name))
+            .unwrap()
+            .data
+    };
+    for name in ["split", "rmsnorm"] {
+        let advertisement = advertisements
+            .iter()
+            .find(|item| item.id.name == name)
+            .unwrap();
+        let feature = if name == "split" {
+            SPLIT_PER_HEAD_FEATURE
+        } else {
+            RMSNORM_WEIGHT_OFFSET_FEATURE
+        };
+        assert!(advertisement.id.features.contains(feature), "{name}");
+    }
+
+    // Two rows of two heads, each [query 2 | gate 2].
+    let row: Vec<f32> = (1..=8).map(|value| value as f32).collect();
+    let input = [row.clone(), row.iter().map(|value| value + 10.0).collect()].concat();
+    let heads = BTreeMap::from([("head_count".into(), OperatorAttributeValue::Integer(2))]);
+    assert_eq!(
+        run(
+            "split",
+            &[("rows", vec![2, 8], input.clone())],
+            &[("query", vec![2, 4]), ("gate", vec![2, 4])],
+            heads,
+        ),
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(read("query"), [1.0, 2.0, 5.0, 6.0, 11.0, 12.0, 15.0, 16.0]);
+    assert_eq!(read("gate"), [3.0, 4.0, 7.0, 8.0, 13.0, 14.0, 17.0, 18.0]);
+    // Without `head_count`, the last dimension splits in half.
+    assert_eq!(
+        run(
+            "split",
+            &[("rows", vec![2, 8], input)],
+            &[("left", vec![2, 4]), ("right", vec![2, 4])],
+            BTreeMap::new(),
+        ),
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(read("left"), [1.0, 2.0, 3.0, 4.0, 11.0, 12.0, 13.0, 14.0]);
+
+    // `weight_offset` 1 scales the normalized row by `1 + weight`.
+    let x = vec![3.0, 4.0];
+    let weight = vec![0.5, -0.25];
+    let offset = BTreeMap::from([
+        ("epsilon".into(), OperatorAttributeValue::Float(1e-6)),
+        ("weight_offset".into(), OperatorAttributeValue::Float(1.0)),
+    ]);
+    assert_eq!(
+        run(
+            "rmsnorm",
+            &[("x", vec![1, 2], x.clone()), ("w", vec![2], weight.clone())],
+            &[("offset", vec![1, 2])],
+            offset,
+        ),
+        KernelResultStatus::Succeeded
+    );
+    let plus_one: Vec<f32> = weight.iter().map(|value| value + 1.0).collect();
+    assert_eq!(
+        run(
+            "rmsnorm",
+            &[("x", vec![1, 2], x), ("w1", vec![2], plus_one)],
+            &[("plain", vec![1, 2])],
+            BTreeMap::from([("epsilon".into(), OperatorAttributeValue::Float(1e-6))]),
+        ),
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(read("offset"), read("plain"));
+}

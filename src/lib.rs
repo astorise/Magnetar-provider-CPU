@@ -114,8 +114,8 @@ use magnetar_core::{
 };
 use magnetar_core::{
     operator::ACTIVATION_RELU_SQUARED_FEATURE, operator::ATTENTION_LATENT_KV_FEATURE,
-    operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_TURBOQUANT_KV_FEATURE,
-    operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
+    operator::ATTENTION_SCALE_FEATURE, operator::ATTENTION_TOKEN_SELECTION_FEATURE,
+    operator::ATTENTION_TURBOQUANT_KV_FEATURE, operator::ATTENTION_VALUE_HEAD_DIMENSION_FEATURE,
     operator::ATTENTION_VALUE_HEAD_STRIDE_FEATURE, operator::CONCAT_HEADS_FEATURE,
     operator::ConcatAxis, operator::EMBEDDING_SCALE_FEATURE,
     operator::KV_WRITE_TURBOQUANT_EXACT_HEAD_FEATURE, operator::KV_WRITE_TURBOQUANT_FEATURE,
@@ -1449,6 +1449,9 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         ATTENTION_VALUE_HEAD_STRIDE_FEATURE.to_string(),
         ATTENTION_LATENT_KV_FEATURE.to_string(),
         ATTENTION_TURBOQUANT_KV_FEATURE.to_string(),
+        // The keys each query reads (`token_selection`,
+        // `support-qwen38-flash-next`).
+        ATTENTION_TOKEN_SELECTION_FEATURE.to_string(),
     ]);
     let with_features = |operator: &str, family: OperatorFamily, features: &[&str]| {
         let mut advertisement = baseline_advertisement(operator, family);
@@ -3598,19 +3601,51 @@ impl ReferenceCpuExecutor {
                         });
                     }
                 };
-                attention_with_value_width(
-                    &q,
-                    &k,
-                    &v,
-                    head_count,
-                    head_dimension,
-                    value_head_dimension,
-                    kv_head_count,
-                    window_size,
-                    causal,
-                    Self::attribute_float_opt(&invocation.attributes, "scale"),
-                )
-                .map_err(KernelError::from)?
+                // The fourth input lists the key positions each query reads
+                // (`token_selection`, `support-qwen38-flash-next`).
+                if Self::attribute_bool(&invocation.attributes, "token_selection", false) {
+                    for unsupported in [
+                        "latent_kv_width",
+                        "value_head_dimension",
+                        "value_head_stride",
+                    ] {
+                        if invocation.attributes.contains_key(unsupported) {
+                            return Err(KernelError::KernelAttributeUnsupported {
+                                attribute: format!(
+                                    "token_selection does not combine with {unsupported}"
+                                ),
+                            });
+                        }
+                    }
+                    let selection = self.input_tensor(invocation, 3)?;
+                    operator_semantics::attention_over_selection(
+                        &q,
+                        &k,
+                        &v,
+                        &selection,
+                        head_count,
+                        head_dimension,
+                        kv_head_count,
+                        window_size,
+                        causal,
+                        Self::attribute_float_opt(&invocation.attributes, "scale"),
+                    )
+                    .map_err(KernelError::from)?
+                } else {
+                    attention_with_value_width(
+                        &q,
+                        &k,
+                        &v,
+                        head_count,
+                        head_dimension,
+                        value_head_dimension,
+                        kv_head_count,
+                        window_size,
+                        causal,
+                        Self::attribute_float_opt(&invocation.attributes, "scale"),
+                    )
+                    .map_err(KernelError::from)?
+                }
             }
             "softmax" => {
                 let input = self.input_tensor(invocation, 0)?;

@@ -877,6 +877,8 @@ impl NativeState {
             .is_some_and(|width| width != head_dimension)
             || attributes.contains_key("value_head_stride")
             || attributes.contains_key("latent_kv_width")
+            // The keys each query reads: the shared semantics.
+            || attributes.contains_key("token_selection")
         {
             return None;
         }

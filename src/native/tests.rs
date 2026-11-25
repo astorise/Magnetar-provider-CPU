@@ -2109,3 +2109,140 @@ fn gated_delta_mixer_reads_compact_weights() {
     // No compact weight was expanded to f32.
     assert_eq!(executor.state.materialized.lock().unwrap().0, 0);
 }
+
+/// `support-qwen38-flash-next`: an attention reading a selection (its
+/// fourth input, with `token_selection`) is advertised as a feature, runs
+/// through the Reference CPU kernel on the optimized Provider, and
+/// computes what the shared semantics compute, for grouped-query heads, a
+/// window and a padded selection.
+#[test]
+fn selected_attention_runs_the_reference_form_on_the_native_provider() {
+    use magnetar_core::operator::{
+        ATTENTION_TOKEN_SELECTION_FEATURE, OperatorAttributeValue as Value,
+    };
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let advertisements = native_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|advertisement| advertisement.id.name == "attention")
+        .unwrap();
+    assert!(
+        advertisement
+            .id
+            .features
+            .iter()
+            .any(|feature| feature == ATTENTION_TOKEN_SELECTION_FEATURE),
+        "the optimized Provider advertises the selection form"
+    );
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let (heads, kv_heads, dim) = (4_u64, 2_u64, 8_u64);
+    let (queries, rows) = (5_u64, 6_u64);
+    // Ascending positions, `-1` where a row reads fewer keys; the last
+    // query reads every earlier key.
+    let selection = HostTensor::new(
+        [queries, 3],
+        vec![
+            0.0, -1.0, -1.0, //
+            0.0, 1.0, -1.0, //
+            0.0, 2.0, -1.0, //
+            1.0, 2.0, 3.0, //
+            0.0, 3.0, 4.0,
+        ],
+    )
+    .unwrap();
+    let q = activations(queries, heads * dim, 171);
+    let k = activations(rows, kv_heads * dim, 172);
+    let v = activations(rows, kv_heads * dim, 173);
+    let resource = |id: &str, shape: Vec<u64>| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(shape),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    for (window, scale) in [(None, None), (Some(3_u64), Some(0.5_f32))] {
+        let executor = NativeCpuExecutor::with_settings(true, true, 2);
+        for (name, tensor) in [("q", &q), ("k", &k), ("v", &v), ("s", &selection)] {
+            executor
+                .write_tensor(TensorResourceId::new(name), tensor.clone())
+                .unwrap();
+        }
+        let mut attributes = BTreeMap::from([
+            ("head_count".to_string(), Value::Integer(heads as i64)),
+            ("head_dimension".to_string(), Value::Integer(dim as i64)),
+            ("kv_head_count".to_string(), Value::Integer(kv_heads as i64)),
+            ("causal".to_string(), Value::Boolean(true)),
+            ("token_selection".to_string(), Value::Boolean(true)),
+        ]);
+        if let Some(window) = window {
+            attributes.insert("window_size".into(), Value::Integer(window as i64));
+        }
+        if let Some(scale) = scale {
+            attributes.insert("scale".into(), Value::Float(f64::from(scale)));
+        }
+        let invocation = KernelInvocation::new(
+            KernelInvocationId::new("selected"),
+            advertisement.implemented_operator.clone(),
+            advertisement.id.clone(),
+            ProviderBinding::new(NATIVE_CPU_PROVIDER_NAME),
+            ResourceAffinity::new(FallbackClass::Transparent),
+        )
+        .with_input(resource("q", vec![queries, heads * dim]))
+        .with_input(resource("k", vec![rows, kv_heads * dim]))
+        .with_input(resource("v", vec![rows, kv_heads * dim]))
+        .with_input(resource("s", vec![queries, 3]))
+        .with_output(resource("out", vec![queries, heads * dim]))
+        .with_attributes(attributes);
+        assert!(
+            executor
+                .state
+                .attention(executor.reference(), &invocation)
+                .is_none(),
+            "the selection form runs the Reference CPU kernel"
+        );
+        let mut memory = MemoryManager::default();
+        let invocation =
+            invocation.with_workspace(executor.allocate_workspace(&mut memory, 4096).unwrap());
+        let handle = executor
+            .submit_kernel(advertisement, operator, &invocation, &mut memory)
+            .unwrap();
+        let result = executor.complete_kernel(&handle).unwrap();
+        assert_eq!(result.status, KernelResultStatus::Succeeded, "{result:?}");
+        let actual = executor.read_tensor(&TensorResourceId::new("out")).unwrap();
+        let expected = magnetar_provider_api::attention_over_selection(
+            &q,
+            &k,
+            &v,
+            &selection,
+            heads,
+            dim,
+            Some(kv_heads),
+            window,
+            true,
+            scale,
+        )
+        .unwrap();
+        assert_eq!(actual.shape, expected.shape);
+        assert_eq!(actual.data, expected.data, "window {window:?}");
+        // The selection matters: dense attention over every earlier key
+        // differs.
+        let dense = attention(&q, &k, &v, heads, dim, Some(kv_heads), window, true).unwrap();
+        if window.is_none() && scale.is_none() {
+            assert!(
+                actual
+                    .data
+                    .iter()
+                    .zip(&dense.data)
+                    .any(|(a, d)| (a - d).abs() > 1e-3),
+                "a selection that skips keys changes the output"
+            );
+        }
+    }
+}

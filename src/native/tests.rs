@@ -1985,3 +1985,127 @@ fn one_thread_per_core_never_exceeds_the_logical_cpus() {
     let threads = super::topology::one_per_core();
     assert!((1..=logical).contains(&threads), "{threads} of {logical}");
 }
+
+/// `support-qwen38-flash-next` 2.5: the gated-delta mixer on this
+/// Provider (projections as its dense matmuls over compact weights read in
+/// place, the rest as the shared semantics) matches the Reference mixer: a
+/// masked five-token prefill from non-zero states, then a decode step from
+/// the states it returned, every output compared. The output projection
+/// `[512, 128]` is held transposed, the input projections are not.
+#[test]
+fn gated_delta_mixer_reads_compact_weights() {
+    use magnetar_core::operator::OperatorAttributeValue as Value;
+    use operator_semantics::{gated_delta_mixer, gated_delta_mixer_from_attributes};
+    let (key_heads, value_heads, key_dim, value_dim, conv_kernel, hidden) =
+        (2_u64, 4_u64, 32_u64, 32_u64, 4_u64, 512_u64);
+    let channels = 2 * key_heads * key_dim + value_heads * value_dim;
+    let value_width = value_heads * value_dim;
+    let mut attributes = BTreeMap::new();
+    for (name, value) in [
+        ("key_heads", key_heads),
+        ("value_heads", value_heads),
+        ("key_dim", key_dim),
+        ("value_dim", value_dim),
+        ("conv_kernel", conv_kernel),
+    ] {
+        attributes.insert(name.to_string(), Value::Integer(value as i64));
+    }
+    attributes.insert("epsilon".into(), Value::Float(1e-6));
+    let config = gated_delta_mixer_from_attributes(&attributes).unwrap();
+    // Exact bfloat16 values (an exact power-of-two scale keeps them so).
+    let weight = |rows: u64, cols: u64, seed: u32| {
+        let values = bf16_values(rows, cols, seed);
+        let data: Vec<f32> = values.data.iter().map(|value| value * 0.125).collect();
+        HostTensor::new([rows, cols], data).unwrap()
+    };
+    let vector = |len: u64, seed: u32, scale: f32| {
+        let data: Vec<f32> = activations(1, len, seed)
+            .data
+            .iter()
+            .map(|value| value * scale)
+            .collect();
+        HostTensor::new([len], data).unwrap()
+    };
+    let scaled = |tensor: HostTensor, shape: Vec<u64>, scale: f32| {
+        let data: Vec<f32> = tensor.data.iter().map(|value| value * scale).collect();
+        HostTensor::new(shape, data).unwrap()
+    };
+    // Inputs 3..=11.
+    let weights = [
+        weight(channels, hidden, 201),
+        weight(value_width, hidden, 202),
+        weight(value_heads, hidden, 203),
+        weight(value_heads, hidden, 204),
+        scaled(
+            activations(channels, conv_kernel, 205),
+            vec![channels, conv_kernel],
+            0.5,
+        ),
+        vector(value_heads, 206, 0.5),
+        vector(value_heads, 207, 0.5),
+        vector(value_dim, 208, 0.2),
+        weight(hidden, value_width, 209),
+    ];
+    let executor = NativeCpuExecutor::with_settings(true, true, 3);
+    let ids: Vec<TensorResourceId> = (0..13)
+        .map(|index| TensorResourceId::new(format!("mixer.{index}")))
+        .collect();
+    for (offset, tensor) in weights.iter().enumerate() {
+        let id = ids[3 + offset].clone();
+        if tensor.shape.len() == 2 {
+            executor.write_weight_tensor(id, tensor.clone()).unwrap();
+        } else {
+            executor.reference().write_tensor(id, tensor.clone());
+        }
+    }
+    for index in [3, 4, 11] {
+        assert!(executor.is_compact(&ids[index]), "input {index} is compact");
+    }
+    let mut states = [
+        scaled(
+            activations(channels, conv_kernel, 210),
+            vec![channels, conv_kernel],
+            0.5,
+        ),
+        scaled(
+            activations(value_heads, key_dim * value_dim, 211),
+            vec![value_heads, key_dim, value_dim],
+            0.2,
+        ),
+    ];
+    for (tokens, mask) in [(5_u64, Some(vec![1.0, 1.0, 0.0, 1.0, 1.0])), (1, None)] {
+        let hidden_states = activations(tokens, hidden, 212 + tokens as u32);
+        let mut host = vec![hidden_states, states[0].clone(), states[1].clone()];
+        host.extend(weights.iter().cloned());
+        if let Some(mask) = &mask {
+            host.push(HostTensor::new([tokens], mask.clone()).unwrap());
+        }
+        for index in [0, 1, 2, 12] {
+            if let Some(tensor) = host.get(index) {
+                executor
+                    .reference()
+                    .write_tensor(ids[index].clone(), tensor.clone());
+            }
+        }
+        let expected = gated_delta_mixer(&host, config).unwrap();
+        let inputs: Vec<&TensorResourceId> = ids[..host.len()].iter().collect();
+        let invocation =
+            invocation_reading("gated-delta-mixer", &inputs).with_attributes(attributes.clone());
+        let actual = executor
+            .state
+            .run_multi(executor.reference(), &invocation)
+            .expect("handled natively")
+            .unwrap();
+        assert_eq!(actual.len(), 3);
+        for (output, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert_close(
+                actual,
+                expected,
+                &format!("{tokens} token(s), output {output}"),
+            );
+        }
+        states = [expected[1].clone(), expected[2].clone()];
+    }
+    // No compact weight was expanded to f32.
+    assert_eq!(executor.state.materialized.lock().unwrap().0, 0);
+}

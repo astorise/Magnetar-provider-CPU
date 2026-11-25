@@ -91,6 +91,17 @@ pub(crate) trait PackedWeights: Send + Sync {
         executor: &ReferenceCpuExecutor,
         invocation: &KernelInvocation,
     ) -> Option<Result<HostTensor, KernelError>>;
+    /// Runs `invocation` when it has several outputs this Provider
+    /// computes itself (the gated-delta mixer), returning them in order;
+    /// `None` lets the Reference CPU kernel run.
+    fn run_multi(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+    ) -> Option<Result<Vec<HostTensor>, KernelError>> {
+        let _ = (executor, invocation);
+        None
+    }
     /// A packed weight's logical values, for a kernel without a packed path.
     fn materialize(&self, id: &TensorResourceId) -> Option<HostTensor>;
     fn shape(&self, id: &TensorResourceId) -> Option<Vec<u64>>;
@@ -1363,9 +1374,144 @@ impl NativeState {
             None => self.dense_matmul(executor, invocation, id),
         }
     }
+
+    /// `a x wᵀ` for a dense weight `w` in checkpoint `[out, in]` order,
+    /// compact or f32, across the pool; `None` for a packed weight or
+    /// mismatched shapes.
+    fn project(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        a: &HostTensor,
+        id: &TensorResourceId,
+    ) -> Option<Result<HostTensor, KernelError>> {
+        if self.weight(id).is_some() {
+            return None;
+        }
+        match self.compact(id) {
+            // A weight held transposed is used the other way round.
+            Some(weight) => self.dense_product(
+                a,
+                dense::Values::Bf16(&weight.bits),
+                weight.stored_shape(),
+                !weight.transposed,
+            ),
+            None => {
+                let storage = executor.storage.lock().unwrap();
+                let w = storage.get(id)?;
+                let (rows, cols) = w.rows_cols().ok()?;
+                if w.shape.len() != 2 {
+                    return None;
+                }
+                self.dense_product(
+                    a,
+                    dense::Values::F32(&w.data),
+                    [rows as usize, cols as usize],
+                    true,
+                )
+            }
+        }
+    }
+
+    /// `gated-delta-mixer` (`support-qwen38-flash-next`): the four input
+    /// projections and the output projection as this Provider's dense
+    /// matmuls (compact weights read in place, across the pool), everything
+    /// between them as the shared semantics compute it
+    /// (`gated_delta_mixer_from_projections`). `None` hands a form it does
+    /// not handle (a packed projection weight) to the Reference kernel.
+    fn gated_delta_mixer(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+    ) -> Option<Result<Vec<HostTensor>, KernelError>> {
+        if cfg!(target_arch = "wasm32") || !(12..=13).contains(&invocation.inputs.len()) {
+            return None;
+        }
+        let id = |index: usize| &invocation.inputs[index].resource.id;
+        if [3, 4, 5, 6, 11]
+            .iter()
+            .any(|&index| self.weight(id(index)).is_some())
+        {
+            return None;
+        }
+        Some((|| {
+            let config =
+                operator_semantics::gated_delta_mixer_from_attributes(&invocation.attributes)
+                    .map_err(KernelError::from)?;
+            let mut x = executor.input_tensor(invocation, 0)?;
+            let [tokens, hidden] = x.shape[..] else {
+                return Err(KernelError::KernelExecutionFailed {
+                    reason: "gated-delta hidden input must be rank two".into(),
+                });
+            };
+            // A masked token's input is zero, so are its projections.
+            if invocation.inputs.len() == 13 {
+                let mask = executor.input_tensor(invocation, 12)?;
+                if mask.shape != [tokens]
+                    || mask.data.iter().any(|&value| value != 0.0 && value != 1.0)
+                {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: "gated-delta mask must be [tokens] zeros and ones".into(),
+                    });
+                }
+                for (row, &keep) in x.data.chunks_exact_mut(hidden as usize).zip(&mask.data) {
+                    if keep == 0.0 {
+                        row.fill(0.0);
+                    }
+                }
+            }
+            let shape_error = || KernelError::KernelExecutionFailed {
+                reason: "gated-delta projection weight does not match its input".into(),
+            };
+            let mut projections = Vec::with_capacity(4);
+            for index in 3..=6 {
+                let product = self
+                    .project(executor, &x, id(index))
+                    .ok_or_else(shape_error)??;
+                projections.push(product.data);
+            }
+            let states = [
+                executor.input_tensor(invocation, 1)?,
+                executor.input_tensor(invocation, 2)?,
+            ];
+            let weights = [7, 8, 9, 10].map(|index| executor.input_tensor(invocation, index));
+            let [convolution, a_log, dt_bias, norm] = weights;
+            let [normalized, convolution_state, recurrent_state] =
+                operator_semantics::gated_delta_mixer_from_projections(
+                    [
+                        &projections[0],
+                        &projections[1],
+                        &projections[2],
+                        &projections[3],
+                    ],
+                    tokens,
+                    [&states[0], &states[1]],
+                    [&convolution?, &a_log?, &dt_bias?, &norm?],
+                    config,
+                )
+                .map_err(KernelError::from)?;
+            let output = self
+                .project(executor, &normalized, id(11))
+                .ok_or_else(shape_error)??;
+            if output.shape != [tokens, hidden] {
+                return Err(shape_error());
+            }
+            Ok(vec![output, convolution_state, recurrent_state])
+        })())
+    }
 }
 
 impl PackedWeights for NativeState {
+    fn run_multi(
+        &self,
+        executor: &ReferenceCpuExecutor,
+        invocation: &KernelInvocation,
+    ) -> Option<Result<Vec<HostTensor>, KernelError>> {
+        match invocation.kernel.name.as_str() {
+            "gated-delta-mixer" => self.gated_delta_mixer(executor, invocation),
+            _ => None,
+        }
+    }
+
     fn run(
         &self,
         executor: &ReferenceCpuExecutor,

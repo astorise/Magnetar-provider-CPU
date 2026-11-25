@@ -2711,6 +2711,47 @@ impl ReferenceCpuExecutor {
             return Ok(result);
         }
         if let Some(packed) = &self.packed
+            && let Some(outputs) = packed.run_multi(self, invocation)
+        {
+            // Every output distinct from the inputs and from each other, as
+            // the Reference kernels require.
+            let ids: Vec<_> = invocation.outputs.iter().map(|o| &o.resource.id).collect();
+            if ids.iter().enumerate().any(|(index, id)| {
+                ids[..index].contains(id)
+                    || invocation
+                        .inputs
+                        .iter()
+                        .any(|input| &input.resource.id == *id)
+            }) {
+                return Err(KernelError::KernelExecutionFailed {
+                    reason: format!("{name} outputs must be distinct from all inputs and outputs"),
+                });
+            }
+            let outputs = outputs?;
+            if outputs.len() != invocation.outputs.len()
+                || outputs
+                    .iter()
+                    .zip(&invocation.outputs)
+                    .any(|(tensor, resource)| {
+                        resource.resource.descriptor.shape.dimensions != tensor.shape
+                    })
+            {
+                return Err(KernelError::KernelExecutionFailed {
+                    reason: format!("{name} output descriptor does not match computed shape"),
+                });
+            }
+            for (index, tensor) in outputs.into_iter().enumerate() {
+                let descriptor = self.store_output(invocation, index, tensor)?;
+                if record {
+                    result
+                        .output_readiness
+                        .insert(descriptor.id.to_string(), true);
+                    result.updated_resources.push(descriptor.clone());
+                }
+            }
+            return Ok(result);
+        }
+        if let Some(packed) = &self.packed
             && let Some(output) = packed.run(self, invocation)
         {
             let descriptor = self.store_output(invocation, 0, output?)?;

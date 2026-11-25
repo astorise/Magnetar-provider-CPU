@@ -2011,7 +2011,6 @@ fn gated_delta_mixer_reads_compact_weights() {
         attributes.insert(name.to_string(), Value::Integer(value as i64));
     }
     attributes.insert("epsilon".into(), Value::Float(1e-6));
-    let config = gated_delta_mixer_from_attributes(&attributes).unwrap();
     // Exact bfloat16 values (an exact power-of-two scale keeps them so).
     let weight = |rows: u64, cols: u64, seed: u32| {
         let values = bf16_values(rows, cols, seed);
@@ -2061,50 +2060,57 @@ fn gated_delta_mixer_reads_compact_weights() {
     for index in [3, 4, 11] {
         assert!(executor.is_compact(&ids[index]), "input {index} is compact");
     }
-    let mut states = [
-        scaled(
-            activations(channels, conv_kernel, 210),
-            vec![channels, conv_kernel],
-            0.5,
-        ),
-        scaled(
-            activations(value_heads, key_dim * value_dim, 211),
-            vec![value_heads, key_dim, value_dim],
-            0.2,
-        ),
-    ];
-    for (tokens, mask) in [(5_u64, Some(vec![1.0, 1.0, 0.0, 1.0, 1.0])), (1, None)] {
-        let hidden_states = activations(tokens, hidden, 212 + tokens as u32);
-        let mut host = vec![hidden_states, states[0].clone(), states[1].clone()];
-        host.extend(weights.iter().cloned());
-        if let Some(mask) = &mask {
-            host.push(HostTensor::new([tokens], mask.clone()).unwrap());
+    for gate in [None, Some("sigmoid")] {
+        let mut attributes = attributes.clone();
+        if let Some(gate) = gate {
+            attributes.insert("output_gate_type".into(), Value::String(gate.into()));
         }
-        for index in [0, 1, 2, 12] {
-            if let Some(tensor) = host.get(index) {
-                executor
-                    .reference()
-                    .write_tensor(ids[index].clone(), tensor.clone());
+        let config = gated_delta_mixer_from_attributes(&attributes).unwrap();
+        let mut states = [
+            scaled(
+                activations(channels, conv_kernel, 210),
+                vec![channels, conv_kernel],
+                0.5,
+            ),
+            scaled(
+                activations(value_heads, key_dim * value_dim, 211),
+                vec![value_heads, key_dim, value_dim],
+                0.2,
+            ),
+        ];
+        for (tokens, mask) in [(5_u64, Some(vec![1.0, 1.0, 0.0, 1.0, 1.0])), (1, None)] {
+            let hidden_states = activations(tokens, hidden, 212 + tokens as u32);
+            let mut host = vec![hidden_states, states[0].clone(), states[1].clone()];
+            host.extend(weights.iter().cloned());
+            if let Some(mask) = &mask {
+                host.push(HostTensor::new([tokens], mask.clone()).unwrap());
             }
+            for index in [0, 1, 2, 12] {
+                if let Some(tensor) = host.get(index) {
+                    executor
+                        .reference()
+                        .write_tensor(ids[index].clone(), tensor.clone());
+                }
+            }
+            let expected = gated_delta_mixer(&host, config).unwrap();
+            let inputs: Vec<&TensorResourceId> = ids[..host.len()].iter().collect();
+            let invocation = invocation_reading("gated-delta-mixer", &inputs)
+                .with_attributes(attributes.clone());
+            let actual = executor
+                .state
+                .run_multi(executor.reference(), &invocation)
+                .expect("handled natively")
+                .unwrap();
+            assert_eq!(actual.len(), 3);
+            for (output, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_close(
+                    actual,
+                    expected,
+                    &format!("{gate:?} gate, {tokens} token(s), output {output}"),
+                );
+            }
+            states = [expected[1].clone(), expected[2].clone()];
         }
-        let expected = gated_delta_mixer(&host, config).unwrap();
-        let inputs: Vec<&TensorResourceId> = ids[..host.len()].iter().collect();
-        let invocation =
-            invocation_reading("gated-delta-mixer", &inputs).with_attributes(attributes.clone());
-        let actual = executor
-            .state
-            .run_multi(executor.reference(), &invocation)
-            .expect("handled natively")
-            .unwrap();
-        assert_eq!(actual.len(), 3);
-        for (output, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
-            assert_close(
-                actual,
-                expected,
-                &format!("{tokens} token(s), output {output}"),
-            );
-        }
-        states = [expected[1].clone(), expected[2].clone()];
     }
     // No compact weight was expanded to f32.
     assert_eq!(executor.state.materialized.lock().unwrap().0, 0);

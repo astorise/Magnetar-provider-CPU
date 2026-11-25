@@ -1520,6 +1520,13 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("mamba2-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("gated-delta-mixer", OperatorFamily::LinearAlgebra),
         with_features("split", OperatorFamily::Tensor, &[SPLIT_PER_HEAD_FEATURE]),
+        baseline_advertisement("gated-residual", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("gated-residual-final", OperatorFamily::LinearAlgebra),
+        baseline_advertisement("gated-residual-inject", OperatorFamily::Tensor),
+        baseline_advertisement("repeat-features", OperatorFamily::Tensor),
+        baseline_advertisement("qsa-select", OperatorFamily::Tensor),
+        baseline_advertisement("ngram-embedding", OperatorFamily::Tensor),
+        baseline_advertisement("ngram-ple", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mimo", OperatorFamily::LinearAlgebra),
         baseline_advertisement("mamba3-mixer", OperatorFamily::LinearAlgebra),
         baseline_advertisement("token-shift", OperatorFamily::Tensor),
@@ -3181,6 +3188,58 @@ impl ReferenceCpuExecutor {
                             reason: "split output descriptor does not match computed shape".into(),
                         });
                     }
+                    let descriptor = self.store_output(invocation, index, tensor)?;
+                    if record {
+                        result
+                            .output_readiness
+                            .insert(descriptor.id.to_string(), true);
+                        result.updated_resources.push(descriptor.clone());
+                    }
+                }
+                return Ok(result);
+            }
+            // Qwen4-Exp's blocks (`support-qwen38-flash-next` lot 3), through
+            // the shared semantics.
+            name @ ("gated-residual"
+            | "gated-residual-final"
+            | "gated-residual-inject"
+            | "repeat-features"
+            | "qsa-select"
+            | "ngram-embedding"
+            | "ngram-ple") => {
+                let outputs = &invocation.outputs;
+                for (i, output) in outputs.iter().enumerate() {
+                    if outputs[..i]
+                        .iter()
+                        .any(|other| other.resource.id == output.resource.id)
+                        || invocation
+                            .inputs
+                            .iter()
+                            .any(|input| input.resource.id == output.resource.id)
+                    {
+                        return Err(KernelError::KernelExecutionFailed {
+                            reason: format!(
+                                "{name} outputs must be distinct from all inputs and outputs"
+                            ),
+                        });
+                    }
+                }
+                let inputs = (0..invocation.inputs.len())
+                    .map(|index| self.input_tensor(invocation, index))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let computed =
+                    operator_semantics::qwen4_exp_operator(name, &inputs, &invocation.attributes)
+                        .map_err(KernelError::from)?;
+                if outputs.len() != computed.len()
+                    || outputs.iter().zip(&computed).any(|(resource, tensor)| {
+                        resource.resource.descriptor.shape.dimensions != tensor.shape
+                    })
+                {
+                    return Err(KernelError::KernelExecutionFailed {
+                        reason: format!("{name} output descriptor does not match computed shape"),
+                    });
+                }
+                for (index, tensor) in computed.into_iter().enumerate() {
                     let descriptor = self.store_output(invocation, index, tensor)?;
                     if record {
                         result

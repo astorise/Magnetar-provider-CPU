@@ -20,6 +20,69 @@ const FORMATS: [PackedWeightFormat; 14] = [
     PackedWeightFormat::Q4_0,
 ];
 
+#[test]
+fn native_provider_advertises_and_executes_scalar_remainder() {
+    use magnetar_core::operator::OperatorAttributeValue;
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let advertisements = native_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|item| item.id.name == "remainder-scalar")
+        .unwrap();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let executor = NativeCpuExecutor::with_settings(false, false, 1);
+    let resource = |id: &str| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(vec![2, 2]),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    executor
+        .write_tensor(
+            TensorResourceId::new("input"),
+            HostTensor::new([2, 2], vec![-7.0, -1.0, 1.0, 7.0]).unwrap(),
+        )
+        .unwrap();
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("remainder"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(NATIVE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(resource("input"))
+    .with_output(resource("output"))
+    .with_attributes(BTreeMap::from([(
+        "divisor".into(),
+        OperatorAttributeValue::Float(3.0),
+    )]));
+    let mut memory = MemoryManager::default();
+    let invocation =
+        invocation.with_workspace(executor.allocate_workspace(&mut memory, 4096).unwrap());
+    let handle = executor
+        .submit_kernel(advertisement, operator, &invocation, &mut memory)
+        .unwrap();
+    assert_eq!(
+        executor.complete_kernel(&handle).unwrap().status,
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(
+        executor
+            .read_tensor(&TensorResourceId::new("output"))
+            .unwrap()
+            .data,
+        [2.0, 2.0, 1.0, 1.0]
+    );
+}
+
 /// Byte offsets of each block's `f16` scale fields.
 fn half_offsets(format: PackedWeightFormat) -> &'static [usize] {
     match format {

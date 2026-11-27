@@ -1161,6 +1161,94 @@ fn encoder_affine_exact_gelu_and_slice_execute_as_distinct_kernels() {
     );
 }
 
+#[test]
+fn scalar_remainder_kernel_preserves_inputs_and_rejects_invalid_calls() {
+    use magnetar_kernel::{kernel::KernelInvocationId, kernel::KernelResource};
+    let executor = ReferenceCpuExecutor::new();
+    let advertisements = reference_cpu_kernel_advertisements();
+    let advertisement = advertisements
+        .iter()
+        .find(|item| item.id.name == "remainder-scalar")
+        .unwrap();
+    let catalog = magnetar_core::operator::initial_operator_catalog();
+    let operator = catalog.get(&advertisement.implemented_operator).unwrap();
+    let resource = |id: &str| {
+        KernelResource::new(
+            TensorResourceDescriptor::new(
+                TensorResourceId::new(id),
+                TensorDescriptor::materialized(
+                    ShapeDescriptor::new(vec![2, 3]),
+                    DTypeDescriptor::portable(ComputeDType::Float32),
+                ),
+                ResourceAffinity::new(FallbackClass::Transparent),
+            ),
+            KernelMemoryClass::Host,
+        )
+    };
+    let values = vec![-7.0, -1.0, 0.0, 1.0, 7.0, 12.5];
+    executor.write_tensor(
+        TensorResourceId::new("input"),
+        HostTensor::new([2, 3], values.clone()).unwrap(),
+    );
+    let invocation = KernelInvocation::new(
+        KernelInvocationId::new("remainder"),
+        advertisement.implemented_operator.clone(),
+        advertisement.id.clone(),
+        ProviderBinding::new(REFERENCE_CPU_PROVIDER_NAME),
+        ResourceAffinity::new(FallbackClass::Transparent),
+    )
+    .with_input(resource("input"))
+    .with_output(resource("output"))
+    .with_attributes(BTreeMap::from([(
+        "divisor".into(),
+        OperatorAttributeValue::Float(3.0),
+    )]));
+    assert_eq!(
+        executor
+            .execute_invocation(advertisement, operator, &invocation)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    assert_eq!(
+        executor
+            .read_tensor(&TensorResourceId::new("output"))
+            .unwrap()
+            .data,
+        [2.0, 2.0, 0.0, 1.0, 1.0, 0.5]
+    );
+    let mut alias = invocation.clone();
+    alias.outputs[0] = resource("input");
+    assert_ne!(
+        executor
+            .execute_invocation(advertisement, operator, &alias)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    let mut invalid = invocation;
+    invalid
+        .attributes
+        .insert("divisor".into(), OperatorAttributeValue::Float(0.0));
+    invalid.outputs[0] = resource("invalid-output");
+    assert_ne!(
+        executor
+            .execute_invocation(advertisement, operator, &invalid)
+            .status,
+        KernelResultStatus::Succeeded
+    );
+    assert!(
+        executor
+            .read_tensor(&TensorResourceId::new("invalid-output"))
+            .is_none()
+    );
+    assert_eq!(
+        executor
+            .read_tensor(&TensorResourceId::new("input"))
+            .unwrap()
+            .data,
+        values
+    );
+}
+
 struct Rng(u64);
 
 impl Rng {

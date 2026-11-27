@@ -1547,6 +1547,7 @@ pub fn reference_cpu_kernel_advertisements() -> Vec<KernelAdvertisement> {
         baseline_advertisement("affine-layernorm", OperatorFamily::Normalization),
         baseline_advertisement("gelu-exact", OperatorFamily::Activation),
         baseline_advertisement("slice-last", OperatorFamily::Tensor),
+        baseline_advertisement("remainder-scalar", OperatorFamily::Tensor),
         baseline_advertisement("softmax", OperatorFamily::Activation),
         baseline_advertisement("silu", OperatorFamily::Activation),
         baseline_advertisement("gelu", OperatorFamily::Activation),
@@ -2710,14 +2711,15 @@ impl ReferenceCpuExecutor {
         record: bool,
     ) -> Result<KernelResult, KernelError> {
         let name = invocation.kernel.name.as_str();
-        if matches!(name, "affine-layernorm" | "gelu-exact" | "slice-last")
-            && invocation.outputs.iter().any(|output| {
-                invocation
-                    .inputs
-                    .iter()
-                    .any(|input| input.resource.id == output.resource.id)
-            })
-        {
+        if matches!(
+            name,
+            "affine-layernorm" | "gelu-exact" | "slice-last" | "remainder-scalar"
+        ) && invocation.outputs.iter().any(|output| {
+            invocation
+                .inputs
+                .iter()
+                .any(|input| input.resource.id == output.resource.id)
+        }) {
             return Err(KernelError::KernelAliasingUnsupported);
         }
         let mut result = KernelResult::success(invocation.id.clone());
@@ -3454,6 +3456,12 @@ impl ReferenceCpuExecutor {
             }
             "gelu-exact" => operator_semantics::gelu_exact(&self.input_tensor(invocation, 0)?)
                 .map_err(KernelError::from)?,
+            "remainder-scalar" => {
+                let divisor = operator_semantics::remainder_scalar_divisor(&invocation.attributes)
+                    .map_err(KernelError::from)?;
+                operator_semantics::remainder_scalar(&self.input_tensor(invocation, 0)?, divisor)
+                    .map_err(KernelError::from)?
+            }
             "slice-last" => {
                 let (start, width) =
                     operator_semantics::slice_last_attributes(&invocation.attributes)
@@ -3774,7 +3782,11 @@ impl ReferenceCpuExecutor {
         };
         if matches!(
             name,
-            "affine-layernorm" | "gelu-exact" | "slice-last" | "differential-attention"
+            "affine-layernorm"
+                | "gelu-exact"
+                | "slice-last"
+                | "remainder-scalar"
+                | "differential-attention"
         ) && invocation
             .outputs
             .first()
